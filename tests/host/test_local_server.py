@@ -1085,3 +1085,64 @@ def test_ensure_does_not_advertise_pidfile_before_ownership_confirmed(
     assert result.url == "http://127.0.0.1:6767"
     # Once confirmed, the record IS advertised for reuse/discovery.
     assert pid_file.read_text() == "9001\n6767\n"
+
+
+def test_latest_server_log_tail_picks_newest_and_truncates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``latest_server_log_tail`` must return the most recently modified server
+    log with only its trailing lines — this is what lets the foreground CLI
+    surface the crashed daemon-spawned server's actual error (e.g. a missing
+    Postgres driver) instead of only pointing at log directories.
+    """
+    import os
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+
+    old = log_dir / "server-20260101-000000-000000.log"
+    old.write_text("stale run\n")
+    os.utime(old, (1_000_000, 1_000_000))
+
+    new = log_dir / "server-20260102-000000-000000.log"
+    new.write_text(
+        "\n".join(f"line {i}" for i in range(60))
+        + "\nModuleNotFoundError: No module named 'psycopg'\n"
+    )
+    os.utime(new, (2_000_000, 2_000_000))
+
+    result = local_server.latest_server_log_tail(max_lines=50)
+
+    assert result is not None
+    path, tail = result
+    assert path == new
+    assert "No module named 'psycopg'" in tail
+    assert "stale run" not in tail
+    # Truncated to the last 50 lines: the earliest lines must be gone.
+    assert "line 0\n" not in tail + "\n"
+    assert len(tail.splitlines()) == 50
+
+
+def test_latest_server_log_tail_degrades_to_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Missing directory or an empty one must yield ``None`` (never raise):
+    the caller appends the tail as best-effort detail to an error message
+    that must always be produced.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    # Directory does not exist at all.
+    assert local_server.latest_server_log_tail() is None
+    # Directory exists but holds no logs.
+    (tmp_path / "logs" / "server").mkdir(parents=True)
+    assert local_server.latest_server_log_tail() is None
+    # An empty log file still yields a (path, placeholder) pair.
+    empty = tmp_path / "logs" / "server" / "server-20260101-000000-000000.log"
+    empty.write_text("")
+    result = local_server.latest_server_log_tail()
+    assert result is not None
+    assert result[0] == empty
+    assert result[1] == "(empty log file)"

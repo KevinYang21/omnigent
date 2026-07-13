@@ -113,7 +113,37 @@ def test_missing_psycopg_translates_to_actionable_error(
     assert "psycopg[binary]" in message
     # ``name`` is preserved so callers keying on the missing module still work.
     assert excinfo.value.name == "psycopg"
+    # The original SQLAlchemy-raised error stays chained for diagnostics.
+    assert excinfo.value.__cause__ is not None
     # The credentials in the URI must never leak into the surfaced message.
+    assert "user:pass" not in message
+    assert "host:5432" not in message
+
+
+@pytest.mark.parametrize(
+    "db_uri",
+    [
+        # A bare ``postgresql://`` makes SQLAlchemy select the legacy
+        # psycopg2 DBAPI — installing psycopg 3 would not fix it.
+        "postgresql://user:pass@host:5432/db",
+        "postgresql+psycopg2://user:pass@host:5432/db",
+    ],
+)
+def test_missing_psycopg2_guidance_is_dialect_correct(db_uri: str) -> None:
+    """
+    The psycopg2 dialects must NOT be told "install psycopg 3 and retry" —
+    that provably reproduces the same error. The guidance must lead with
+    switching the URI scheme to ``postgresql+psycopg://`` and offer the
+    explicit psycopg2 install as the alternative.
+    """
+    exc = ModuleNotFoundError("No module named 'psycopg2'", name="psycopg2")
+    translated = _translate_missing_driver_error(db_uri, exc)
+
+    assert translated is not exc
+    message = str(translated)
+    assert "postgresql+psycopg://" in message  # the preferred fix: switch dialect
+    assert "psycopg2-binary" in message  # the keep-the-dialect alternative
+    assert translated.name == "psycopg2"
     assert "user:pass" not in message
     assert "host:5432" not in message
 
@@ -132,6 +162,35 @@ def test_translate_missing_driver_passes_through_unrelated_errors() -> None:
     # transitive import failure) — not the driver, so leave it alone.
     unrelated = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
     assert _translate_missing_driver_error("postgresql+psycopg://u@h/db", unrelated) is unrelated
+
+    # A URI make_url cannot parse must fall back to the scheme split, not
+    # blow up inside error handling.
+    garbage = ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+    assert _translate_missing_driver_error("not a uri at all", garbage) is garbage
+
+
+def test_unrelated_import_error_reraises_without_self_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pass-through path must use a bare ``raise``: the surfaced exception is
+    the original object with ``__cause__`` untouched. A ``raise exc from exc``
+    would stamp a self-referential ``__cause__`` and confuse diagnostics
+    integrations even though traceback rendering survives via cycle detection.
+    """
+    original = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
+
+    def _raise_unrelated(uri: str, **_kwargs: Any) -> MagicMock:
+        raise original
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _raise_unrelated)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        get_or_create_engine("postgresql+psycopg://u@h/db")
+
+    assert excinfo.value is original
+    assert excinfo.value.__cause__ is None
 
 
 def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(

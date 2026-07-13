@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy.engine import make_url
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -291,9 +292,13 @@ def _create_engine(db_uri: str) -> Engine:
         # Postgres) therefore fails here with a bare ``No module named
         # 'psycopg'`` when the driver was never installed — an opaque error
         # deep in SQLAlchemy internals. Translate it into an actionable
-        # message that names the install command; re-raise anything else
-        # unchanged.
-        raise _translate_missing_driver_error(db_uri, exc) from exc
+        # message that names the install command. Unrelated failures re-raise
+        # via bare ``raise`` so the original exception is truly untouched
+        # (``raise exc from exc`` would stamp a self-referential ``__cause__``).
+        translated = _translate_missing_driver_error(db_uri, exc)
+        if translated is exc:
+            raise
+        raise translated from exc
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
     return engine
@@ -320,21 +325,47 @@ def _translate_missing_driver_error(db_uri: str, exc: ModuleNotFoundError) -> Mo
         backend is Postgres and the driver is the missing module; otherwise the
         original *exc* unchanged.
     """
-    backend = db_uri.split("://", 1)[0]  # dialect only — never the credentials
+    # Echo only the dialect — never the credentials. Prefer SQLAlchemy's own
+    # URL parser over string surgery; fall back to a plain scheme split for
+    # strings make_url rejects (the message must never crash error handling).
+    try:
+        backend = make_url(db_uri).drivername
+    except Exception:  # noqa: BLE001 — any parse failure falls back
+        backend = db_uri.split("://", 1)[0]
     if "postgres" not in backend.lower() or exc.name not in {"psycopg", "psycopg2"}:
         return exc
-    message = (
-        f"Database backend '{backend}' needs the PostgreSQL driver "
-        f"'{exc.name}', which is not installed. Install it with one of:\n"
-        f"    uv tool install omnigent --with 'psycopg[binary]'   "
-        f"# uv tool (e.g. `omni`/`omnigent` CLI)\n"
-        f"    pip install 'omnigent[postgres]'                    "
-        f"# the extra that bundles the driver\n"
-        f"    pip install 'psycopg[binary]'                       "
-        f"# plain virtualenv\n"
-        f"The Postgres backend is selected via OMNIGENT_DATABASE_URI / "
-        f"--database-uri."
+    install_commands = (
+        "    uv tool install omnigent --with 'psycopg[binary]'   "
+        "# uv tool (e.g. `omni`/`omnigent` CLI)\n"
+        "    pip install 'omnigent[postgres]'                    "
+        "# the extra that bundles the driver\n"
+        "    pip install 'psycopg[binary]'                       "
+        "# plain virtualenv\n"
     )
+    if exc.name == "psycopg2":
+        # A bare ``postgresql://`` (or explicit ``postgresql+psycopg2://``)
+        # URI makes SQLAlchemy select the legacy psycopg2 DBAPI. Installing
+        # psycopg 3 would NOT fix that dialect, so the guidance must lead
+        # with switching the URI scheme to the psycopg 3 dialect.
+        message = (
+            f"Database backend '{backend}' selects the legacy PostgreSQL "
+            f"driver 'psycopg2', which is not installed. Preferred fix: "
+            f"change the URI scheme to 'postgresql+psycopg://' (the modern "
+            f"psycopg 3 dialect) and install the driver with one of:\n"
+            f"{install_commands}"
+            f"Alternatively, keep the psycopg2 dialect by installing it "
+            f"explicitly: pip install psycopg2-binary\n"
+            f"The Postgres backend is selected via OMNIGENT_DATABASE_URI / "
+            f"--database-uri."
+        )
+    else:
+        message = (
+            f"Database backend '{backend}' needs the PostgreSQL driver "
+            f"'{exc.name}', which is not installed. Install it with one of:\n"
+            f"{install_commands}"
+            f"The Postgres backend is selected via OMNIGENT_DATABASE_URI / "
+            f"--database-uri."
+        )
     return ModuleNotFoundError(message, name=exc.name)
 
 

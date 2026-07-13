@@ -554,3 +554,75 @@ def test_does_not_suppress_hint_for_ordinary_errors() -> None:
 
     assert cli_diagnostics.suppresses_setup_hint(RuntimeError("boom")) is False
     assert cli_diagnostics.suppresses_setup_hint(click.ClickException("bad")) is False
+
+
+def test_daemon_exit_error_carries_server_log_tail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Foreground acceptance, part 1: when the daemon dies before its server is
+    ready, ``_discover_local_server_url`` must embed the newest server log's
+    tail — the actionable cause (e.g. the Postgres-driver install command)
+    lives there, and the CLI process never saw the subprocess's own error.
+    """
+    import omnigent.cli as cli
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    (log_dir / "server-20260101-000000-000000.log").write_text(
+        "Traceback (most recent call last):\n"
+        "ModuleNotFoundError: Database backend 'postgresql+psycopg' needs the "
+        "PostgreSQL driver 'psycopg', which is not installed. Install it with "
+        "one of:\n    pip install 'omnigent[postgres]'\n"
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_host_daemon_alive", lambda: False)
+
+    from omnigent.host.local_server import LocalServerStartupError
+
+    with pytest.raises(LocalServerStartupError) as excinfo:
+        cli._discover_local_server_url(timeout=1.0)
+
+    message = str(excinfo.value)
+    assert "daemon exited before its Omnigent server became ready" in message
+    assert "Newest server log" in message
+    assert "omnigent[postgres]" in message  # the actionable cause, inline
+
+
+def test_main_surfaces_install_command_on_stderr_without_setup_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Foreground acceptance, part 2 (top-level ``main()``): the terminal output
+    for a daemon-startup failure must contain the corrective install command
+    and must NOT contain the "run `omnigent setup`" hint — the wizard cannot
+    install a missing dependency.
+    """
+    import contextlib
+    import io
+
+    import omnigent.cli as cli
+    from omnigent.host.local_server import LocalServerStartupError
+
+    # Keep the test hermetic: no diagnostics log files, no update check.
+    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise LocalServerStartupError(
+            "The local daemon exited before its Omnigent server became ready.\n"
+            "  Last 50 lines:\n"
+            "  ModuleNotFoundError: ... pip install 'omnigent[postgres]' ..."
+        )
+
+    monkeypatch.setattr(cli, "cli", _boom)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "run"])
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    assert excinfo.value.code == 1
+    output = stderr.getvalue()
+    assert "omnigent[postgres]" in output  # corrective command reaches the terminal
+    assert "auth or configuration problem" not in output  # no misleading hint

@@ -33,6 +33,7 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     open_process_log_file,
+    process_log_dir,
 )
 
 _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
@@ -925,3 +926,36 @@ def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
         f"  Server log: {log_path}\n"
         f"\n  Last 50 lines:\n{tail}"
     )
+
+
+def latest_server_log_tail(max_lines: int = 50) -> tuple[Path, str] | None:
+    """Return the newest local-server log and its last *max_lines* lines.
+
+    In the daemon-owned startup path the server crashes in a subprocess of the
+    daemon, so the CLI process never holds the failing log's path — only the
+    daemon does, and it is gone by the time the CLI notices. Best effort: pick
+    the most recently modified log in the server log directory, which in the
+    daemon-just-died window is the crashed spawn's log. This is what lets the
+    foreground ``omni`` error carry the actual cause (e.g. a missing Postgres
+    driver and its install command) instead of only pointing at log folders.
+
+    :param max_lines: How many trailing lines to return, e.g. ``50``.
+    :returns: ``(log_path, tail)`` for the newest ``*.log`` file, or ``None``
+        when the directory is missing/empty or unreadable (never raises).
+    """
+    log_dir = process_log_dir("server", root=_local_data_dir() / "logs")
+    try:
+        newest = max(
+            (p for p in log_dir.glob("*.log") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            default=None,
+        )
+        if newest is None:
+            return None
+        lines = newest.read_text(errors="replace").splitlines()
+    except OSError:
+        # Directory vanished, a peer pruned the file between glob and stat,
+        # or the file is unreadable — degrade to "no tail" silently.
+        return None
+    tail = "\n".join(lines[-max_lines:]) if lines else "(empty log file)"
+    return newest, tail
