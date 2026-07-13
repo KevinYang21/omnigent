@@ -261,32 +261,81 @@ def _create_engine(db_uri: str) -> Engine:
     pool_recycle = (
         _LAKEBASE_POOL_RECYCLE_SECONDS if token_provider else _SERVER_POOL_RECYCLE_SECONDS
     )
-    engine = create_engine(
-        db_uri,
-        # Verify connections are alive before checking them out
-        # from the pool. Prevents "server has gone away" errors
-        # after idle periods.
-        pool_pre_ping=True,
-        # Recycle connections older than this window. Prevents stale
-        # connections when the database server restarts or closes idle
-        # connections; in Lakebase token mode the shorter window also keeps
-        # each connection's OAuth token refreshed ahead of its ~1h expiry.
-        pool_recycle=pool_recycle,
-        # Aligned with the AnyIO thread limiter in
-        # ``server/app.py:_lifespan``. Every DB call runs via
-        # ``asyncio.to_thread``, so connections beyond the thread
-        # token count just sit idle. Overflow covers boot-time
-        # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
-        pool_size=200,
-        max_overflow=20,
-        # Bound the wait when the pool is exhausted instead of
-        # blocking indefinitely; surfaces real saturation as an
-        # error rather than a hang.
-        pool_timeout=10,
-    )
+    try:
+        engine = create_engine(
+            db_uri,
+            # Verify connections are alive before checking them out
+            # from the pool. Prevents "server has gone away" errors
+            # after idle periods.
+            pool_pre_ping=True,
+            # Recycle connections older than this window. Prevents stale
+            # connections when the database server restarts or closes idle
+            # connections; in Lakebase token mode the shorter window also keeps
+            # each connection's OAuth token refreshed ahead of its ~1h expiry.
+            pool_recycle=pool_recycle,
+            # Aligned with the AnyIO thread limiter in
+            # ``server/app.py:_lifespan``. Every DB call runs via
+            # ``asyncio.to_thread``, so connections beyond the thread
+            # token count just sit idle. Overflow covers boot-time
+            # bursts (e.g. migrations). Lakebase per-instance cap: 1000.
+            pool_size=200,
+            max_overflow=20,
+            # Bound the wait when the pool is exhausted instead of
+            # blocking indefinitely; surfaces real saturation as an
+            # error rather than a hang.
+            pool_timeout=10,
+        )
+    except ModuleNotFoundError as exc:
+        # SQLAlchemy imports the DBAPI driver lazily inside ``create_engine``.
+        # A non-SQLite URI (e.g. an ``OMNIGENT_DATABASE_URI`` pointing at
+        # Postgres) therefore fails here with a bare ``No module named
+        # 'psycopg'`` when the driver was never installed — an opaque error
+        # deep in SQLAlchemy internals. Translate it into an actionable
+        # message that names the install command; re-raise anything else
+        # unchanged.
+        raise _translate_missing_driver_error(db_uri, exc) from exc
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
     return engine
+
+
+def _translate_missing_driver_error(db_uri: str, exc: ModuleNotFoundError) -> ModuleNotFoundError:
+    """
+    Rewrite a missing-DBAPI-driver import error into an actionable one.
+
+    When :func:`_create_engine` builds a Postgres engine but the ``psycopg``
+    driver is not installed, SQLAlchemy raises a bare
+    ``ModuleNotFoundError: No module named 'psycopg'`` from inside
+    ``create_engine``. That is technically correct but gives the operator no
+    hint that the driver ships in an optional extra. This returns a
+    replacement error whose message names the exact install commands.
+
+    Only the dialect part of *db_uri* is echoed (never the credentials), so
+    the message is safe to log.
+
+    :param db_uri: The connection string being opened, e.g.
+        ``"postgresql+psycopg://user:pass@host/db"``.
+    :param exc: The original ``ModuleNotFoundError`` from ``create_engine``.
+    :returns: A new ``ModuleNotFoundError`` with an actionable message when the
+        backend is Postgres and the driver is the missing module; otherwise the
+        original *exc* unchanged.
+    """
+    backend = db_uri.split("://", 1)[0]  # dialect only — never the credentials
+    if "postgres" not in backend.lower() or exc.name not in {"psycopg", "psycopg2"}:
+        return exc
+    message = (
+        f"Database backend '{backend}' needs the PostgreSQL driver "
+        f"'{exc.name}', which is not installed. Install it with one of:\n"
+        f"    uv tool install omnigent --with 'psycopg[binary]'   "
+        f"# uv tool (e.g. `omni`/`omnigent` CLI)\n"
+        f"    pip install 'omnigent[postgres]'                    "
+        f"# the extra that bundles the driver\n"
+        f"    pip install 'psycopg[binary]'                       "
+        f"# plain virtualenv\n"
+        f"The Postgres backend is selected via OMNIGENT_DATABASE_URI / "
+        f"--database-uri."
+    )
+    return ModuleNotFoundError(message, name=exc.name)
 
 
 def get_or_create_engine(db_uri: str) -> Engine:

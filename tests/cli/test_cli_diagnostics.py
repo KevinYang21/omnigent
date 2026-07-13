@@ -504,3 +504,53 @@ def test_prune_old_logs_survives_file_vanishing_mid_sort(
 
     surviving = [p for p in real if p.exists()]
     assert len(surviving) == cli_diagnostics.MAX_LOG_FILES  # newest kept, oldest pruned
+
+
+def test_suppresses_setup_hint_for_import_errors() -> None:
+    """
+    A missing dependency (ImportError / ModuleNotFoundError) is never fixed by
+    the model-credential wizard, so the setup hint must be withheld.
+    """
+    assert cli_diagnostics.suppresses_setup_hint(ImportError("no module")) is True
+    assert (
+        cli_diagnostics.suppresses_setup_hint(
+            ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+        )
+        is True
+    )
+
+
+def test_suppresses_setup_hint_honors_marker_attribute() -> None:
+    """
+    Any exception may opt out of the setup hint by carrying the marker
+    attribute — this keeps ``cli_diagnostics`` decoupled from the modules that
+    raise server-startup / dependency errors.
+    """
+
+    class _Marked(Exception):
+        omnigent_suppress_setup_hint = True
+
+    assert getattr(_Marked, cli_diagnostics.SUPPRESS_SETUP_HINT_ATTR) is True
+    assert cli_diagnostics.suppresses_setup_hint(_Marked()) is True
+
+
+def test_local_server_startup_error_suppresses_hint() -> None:
+    """
+    The real ``LocalServerStartupError`` carries the marker, so a crashed
+    background server does not trigger the misleading "run omnigent setup" hint.
+    """
+    from omnigent.host.local_server import LocalServerStartupError
+
+    err = LocalServerStartupError("server failed to start")
+    assert cli_diagnostics.suppresses_setup_hint(err) is True
+
+
+def test_does_not_suppress_hint_for_ordinary_errors() -> None:
+    """
+    Ordinary errors (including a plain ClickException) keep the setup hint —
+    the dominant real-world cause is still a missing/misconfigured credential.
+    """
+    import click
+
+    assert cli_diagnostics.suppresses_setup_hint(RuntimeError("boom")) is False
+    assert cli_diagnostics.suppresses_setup_hint(click.ClickException("bad")) is False

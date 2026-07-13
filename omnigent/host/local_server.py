@@ -44,6 +44,27 @@ _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
 _DOOMED_CHILD_EXIT_GRACE_S = _LOCAL_SERVER_READY_TIMEOUT_SECONDS
 
 
+class LocalServerStartupError(click.ClickException):
+    """
+    The background local Omnigent server failed to start or become ready.
+
+    A dedicated :class:`click.ClickException` subclass so the top-level CLI
+    can tell a server-startup failure apart from a genuine credential
+    problem: the real cause (a missing dependency, a port conflict, a schema
+    mismatch) lives in the server log, and ``omnigent setup`` cannot fix it.
+    The class-level marker (read by
+    :func:`omnigent.cli_diagnostics.suppresses_setup_hint`) suppresses the
+    otherwise-misleading "run `omnigent setup`" recovery hint. Kept a
+    ``ClickException`` so existing ``except click.ClickException`` handlers
+    (e.g. in :func:`ensure_local_omnigent_server`) still catch it and its
+    exit-code / ``show()`` behavior is unchanged.
+    """
+
+    #: Read duck-typed by ``cli_diagnostics.suppresses_setup_hint`` — see
+    #: ``cli_diagnostics.SUPPRESS_SETUP_HINT_ATTR``.
+    omnigent_suppress_setup_hint = True
+
+
 def _local_data_dir() -> Path:
     """Return the local runtime data dir (db, artifacts, logs, pidfile).
 
@@ -516,7 +537,7 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
         # free port, which concurrent spawners never prefer.
         _await_doomed_child_exit(spawned.proc)
         if retried:
-            raise click.ClickException(
+            raise LocalServerStartupError(
                 f"Local server port contention persists: port {port} is owned by "
                 f"pid {foreign_owner} even after a free-port respawn. "
                 f"Server log: {spawned.log_path}"
@@ -886,7 +907,7 @@ def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
 
     :param base_url: The loopback URL the server was meant to bind.
     :param log_path: Captured stdout/stderr log file.
-    :raises click.ClickException: Always.
+    :raises LocalServerStartupError: Always.
     """
     try:
         lines = log_path.read_text(errors="replace").splitlines()
@@ -899,7 +920,7 @@ def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
         _LOCAL_SERVER_PID_PATH.unlink()
     with contextlib.suppress(OSError):
         _LOCAL_SERVER_SIG_PATH.unlink()
-    raise click.ClickException(
+    raise LocalServerStartupError(
         f"Background local server failed to start ({base_url}).\n"
         f"  Server log: {log_path}\n"
         f"\n  Last 50 lines:\n{tail}"

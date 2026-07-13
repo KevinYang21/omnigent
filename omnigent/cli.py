@@ -42,6 +42,7 @@ from omnigent.config import (
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
+    LocalServerStartupError,
     _pid_alive,
     ensure_local_omnigent_server,
     local_server_status,
@@ -1465,6 +1466,7 @@ def main() -> None:
         log_cli_exception,
         print_setup_hint,
         setup_cli_logging,
+        suppresses_setup_hint,
     )
 
     setup_cli_logging(argv)
@@ -1490,7 +1492,10 @@ def main() -> None:
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
-        if suggest_setup:
+        # Withhold the setup hint for failures the wizard cannot fix — a
+        # crashed background server (LocalServerStartupError) or a missing
+        # dependency — whose real cause is already surfaced above.
+        if suggest_setup and not suppresses_setup_hint(exc):
             print_setup_hint()
         raise SystemExit(exc.exit_code) from exc
     except click.Abort as exc:
@@ -1500,7 +1505,7 @@ def main() -> None:
         raise SystemExit(1) from exc
     except Exception as exc:
         log_cli_error_hint(exc)
-        if suggest_setup:
+        if suggest_setup and not suppresses_setup_hint(exc):
             print_setup_hint()
         raise
 
@@ -2661,7 +2666,7 @@ def _discover_local_server_url(
 
     :param timeout: Max seconds to wait, e.g. ``60.0``.
     :returns: The loopback server URL, e.g. ``"http://127.0.0.1:8123"``.
-    :raises click.ClickException: If the daemon exits first, or the server
+    :raises LocalServerStartupError: If the daemon exits first, or the server
         does not come up within the timeout.
     """
     import time
@@ -2672,13 +2677,13 @@ def _discover_local_server_url(
         if url is not None:
             return url
         if not _host_daemon_alive():
-            raise click.ClickException(
+            raise LocalServerStartupError(
                 "The local daemon exited before its Omnigent server became ready. "
                 "See logs under ~/.omnigent/logs/host/ and "
                 "~/.omnigent/logs/server/."
             )
         time.sleep(0.2)
-    raise click.ClickException(
+    raise LocalServerStartupError(
         f"Timed out after {timeout:.0f}s waiting for the local Omnigent server to "
         "start. See ~/.omnigent/logs/server/ for details."
     )

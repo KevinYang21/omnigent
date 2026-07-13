@@ -20,6 +20,7 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
+    _translate_missing_driver_error,
     build_search_snippet,
     builtin_agent_id,
     clear_engine_cache,
@@ -82,6 +83,55 @@ def test_non_sqlite_engine_has_pool_settings(
     # the database server restarts or closes idle connections.
     # Failure means connections could persist indefinitely and break.
     assert captured_kwargs.get("pool_recycle") == 1800
+
+
+def test_missing_psycopg_translates_to_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Postgres URI whose driver is uninstalled must surface an actionable
+    install hint, not SQLAlchemy's bare ``No module named 'psycopg'``.
+
+    Simulates the driver being absent by making ``create_engine`` raise the
+    same ``ModuleNotFoundError`` SQLAlchemy raises when it lazily imports the
+    DBAPI. ``_create_engine`` must catch it and re-raise a message that names
+    the install command and the ``omnigent[postgres]`` extra.
+    """
+
+    def _raise_missing_driver(uri: str, **_kwargs: Any) -> MagicMock:
+        raise ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _raise_missing_driver)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        get_or_create_engine("postgresql+psycopg://user:pass@host:5432/db")
+
+    message = str(excinfo.value)
+    # Names the extra and at least one concrete install command.
+    assert "omnigent[postgres]" in message
+    assert "psycopg[binary]" in message
+    # ``name`` is preserved so callers keying on the missing module still work.
+    assert excinfo.value.name == "psycopg"
+    # The credentials in the URI must never leak into the surfaced message.
+    assert "user:pass" not in message
+    assert "host:5432" not in message
+
+
+def test_translate_missing_driver_passes_through_unrelated_errors() -> None:
+    """
+    ``_translate_missing_driver_error`` only rewrites a *Postgres driver*
+    import failure. A non-Postgres backend, or a ModuleNotFoundError for some
+    other module, is returned unchanged so real bugs are not masked.
+    """
+    # Non-Postgres backend: return the original untouched.
+    other_backend = ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+    assert _translate_missing_driver_error("sqlite:///x.db", other_backend) is other_backend
+
+    # Postgres backend, but the missing module is something unrelated (e.g. a
+    # transitive import failure) — not the driver, so leave it alone.
+    unrelated = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
+    assert _translate_missing_driver_error("postgresql+psycopg://u@h/db", unrelated) is unrelated
 
 
 def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
