@@ -17,7 +17,9 @@ importing ``cli.py`` to keep that dependency direction clean.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -139,7 +141,6 @@ def server_config_signature() -> str:
     """
     import hashlib
     import importlib.metadata
-    import json
 
     from omnigent.server.auth import resolve_auth_source
 
@@ -538,6 +539,7 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
         # free port, which concurrent spawners never prefer.
         _await_doomed_child_exit(spawned.proc)
         if retried:
+            _record_server_startup_failure(spawned.log_path)
             raise LocalServerStartupError(
                 f"Local server port contention persists: port {port} is owned by "
                 f"pid {foreign_owner} even after a free-port respawn. "
@@ -624,6 +626,16 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     # file (e.g. to point a worktree at its own Postgres). Defaults to the
     # isolated sqlite db under the runtime data dir.
     db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or f"sqlite:///{db_path}"
+    if db_uri.startswith(("postgres://", "postgresql://")):
+        # PaaS-style ``postgres://`` is not a SQLAlchemy dialect at all
+        # (opaque NoSuchModuleError), and bare ``postgresql://`` selects the
+        # legacy psycopg2 driver that no omnigent extra ships. Canonicalize
+        # to the psycopg 3 dialect exactly like the Docker entrypoint does.
+        # Imported lazily: this module is on the CLI's import path and
+        # ``omnigent.db.utils`` pulls in SQLAlchemy.
+        from omnigent.db.utils import normalize_database_url
+
+        db_uri = normalize_database_url(db_uri)
 
     log_path, log_fh = open_process_log_file("server", root=data_dir / "logs")
 
@@ -906,15 +918,18 @@ def _wait_for_local_omnigent_server(
 def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
     """Raise a descriptive error for a failed background-server startup.
 
+    Also records the failing log's path in a sidecar (see
+    :func:`consume_failed_server_log_tail`): this function usually runs inside
+    the *daemon*, whose exception never reaches the user's terminal — the
+    sidecar is how the foreground CLI later finds the exact log of the spawn
+    that just failed, rather than guessing by mtime.
+
     :param base_url: The loopback URL the server was meant to bind.
     :param log_path: Captured stdout/stderr log file.
     :raises LocalServerStartupError: Always.
     """
-    try:
-        lines = log_path.read_text(errors="replace").splitlines()
-        tail = "\n".join(lines[-50:]) if lines else "(empty log file)"
-    except OSError as exc:
-        tail = f"(could not read log file: {exc})"
+    tail = _read_log_tail(log_path)
+    _record_server_startup_failure(log_path)
     # A failed spawn leaves a misleading pidfile; clear it (and the sig
     # sidecar) so the next invocation does not try to reuse a dead entry.
     with contextlib.suppress(OSError):
@@ -928,20 +943,125 @@ def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
     )
 
 
-def latest_server_log_tail(max_lines: int = 50) -> tuple[Path, str] | None:
-    """Return the newest local-server log and its last *max_lines* lines.
+# Strip ANSI escape sequences (CSI like ``\x1b[31m`` plus lone ESC-<final>)
+# and all C0 control characters except newline/tab before terminal display,
+# so captured subprocess output cannot inject cursor movement, title changes,
+# or other terminal control into the user's session.
+_ANSI_OR_CONTROL = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f]")
 
-    In the daemon-owned startup path the server crashes in a subprocess of the
-    daemon, so the CLI process never holds the failing log's path — only the
-    daemon does, and it is gone by the time the CLI notices. Best effort: pick
-    the most recently modified log in the server log directory, which in the
-    daemon-just-died window is the crashed spawn's log. This is what lets the
-    foreground ``omni`` error carry the actual cause (e.g. a missing Postgres
-    driver and its install command) instead of only pointing at log folders.
+# Only surface a mtime-matched server log this fresh (seconds). The failing
+# spawn happened within the current CLI invocation's discovery window, so a
+# generous bound filters out stale logs from failures days ago without ever
+# excluding the real one.
+_SERVER_LOG_FRESHNESS_S = 300.0
+
+# Read at most this many bytes from the end of a server log when building a
+# tail — logs from long-lived servers can be hundreds of MB, and the tail
+# only ever shows the last ~50 lines.
+_TAIL_MAX_BYTES = 65536
+
+
+def _server_failure_record_path() -> Path:
+    """Return the sidecar path recording the last failed server spawn's log.
+
+    Counterpart to ``_LOCAL_SERVER_LOG_REF_PATH`` (which records a *running*
+    server's log): that sidecar is only written once a spawn is healthy, so a
+    failed spawn's log path would otherwise be known solely to the daemon
+    that just died.
+    """
+    return _local_data_dir() / "local_server_failed.logpath"
+
+
+def _record_server_startup_failure(log_path: Path) -> None:
+    """Best-effort: persist which server log the failing spawn wrote.
+
+    :param log_path: The failed spawn's captured stdout/stderr log.
+    """
+    with contextlib.suppress(OSError):
+        _atomic_write(_server_failure_record_path(), f"{log_path}\n")
+
+
+def _read_log_tail(log_path: Path, max_lines: int = 50) -> str:
+    """Return the sanitized last *max_lines* lines of *log_path*.
+
+    Reads at most :data:`_TAIL_MAX_BYTES` from the end of the file (never the
+    whole log), strips terminal escape/control sequences, and redacts
+    secret-shaped substrings — including URL userinfo such as
+    ``postgresql+psycopg://user:password@host`` from a migration error's
+    copy-pasteable command — because this text is displayed on terminals and
+    routinely ends up pasted into bug reports.
+
+    :param log_path: Log file to tail.
+    :param max_lines: How many trailing lines to keep, e.g. ``50``.
+    :returns: The sanitized tail, or a short placeholder when the file is
+        empty/unreadable (never raises).
+    """
+    from omnigent.cli_diagnostics import redact_secrets
+
+    try:
+        with log_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - _TAIL_MAX_BYTES))
+            raw = fh.read(_TAIL_MAX_BYTES).decode(errors="replace")
+    except OSError as exc:
+        return f"(could not read log file: {exc})"
+    lines = raw.splitlines()
+    if not lines:
+        return "(empty log file)"
+    tail = "\n".join(lines[-max_lines:])
+    return redact_secrets(_ANSI_OR_CONTROL.sub("", tail))
+
+
+def consume_failed_server_log_tail(max_lines: int = 50) -> tuple[Path, str] | None:
+    """Return (and clear) the exact log tail of the last failed server spawn.
+
+    In the daemon-owned startup path the server crashes in a subprocess of
+    the daemon, so the CLI process never held the failing log's path — but
+    the daemon recorded it via :func:`_record_server_startup_failure` just
+    before dying. This consumes that record so a *later* unrelated failure
+    can never resurface it, and ignores records older than
+    :data:`_SERVER_LOG_FRESHNESS_S` (a daemon that died before spawning the
+    server leaves no fresh record — better no tail than a stale one).
 
     :param max_lines: How many trailing lines to return, e.g. ``50``.
-    :returns: ``(log_path, tail)`` for the newest ``*.log`` file, or ``None``
-        when the directory is missing/empty or unreadable (never raises).
+    :returns: ``(log_path, sanitized_tail)``, or ``None`` when there is no
+        fresh failure record (never raises).
+    """
+    record_path = _server_failure_record_path()
+    try:
+        text = record_path.read_text().strip()
+    except OSError:
+        return None
+    with contextlib.suppress(OSError):
+        record_path.unlink()
+    if not text:
+        return None
+    log_path = Path(text)
+    try:
+        mtime = log_path.stat().st_mtime
+    except OSError:
+        return None
+    # The log's own mtime is when the failing server last wrote — a stale
+    # mtime means this record survived from a failure long ago.
+    if time.time() - mtime > _SERVER_LOG_FRESHNESS_S:
+        return None
+    return log_path, _read_log_tail(log_path, max_lines)
+
+
+def latest_server_log_tail(max_lines: int = 50) -> tuple[Path, str] | None:
+    """Return the newest *fresh* local-server log and its sanitized tail.
+
+    Fallback for when no failure record exists (see
+    :func:`consume_failed_server_log_tail`): pick the most recently modified
+    log in the server log directory, but only if it was written within
+    :data:`_SERVER_LOG_FRESHNESS_S` — an old mtime means the newest log
+    belongs to some earlier run, and surfacing it would show a stale,
+    potentially unrelated failure.
+
+    :param max_lines: How many trailing lines to return, e.g. ``50``.
+    :returns: ``(log_path, sanitized_tail)`` for the newest fresh ``*.log``
+        file, or ``None`` when there is none (never raises).
     """
     log_dir = process_log_dir("server", root=_local_data_dir() / "logs")
     try:
@@ -950,12 +1070,10 @@ def latest_server_log_tail(max_lines: int = 50) -> tuple[Path, str] | None:
             key=lambda p: p.stat().st_mtime,
             default=None,
         )
-        if newest is None:
+        if newest is None or time.time() - newest.stat().st_mtime > _SERVER_LOG_FRESHNESS_S:
             return None
-        lines = newest.read_text(errors="replace").splitlines()
     except OSError:
-        # Directory vanished, a peer pruned the file between glob and stat,
-        # or the file is unreadable — degrade to "no tail" silently.
+        # Directory vanished or a peer pruned the file between glob and
+        # stat — degrade to "no tail" silently.
         return None
-    tail = "\n".join(lines[-max_lines:]) if lines else "(empty log file)"
-    return newest, tail
+    return newest, _read_log_tail(newest, max_lines)

@@ -119,6 +119,10 @@ _SECRET_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
     # Databricks PATs
     re.compile(r"\bdapi[A-Za-z0-9]{10,}\b"),
+    # URL userinfo: scheme://user:password@host — e.g. a database URI baked
+    # into a migration error's copy-pasteable command. Redacts the whole
+    # userinfo (the lookahead keeps the ``@host`` part readable).
+    re.compile(r"(://)[^/\s@]+(?=@)"),
 ]
 _REDACTED = "[REDACTED]"
 
@@ -136,6 +140,22 @@ def _redact(text: str) -> str:
             text,
         )
     return text
+
+
+def redact_secrets(text: str) -> str:
+    """
+    Public wrapper around the diagnostics redaction filter.
+
+    For callers outside the logging pipeline that are about to surface
+    captured log content on a user-visible channel (e.g. the server-log
+    tail embedded in a startup error) and must scrub secret-shaped
+    substrings — including URL userinfo like
+    ``postgresql+psycopg://user:password@host`` — first.
+
+    :param text: Arbitrary log text (may include tracebacks).
+    :returns: Scrubbed text.
+    """
+    return _redact(text)
 
 
 class _RedactingFormatter(TerminalLogFormatter):

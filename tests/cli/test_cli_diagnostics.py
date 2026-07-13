@@ -586,8 +586,24 @@ def test_daemon_exit_error_carries_server_log_tail(
 
     message = str(excinfo.value)
     assert "daemon exited before its Omnigent server became ready" in message
-    assert "Newest server log" in message
+    assert "Server log" in message
     assert "omnigent[postgres]" in message  # the actionable cause, inline
+
+
+def test_redact_secrets_scrubs_url_userinfo() -> None:
+    """
+    The public redaction wrapper must scrub URL userinfo — the exact shape a
+    migration error embeds (``omnigent debug db-upgrade '<full uri>'``) —
+    while leaving the host/db part readable for diagnostics.
+    """
+    text = (
+        "run omnigent debug db-upgrade "
+        "'postgresql+psycopg://user:hunter2@db.example:5432/omnigent'"
+    )
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    assert "hunter2" not in scrubbed
+    assert "://user:" not in scrubbed  # whole userinfo gone, not just password
+    assert "db.example:5432/omnigent" in scrubbed  # target stays readable
 
 
 def test_main_surfaces_install_command_on_stderr_without_setup_hint(

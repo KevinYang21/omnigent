@@ -1091,27 +1091,29 @@ def test_latest_server_log_tail_picks_newest_and_truncates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    ``latest_server_log_tail`` must return the most recently modified server
-    log with only its trailing lines — this is what lets the foreground CLI
-    surface the crashed daemon-spawned server's actual error (e.g. a missing
-    Postgres driver) instead of only pointing at log directories.
+    ``latest_server_log_tail`` must return the most recently modified *fresh*
+    server log with only its trailing lines — this is what lets the foreground
+    CLI surface the crashed daemon-spawned server's actual error (e.g. a
+    missing Postgres driver) instead of only pointing at log directories.
     """
     import os
+    import time
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     log_dir = tmp_path / "logs" / "server"
     log_dir.mkdir(parents=True)
 
+    now = time.time()
     old = log_dir / "server-20260101-000000-000000.log"
-    old.write_text("stale run\n")
-    os.utime(old, (1_000_000, 1_000_000))
+    old.write_text("older run\n")
+    os.utime(old, (now - 60, now - 60))
 
     new = log_dir / "server-20260102-000000-000000.log"
     new.write_text(
         "\n".join(f"line {i}" for i in range(60))
         + "\nModuleNotFoundError: No module named 'psycopg'\n"
     )
-    os.utime(new, (2_000_000, 2_000_000))
+    os.utime(new, (now, now))
 
     result = local_server.latest_server_log_tail(max_lines=50)
 
@@ -1119,10 +1121,33 @@ def test_latest_server_log_tail_picks_newest_and_truncates(
     path, tail = result
     assert path == new
     assert "No module named 'psycopg'" in tail
-    assert "stale run" not in tail
+    assert "older run" not in tail
     # Truncated to the last 50 lines: the earliest lines must be gone.
     assert "line 0\n" not in tail + "\n"
     assert len(tail.splitlines()) == 50
+
+
+def test_latest_server_log_tail_ignores_stale_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A newest-by-mtime log that is *old* belongs to some earlier run — e.g.
+    the daemon died before even creating a server log this time. Surfacing
+    it would show a stale, potentially unrelated failure, so the freshness
+    cutoff must yield ``None`` instead.
+    """
+    import os
+    import time
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    stale = log_dir / "server-20260101-000000-000000.log"
+    stale.write_text("failure from days ago\n")
+    ancient = time.time() - 24 * 3600
+    os.utime(stale, (ancient, ancient))
+
+    assert local_server.latest_server_log_tail() is None
 
 
 def test_latest_server_log_tail_degrades_to_none(
@@ -1139,10 +1164,148 @@ def test_latest_server_log_tail_degrades_to_none(
     # Directory exists but holds no logs.
     (tmp_path / "logs" / "server").mkdir(parents=True)
     assert local_server.latest_server_log_tail() is None
-    # An empty log file still yields a (path, placeholder) pair.
+    # An empty (but fresh) log file still yields a (path, placeholder) pair.
     empty = tmp_path / "logs" / "server" / "server-20260101-000000-000000.log"
     empty.write_text("")
     result = local_server.latest_server_log_tail()
     assert result is not None
     assert result[0] == empty
     assert result[1] == "(empty log file)"
+
+
+def test_log_tail_redacts_credentials_and_strips_control_sequences(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Regression for the credential-exposure review finding: migration errors
+    deliberately embed the full db_uri (``user:password@host``) for a
+    copy-pasteable command, and that traceback lands in the server log. The
+    surfaced tail must redact URL userinfo — terminal output routinely gets
+    pasted into bug reports. ANSI/control sequences from captured subprocess
+    output must be stripped so the log cannot inject terminal control.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    log = log_dir / "server-20260101-000000-000000.log"
+    log.write_text(
+        "RuntimeError: ... Take a backup of your database, then run\n"
+        "    omnigent debug db-upgrade 'postgresql+psycopg://user:secret@host/db'\n"
+        "\x1b[31mred alert\x1b[0m and a bell \x07 plus \x1b]0;title\x1b\\\n"
+    )
+
+    result = local_server.latest_server_log_tail()
+
+    assert result is not None
+    _, tail = result
+    assert "secret" not in tail  # the password never reaches the terminal
+    assert "[REDACTED]@host/db" in tail  # host part stays readable
+    assert "\x1b" not in tail and "\x07" not in tail  # no terminal control
+    assert "red alert" in tail  # visible text survives
+
+
+def test_failed_server_log_record_roundtrip_beats_newer_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The failure record must pinpoint the exact log of the spawn that failed,
+    even when an unrelated log (e.g. a concurrently running dedicated server)
+    has a newer mtime — and it must be consumed on read so a later unrelated
+    failure can never resurface it.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+
+    failed = log_dir / "server-20260101-000000-000000.log"
+    failed.write_text("ModuleNotFoundError: No module named 'psycopg'\n")
+    unrelated_newer = log_dir / "server-20260102-000000-000000.log"
+    unrelated_newer.write_text("healthy dedicated server humming along\n")
+
+    local_server._record_server_startup_failure(failed)
+
+    result = local_server.consume_failed_server_log_tail()
+    assert result is not None
+    path, tail = result
+    assert path == failed  # exact log, not the newer unrelated one
+    assert "No module named 'psycopg'" in tail
+    # Consumed: a second read finds nothing.
+    assert local_server.consume_failed_server_log_tail() is None
+
+
+def test_failed_server_log_record_ignores_stale_and_garbage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A stale record (daemon crash long ago) or a degenerate sidecar must yield
+    ``None`` — better no tail than a misleading one, and never an exception.
+    """
+    import os
+    import time
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    log = log_dir / "server-20260101-000000-000000.log"
+    log.write_text("old failure\n")
+    ancient = time.time() - 24 * 3600
+    os.utime(log, (ancient, ancient))
+
+    record_path = tmp_path / "local_server_failed.logpath"
+    # Stale record: the referenced log was last written far outside the
+    # freshness window (the daemon crash it belongs to is long past).
+    record_path.write_text(f"{log}\n")
+    assert local_server.consume_failed_server_log_tail() is None
+    # Empty record.
+    record_path.write_text("")
+    assert local_server.consume_failed_server_log_tail() is None
+    # Record pointing at a vanished log file.
+    record_path.write_text(f"{log_dir / 'gone.log'}\n")
+    assert local_server.consume_failed_server_log_tail() is None
+
+
+def test_read_log_tail_is_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """
+    Tailing must not read the whole file: a long-lived server's log can be
+    hundreds of MB. Only the trailing block is read, and the last lines
+    survive intact.
+    """
+    log = tmp_path / "big.log"
+    filler = "x" * 100
+    with log.open("w") as fh:
+        for i in range(5000):  # ~500 KB, well past the 64 KB tail window
+            fh.write(f"{filler} {i}\n")
+        fh.write("FINAL: ModuleNotFoundError: No module named 'psycopg'\n")
+
+    tail = local_server._read_log_tail(log, max_lines=50)
+
+    assert "FINAL: ModuleNotFoundError" in tail
+    assert len(tail.splitlines()) == 50
+
+
+def test_spawn_normalizes_paas_postgres_uri(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    ``OMNIGENT_DATABASE_URI=postgres://…`` (PaaS style) is not a SQLAlchemy
+    dialect and bare ``postgresql://`` selects the psycopg2 driver no extra
+    ships. The spawn path must canonicalize both to ``postgresql+psycopg://``
+    — the same normalization the Docker entrypoint applies.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATABASE_URI", "postgres://user:pw@127.0.0.1:5432/db")
+
+    captured_args: list[str] = []
+
+    class _Proc:
+        pid = 4242
+
+        def __init__(self, args: list[str], **_kwargs: Any) -> None:
+            captured_args.extend(args)
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _Proc)
+
+    local_server._spawn_local_server(6767)
+
+    uri = captured_args[captured_args.index("--database-uri") + 1]
+    assert uri == "postgresql+psycopg://user:pw@127.0.0.1:5432/db"

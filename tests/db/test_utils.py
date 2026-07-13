@@ -169,6 +169,45 @@ def test_translate_missing_driver_passes_through_unrelated_errors() -> None:
     assert _translate_missing_driver_error("not a uri at all", garbage) is garbage
 
 
+def test_paas_postgres_scheme_gets_conversion_guidance() -> None:
+    """
+    ``postgres://`` is not a SQLAlchemy dialect at all — it fails with an
+    opaque ``NoSuchModuleError`` *before* any driver import. The engine
+    factory must append conversion guidance pointing at
+    ``postgresql+psycopg://`` (the spawn path normalizes this away, but a
+    direct ``--database-uri`` can still get here). Credentials must not leak.
+    """
+    from sqlalchemy.exc import NoSuchModuleError
+
+    from omnigent.db import utils
+
+    with pytest.raises(NoSuchModuleError) as excinfo:
+        utils._create_engine("postgres://user:secret@host:5432/db")
+
+    message = str(excinfo.value)
+    assert "postgresql+psycopg://" in message
+    assert "omnigent[postgres]" in message
+    assert "secret" not in message
+    assert excinfo.value.__cause__ is not None  # original plugin error chained
+
+
+def test_non_postgres_dialect_error_passes_through() -> None:
+    """
+    A bogus non-Postgres scheme must re-raise SQLAlchemy's original
+    ``NoSuchModuleError`` untouched — the Postgres guidance would only
+    mislead there.
+    """
+    from sqlalchemy.exc import NoSuchModuleError
+
+    from omnigent.db import utils
+
+    with pytest.raises(NoSuchModuleError) as excinfo:
+        utils._create_engine("bogusdb://user@host/db")
+
+    assert "postgresql+psycopg" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None  # bare re-raise, nothing stamped
+
+
 def test_unrelated_import_error_reraises_without_self_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import NoSuchModuleError
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -299,6 +300,21 @@ def _create_engine(db_uri: str) -> Engine:
         if translated is exc:
             raise
         raise translated from exc
+    except NoSuchModuleError as exc:
+        # A PaaS-style ``postgres://`` URI is not a SQLAlchemy dialect at all
+        # ("Can't load plugin: sqlalchemy.dialects:postgres"). The local-server
+        # spawn path normalizes it away, but a direct ``--database-uri`` can
+        # still get here — append the conversion guidance instead of leaving
+        # the opaque plugin error. Non-Postgres dialect errors re-raise bare.
+        scheme = db_uri.split("://", 1)[0].lower()
+        if not scheme.startswith("postgres"):
+            raise
+        raise NoSuchModuleError(
+            f"{exc}. The scheme '{scheme}://' is not a valid SQLAlchemy "
+            f"dialect — use 'postgresql+psycopg://<rest of your URI>' "
+            f"(and install the driver via the 'omnigent[postgres]' extra "
+            f"if needed)."
+        ) from exc
     if token_provider:
         _install_lakebase_token_refresh(engine, token_provider)
     return engine

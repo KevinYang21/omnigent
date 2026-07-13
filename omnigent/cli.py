@@ -44,6 +44,7 @@ from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     LocalServerStartupError,
     _pid_alive,
+    consume_failed_server_log_tail,
     ensure_local_omnigent_server,
     latest_server_log_tail,
     local_server_status,
@@ -2679,15 +2680,18 @@ def _discover_local_server_url(
             return url
         if not _host_daemon_alive():
             # The server crashed inside the daemon's subprocess, so this
-            # process never saw the real error. Surface the newest server
-            # log's tail here — that is where the actionable cause (e.g. a
+            # process never saw the real error. Surface the failed spawn's
+            # log tail here — that is where the actionable cause (e.g. a
             # missing Postgres driver and its install command) lives, and
             # terminal stderr is the only place the user actually looks.
+            # Prefer the daemon's failure record (exact log, consumed on
+            # read); fall back to the newest fresh server log. Both paths
+            # sanitize the tail (secret redaction + control-char strip).
             detail = ""
-            tail_info = latest_server_log_tail()
+            tail_info = consume_failed_server_log_tail() or latest_server_log_tail()
             if tail_info is not None:
                 tail_path, tail = tail_info
-                detail = f"\n  Newest server log: {tail_path}\n\n  Last 50 lines:\n{tail}"
+                detail = f"\n  Server log: {tail_path}\n\n  Last 50 lines:\n{tail}"
             raise LocalServerStartupError(
                 "The local daemon exited before its Omnigent server became ready. "
                 "See logs under ~/.omnigent/logs/host/ and "
