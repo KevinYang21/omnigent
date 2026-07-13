@@ -1087,95 +1087,7 @@ def test_ensure_does_not_advertise_pidfile_before_ownership_confirmed(
     assert pid_file.read_text() == "9001\n6767\n"
 
 
-def test_latest_server_log_tail_picks_newest_and_truncates(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """
-    ``latest_server_log_tail`` must return the most recently modified *fresh*
-    server log with only its trailing lines — this is what lets the foreground
-    CLI surface the crashed daemon-spawned server's actual error (e.g. a
-    missing Postgres driver) instead of only pointing at log directories.
-    """
-    import os
-    import time
-
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    log_dir = tmp_path / "logs" / "server"
-    log_dir.mkdir(parents=True)
-
-    now = time.time()
-    old = log_dir / "server-20260101-000000-000000.log"
-    old.write_text("older run\n")
-    os.utime(old, (now - 60, now - 60))
-
-    new = log_dir / "server-20260102-000000-000000.log"
-    new.write_text(
-        "\n".join(f"line {i}" for i in range(60))
-        + "\nModuleNotFoundError: No module named 'psycopg'\n"
-    )
-    os.utime(new, (now, now))
-
-    result = local_server.latest_server_log_tail(max_lines=50)
-
-    assert result is not None
-    path, tail = result
-    assert path == new
-    assert "No module named 'psycopg'" in tail
-    assert "older run" not in tail
-    # Truncated to the last 50 lines: the earliest lines must be gone.
-    assert "line 0\n" not in tail + "\n"
-    assert len(tail.splitlines()) == 50
-
-
-def test_latest_server_log_tail_ignores_stale_logs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """
-    A newest-by-mtime log that is *old* belongs to some earlier run — e.g.
-    the daemon died before even creating a server log this time. Surfacing
-    it would show a stale, potentially unrelated failure, so the freshness
-    cutoff must yield ``None`` instead.
-    """
-    import os
-    import time
-
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    log_dir = tmp_path / "logs" / "server"
-    log_dir.mkdir(parents=True)
-    stale = log_dir / "server-20260101-000000-000000.log"
-    stale.write_text("failure from days ago\n")
-    ancient = time.time() - 24 * 3600
-    os.utime(stale, (ancient, ancient))
-
-    assert local_server.latest_server_log_tail() is None
-
-
-def test_latest_server_log_tail_degrades_to_none(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """
-    Missing directory or an empty one must yield ``None`` (never raise):
-    the caller appends the tail as best-effort detail to an error message
-    that must always be produced.
-    """
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    # Directory does not exist at all.
-    assert local_server.latest_server_log_tail() is None
-    # Directory exists but holds no logs.
-    (tmp_path / "logs" / "server").mkdir(parents=True)
-    assert local_server.latest_server_log_tail() is None
-    # An empty (but fresh) log file still yields a (path, placeholder) pair.
-    empty = tmp_path / "logs" / "server" / "server-20260101-000000-000000.log"
-    empty.write_text("")
-    result = local_server.latest_server_log_tail()
-    assert result is not None
-    assert result[0] == empty
-    assert result[1] == "(empty log file)"
-
-
-def test_log_tail_redacts_credentials_and_strips_control_sequences(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_log_tail_redacts_credentials_and_strips_control_sequences(tmp_path: Path) -> None:
     """
     Regression for the credential-exposure review finding: migration errors
     deliberately embed the full db_uri (``user:password@host``) for a
@@ -1184,61 +1096,63 @@ def test_log_tail_redacts_credentials_and_strips_control_sequences(
     pasted into bug reports. ANSI/control sequences from captured subprocess
     output must be stripped so the log cannot inject terminal control.
     """
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    log_dir = tmp_path / "logs" / "server"
-    log_dir.mkdir(parents=True)
-    log = log_dir / "server-20260101-000000-000000.log"
+    log = tmp_path / "server-20260101-000000-000000.log"
     log.write_text(
         "RuntimeError: ... Take a backup of your database, then run\n"
         "    omnigent debug db-upgrade 'postgresql+psycopg://user:secret@host/db'\n"
         "\x1b[31mred alert\x1b[0m and a bell \x07 plus \x1b]0;title\x1b\\\n"
     )
 
-    result = local_server.latest_server_log_tail()
+    tail = local_server._read_log_tail(log)
 
-    assert result is not None
-    _, tail = result
     assert "secret" not in tail  # the password never reaches the terminal
     assert "[REDACTED]@host/db" in tail  # host part stays readable
     assert "\x1b" not in tail and "\x07" not in tail  # no terminal control
     assert "red alert" in tail  # visible text survives
 
 
-def test_failed_server_log_record_roundtrip_beats_newer_logs(
+def test_failure_record_roundtrip_requires_matching_pid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    The failure record must pinpoint the exact log of the spawn that failed,
-    even when an unrelated log (e.g. a concurrently running dedicated server)
-    has a newer mtime — and it must be consumed on read so a later unrelated
-    failure can never resurface it.
+    The failure record must be surfaced only for the daemon attempt the CLI
+    was waiting on: the recorded writer PID has to match. Freshness alone is
+    not correlation — a record from another attempt (or a concurrent
+    foreground server) must be dropped. Consumed on read either way, so a
+    later unrelated failure can never resurface it.
     """
+    import os
+
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     log_dir = tmp_path / "logs" / "server"
     log_dir.mkdir(parents=True)
-
     failed = log_dir / "server-20260101-000000-000000.log"
     failed.write_text("ModuleNotFoundError: No module named 'psycopg'\n")
-    unrelated_newer = log_dir / "server-20260102-000000-000000.log"
-    unrelated_newer.write_text("healthy dedicated server humming along\n")
 
     local_server._record_server_startup_failure(failed)
 
-    result = local_server.consume_failed_server_log_tail()
+    # Matching PID (the recorder is this process): exact log surfaces.
+    result = local_server.consume_failed_server_log_tail(os.getpid())
     assert result is not None
     path, tail = result
-    assert path == failed  # exact log, not the newer unrelated one
+    assert path == failed
     assert "No module named 'psycopg'" in tail
     # Consumed: a second read finds nothing.
-    assert local_server.consume_failed_server_log_tail() is None
+    assert local_server.consume_failed_server_log_tail(os.getpid()) is None
+
+    # Mismatched PID: record is dropped (and still consumed), never shown.
+    local_server._record_server_startup_failure(failed)
+    assert local_server.consume_failed_server_log_tail(os.getpid() + 1) is None
+    assert local_server.consume_failed_server_log_tail(os.getpid()) is None
 
 
-def test_failed_server_log_record_ignores_stale_and_garbage(
+def test_failure_record_ignores_stale_unknown_and_garbage(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    A stale record (daemon crash long ago) or a degenerate sidecar must yield
-    ``None`` — better no tail than a misleading one, and never an exception.
+    A stale record (old log mtime), an unknown daemon PID, or a degenerate
+    sidecar must yield ``None`` — better no tail than a misleading one, and
+    never an exception.
     """
     import os
     import time
@@ -1252,19 +1166,25 @@ def test_failed_server_log_record_ignores_stale_and_garbage(
     os.utime(log, (ancient, ancient))
 
     record_path = tmp_path / "local_server_failed.logpath"
-    # Stale record: the referenced log was last written far outside the
-    # freshness window (the daemon crash it belongs to is long past).
+    pid = os.getpid()
+    # Stale: the referenced log was last written far outside the window.
+    record_path.write_text(f"{log}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
+    # Unknown daemon PID: nothing can be attributed.
+    record_path.write_text(f"{log}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(None) is None
+    # Missing PID line (legacy/corrupt record).
     record_path.write_text(f"{log}\n")
-    assert local_server.consume_failed_server_log_tail() is None
-    # Empty record.
-    record_path.write_text("")
-    assert local_server.consume_failed_server_log_tail() is None
+    assert local_server.consume_failed_server_log_tail(pid) is None
+    # Non-numeric PID line.
+    record_path.write_text(f"{log}\nnot-a-pid\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
     # Record pointing at a vanished log file.
-    record_path.write_text(f"{log_dir / 'gone.log'}\n")
-    assert local_server.consume_failed_server_log_tail() is None
+    record_path.write_text(f"{log_dir / 'gone.log'}\n{pid}\n")
+    assert local_server.consume_failed_server_log_tail(pid) is None
 
 
-def test_read_log_tail_is_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_read_log_tail_is_bounded(tmp_path: Path) -> None:
     """
     Tailing must not read the whole file: a long-lived server's log can be
     hundreds of MB. Only the trailing block is read, and the last lines

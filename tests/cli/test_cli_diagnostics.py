@@ -561,20 +561,34 @@ def test_daemon_exit_error_carries_server_log_tail(
 ) -> None:
     """
     Foreground acceptance, part 1: when the daemon dies before its server is
-    ready, ``_discover_local_server_url`` must embed the newest server log's
+    ready, ``_discover_local_server_url`` must embed the failed spawn's log
     tail — the actionable cause (e.g. the Postgres-driver install command)
     lives there, and the CLI process never saw the subprocess's own error.
+    The tail is attributed via the daemon's failure record: recorded writer
+    PID must match the dead daemon's PID.
     """
+    from types import SimpleNamespace
+
     import omnigent.cli as cli
+    from omnigent.host import local_server
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     log_dir = tmp_path / "logs" / "server"
     log_dir.mkdir(parents=True)
-    (log_dir / "server-20260101-000000-000000.log").write_text(
+    failed_log = log_dir / "server-20260101-000000-000000.log"
+    failed_log.write_text(
         "Traceback (most recent call last):\n"
         "ModuleNotFoundError: Database backend 'postgresql+psycopg' needs the "
         "PostgreSQL driver 'psycopg', which is not installed. Install it with "
         "one of:\n    pip install 'omnigent[postgres]'\n"
+    )
+    # The daemon (this process, in the test) recorded the failing log before
+    # dying; the CLI finds the dead daemon's record carrying the same PID.
+    local_server._record_server_startup_failure(failed_log)
+    import os
+
+    monkeypatch.setattr(
+        cli, "_find_daemon_record", lambda target: SimpleNamespace(pid=os.getpid())
     )
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
     monkeypatch.setattr(cli, "_host_daemon_alive", lambda: False)
@@ -588,6 +602,38 @@ def test_daemon_exit_error_carries_server_log_tail(
     assert "daemon exited before its Omnigent server became ready" in message
     assert "Server log" in message
     assert "omnigent[postgres]" in message  # the actionable cause, inline
+
+
+def test_daemon_exit_error_omits_tail_without_attributable_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    No failure record (or one from a different attempt) must yield the plain
+    pointer error — never some other log presented as this attempt's cause.
+    """
+    from types import SimpleNamespace
+
+    import omnigent.cli as cli
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    # A fresh log exists (e.g. a concurrent dedicated server) but no failure
+    # record ties it to the daemon attempt that just died.
+    (log_dir / "server-20260101-000000-000000.log").write_text("unrelated humming server\n")
+    monkeypatch.setattr(cli, "_find_daemon_record", lambda target: SimpleNamespace(pid=12345))
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_host_daemon_alive", lambda: False)
+
+    from omnigent.host.local_server import LocalServerStartupError
+
+    with pytest.raises(LocalServerStartupError) as excinfo:
+        cli._discover_local_server_url(timeout=1.0)
+
+    message = str(excinfo.value)
+    assert "daemon exited before its Omnigent server became ready" in message
+    assert "unrelated humming server" not in message
+    assert "Last 50 lines" not in message
 
 
 def test_redact_secrets_scrubs_url_userinfo() -> None:

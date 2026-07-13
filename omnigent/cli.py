@@ -46,7 +46,6 @@ from omnigent.host.local_server import (
     _pid_alive,
     consume_failed_server_log_tail,
     ensure_local_omnigent_server,
-    latest_server_log_tail,
     local_server_status,
     local_server_url_if_healthy,
     server_config_signature,
@@ -2679,16 +2678,13 @@ def _discover_local_server_url(
         if url is not None:
             return url
         if not _host_daemon_alive():
-            # The server crashed inside the daemon's subprocess, so this
-            # process never saw the real error. Surface the failed spawn's
-            # log tail here — that is where the actionable cause (e.g. a
-            # missing Postgres driver and its install command) lives, and
-            # terminal stderr is the only place the user actually looks.
-            # Prefer the daemon's failure record (exact log, consumed on
-            # read); fall back to the newest fresh server log. Both paths
-            # sanitize the tail (secret redaction + control-char strip).
+            # The server crashed in the daemon's subprocess; surface its
+            # sanitized log tail here (attributed by daemon PID) — terminal
+            # stderr is the only place the user actually looks.
+            record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
+            daemon_pid = record.pid if record is not None else None
             detail = ""
-            tail_info = consume_failed_server_log_tail() or latest_server_log_tail()
+            tail_info = consume_failed_server_log_tail(daemon_pid)
             if tail_info is not None:
                 tail_path, tail = tail_info
                 detail = f"\n  Server log: {tail_path}\n\n  Last 50 lines:\n{tail}"

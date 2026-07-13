@@ -288,24 +288,17 @@ def _create_engine(db_uri: str) -> Engine:
             pool_timeout=10,
         )
     except ModuleNotFoundError as exc:
-        # SQLAlchemy imports the DBAPI driver lazily inside ``create_engine``.
-        # A non-SQLite URI (e.g. an ``OMNIGENT_DATABASE_URI`` pointing at
-        # Postgres) therefore fails here with a bare ``No module named
-        # 'psycopg'`` when the driver was never installed — an opaque error
-        # deep in SQLAlchemy internals. Translate it into an actionable
-        # message that names the install command. Unrelated failures re-raise
-        # via bare ``raise`` so the original exception is truly untouched
-        # (``raise exc from exc`` would stamp a self-referential ``__cause__``).
+        # SQLAlchemy imports the DBAPI lazily in create_engine; a missing
+        # Postgres driver surfaces as an opaque "No module named 'psycopg'".
+        # Bare re-raise on pass-through keeps the original truly untouched.
         translated = _translate_missing_driver_error(db_uri, exc)
         if translated is exc:
             raise
         raise translated from exc
     except NoSuchModuleError as exc:
-        # A PaaS-style ``postgres://`` URI is not a SQLAlchemy dialect at all
-        # ("Can't load plugin: sqlalchemy.dialects:postgres"). The local-server
-        # spawn path normalizes it away, but a direct ``--database-uri`` can
-        # still get here — append the conversion guidance instead of leaving
-        # the opaque plugin error. Non-Postgres dialect errors re-raise bare.
+        # PaaS-style postgres:// is not a SQLAlchemy dialect at all; append
+        # conversion guidance for direct --database-uri callers (the spawn
+        # path normalizes it away). Non-Postgres dialect errors re-raise bare.
         scheme = db_uri.split("://", 1)[0].lower()
         if not scheme.startswith("postgres"):
             raise
@@ -359,10 +352,8 @@ def _translate_missing_driver_error(db_uri: str, exc: ModuleNotFoundError) -> Mo
         "# plain virtualenv\n"
     )
     if exc.name == "psycopg2":
-        # A bare ``postgresql://`` (or explicit ``postgresql+psycopg2://``)
-        # URI makes SQLAlchemy select the legacy psycopg2 DBAPI. Installing
-        # psycopg 3 would NOT fix that dialect, so the guidance must lead
-        # with switching the URI scheme to the psycopg 3 dialect.
+        # Installing psycopg 3 would NOT fix the psycopg2 dialects — the
+        # guidance must lead with switching the URI scheme.
         message = (
             f"Database backend '{backend}' selects the legacy PostgreSQL "
             f"driver 'psycopg2', which is not installed. Preferred fix: "
