@@ -4027,6 +4027,13 @@
             "title": "Dictation Available",
             "type": "boolean"
           },
+          "enabled_connections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Enabled Connections",
+            "type": "array"
+          },
           "features": {
             "additionalProperties": {
               "type": "boolean"
@@ -4121,6 +4128,7 @@
           "managed_sandboxes_enabled",
           "sandbox_provider",
           "sandbox_providers",
+          "enabled_connections",
           "sharing_mode",
           "public_sharing_enabled",
           "server_version",
