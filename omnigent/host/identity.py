@@ -35,6 +35,10 @@ HOST_NAME_ENV_VAR = "OMNIGENT_HOST_NAME"
 # auth provider.
 MANAGED_HOST_TOKEN_HEADER = "X-Omnigent-Host-Token"
 
+# Correlates one host tunnel attempt across daemon, ingress, and server logs.
+# It is diagnostic metadata, not an authentication credential.
+HOST_TUNNEL_CONNECTION_ID_HEADER = "X-Omnigent-Host-Tunnel-Id"
+
 
 @dataclass
 class HostIdentity:

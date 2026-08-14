@@ -18,6 +18,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,7 +78,11 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
-from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import (
+    HOST_TUNNEL_CONNECTION_ID_HEADER,
+    HostIdentity,
+    load_or_create_host_identity,
+)
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
@@ -338,6 +344,17 @@ _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 30
 # escalates once, loudly. A healthy tunnel sends a frame within seconds; an
 # endpoint that accepts and never speaks is functionally down.
 _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
+
+
+def _websocket_close_details(exc: BaseException) -> tuple[int | None, str | None]:
+    """Return the received WebSocket close code and reason, when available."""
+    received = getattr(exc, "rcvd", None)
+    if received is None:
+        return None, None
+    code = getattr(received, "code", None)
+    reason = getattr(received, "reason", None)
+    return code if isinstance(code, int) else None, reason if isinstance(reason, str) else None
+
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -828,6 +845,11 @@ class HostProcess:
         # Per-connection markers feeding the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        self._conn_hello_sent = False
+        self._connect_attempt = 0
+        self._connection_id: str | None = None
+        self._connection_started_at: float | None = None
+        self._upgrade_accepted_at: float | None = None
         # Live tunnel connection, set by _serve_frames for the watcher
         # tasks (which outlive any single connection) to report on.
         self._ws: websockets.asyncio.client.ClientConnection | None = None
@@ -2549,10 +2571,35 @@ class HostProcess:
                     backoff = _RECONNECT_BASE_S
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     break
-                except HostConnectError:
+                except HostConnectError as exc:
                     # Permanent failure (auth / authorization / outdated
                     # server). Do NOT back off and retry — propagate so
                     # ``run_host_process`` can fail loud.
+                    elapsed_ms = (
+                        (time.monotonic() - self._connection_started_at) * 1000
+                        if self._connection_started_at is not None
+                        else None
+                    )
+                    _logger.error(
+                        "host_tunnel phase=failed connection_id=%s host_id=%s "
+                        "attempt=%d last_phase=%s elapsed_ms=%s error_type=%s error=%s",
+                        self._connection_id or "untracked",
+                        self._identity.host_id,
+                        self._connect_attempt,
+                        self._tunnel_last_phase(),
+                        f"{elapsed_ms:.1f}" if elapsed_ms is not None else "unknown",
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "tunnel_connection_id": self._connection_id or "untracked",
+                            "tunnel_phase": "failed",
+                            "tunnel_last_phase": self._tunnel_last_phase(),
+                            "host_id": self._identity.host_id,
+                            "tunnel_attempt": self._connect_attempt,
+                            "tunnel_elapsed_ms": elapsed_ms,
+                            "tunnel_error_type": type(exc).__name__,
+                        },
+                    )
                     raise
                 except Exception as exc:
                     if not isinstance(exc, InvalidURI):
@@ -2647,11 +2694,46 @@ class HostProcess:
                         or (ingress_recycle and not _url_is_loopback(self._server_url))
                     ) and not silent_churn
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
+                    close_code, close_reason = _websocket_close_details(exc)
+                    elapsed_ms = (
+                        (time.monotonic() - self._connection_started_at) * 1000
+                        if self._connection_started_at is not None
+                        else None
+                    )
+                    last_phase = self._tunnel_last_phase()
+                    disconnect_extra: dict[str, object] = {
+                        "tunnel_connection_id": self._connection_id or "untracked",
+                        "tunnel_phase": "disconnected",
+                        "tunnel_last_phase": last_phase,
+                        "host_id": self._identity.host_id,
+                        "tunnel_attempt": self._connect_attempt,
+                        "tunnel_error_type": type(exc).__name__,
+                        "tunnel_backoff_s": wait_s,
+                        "tunnel_recycle": recycle,
+                    }
+                    if elapsed_ms is not None:
+                        disconnect_extra["tunnel_elapsed_ms"] = elapsed_ms
+                    if close_code is not None:
+                        disconnect_extra["tunnel_close_code"] = close_code
+                    if close_reason is not None:
+                        disconnect_extra["tunnel_close_reason"] = close_reason
                     _logger.warning(
-                        "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
+                        "Host tunnel disconnected: %s. Reconnecting in %.1fs%s; "
+                        "host_tunnel phase=disconnected connection_id=%s host_id=%s "
+                        "attempt=%d last_phase=%s elapsed_ms=%s close_code=%s "
+                        "close_reason=%r error_type=%s",
                         exc,
                         wait_s,
                         " (recycle — prompt reconnect)" if recycle else "",
+                        self._connection_id or "untracked",
+                        self._identity.host_id,
+                        self._connect_attempt,
+                        last_phase,
+                        f"{elapsed_ms:.1f}" if elapsed_ms is not None else "unknown",
+                        close_code,
+                        close_reason,
+                        type(exc).__name__,
+                        extra=disconnect_extra,
                     )
                     await asyncio.sleep(wait_s)
                     import random
@@ -2711,6 +2793,16 @@ class HostProcess:
                 handle.proc.kill()
         self._runners.clear()
 
+    def _tunnel_last_phase(self) -> str:
+        """Return the furthest lifecycle phase observed for the current attempt."""
+        if self._conn_frame_received:
+            return "frame_received"
+        if self._conn_hello_sent:
+            return "hello_sent"
+        if self._conn_upgrade_accepted:
+            return "upgrade_accepted"
+        return "connect_start"
+
     async def _connect_and_serve(self) -> None:
         """Single connection attempt: connect, hello, serve.
 
@@ -2720,10 +2812,32 @@ class HostProcess:
         # Fresh per-connection markers for the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
+        self._conn_hello_sent = False
+        self._connect_attempt += 1
+        self._connection_id = uuid.uuid4().hex
+        started_at = time.monotonic()
+        self._connection_started_at = started_at
+        self._upgrade_accepted_at = None
+        reconnect = self._ever_connected
         url = self._tunnel_url()
-        headers = self._build_connect_headers()
+        headers = self._build_connect_headers(connection_id=self._connection_id)
 
-        _logger.info("Connecting to %s", url)
+        _logger.info(
+            "Connecting to %s; host_tunnel phase=connect_start connection_id=%s "
+            "host_id=%s attempt=%d reconnect=%s",
+            url,
+            self._connection_id,
+            self._identity.host_id,
+            self._connect_attempt,
+            reconnect,
+            extra={
+                "tunnel_connection_id": self._connection_id,
+                "tunnel_phase": "connect_start",
+                "host_id": self._identity.host_id,
+                "tunnel_attempt": self._connect_attempt,
+                "tunnel_reconnect": reconnect,
+            },
+        )
         # Build a verifying SSL context from a real CA bundle for wss:// — a bare
         # default context loads zero roots on uv / python-build-standalone Pythons
         # (no OpenSSL default cert path), which fails handshake verification.
@@ -2751,6 +2865,26 @@ class HostProcess:
             if fatal is not None:
                 raise fatal from exc
             raise
+        accepted_at = time.monotonic()
+        self._upgrade_accepted_at = accepted_at
+        handshake_ms = (accepted_at - started_at) * 1000
+        _logger.info(
+            "host_tunnel phase=upgrade_accepted connection_id=%s host_id=%s "
+            "attempt=%d reconnect=%s handshake_ms=%.1f",
+            self._connection_id,
+            self._identity.host_id,
+            self._connect_attempt,
+            reconnect,
+            handshake_ms,
+            extra={
+                "tunnel_connection_id": self._connection_id,
+                "tunnel_phase": "upgrade_accepted",
+                "host_id": self._identity.host_id,
+                "tunnel_attempt": self._connect_attempt,
+                "tunnel_reconnect": reconnect,
+                "tunnel_handshake_ms": handshake_ms,
+            },
+        )
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
         self._ever_connected = True
@@ -2771,7 +2905,7 @@ class HostProcess:
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
 
-    def _build_connect_headers(self) -> dict[str, str]:
+    def _build_connect_headers(self, *, connection_id: str | None = None) -> dict[str, str]:
         """Build the WebSocket upgrade headers for the tunnel connection.
 
         Server-managed sandbox hosts authenticate with the launch token
@@ -2785,6 +2919,7 @@ class HostProcess:
         the upgrade proceeds unauthenticated and the server/proxy
         decides.
 
+        :param connection_id: Per-attempt diagnostic id forwarded to the server.
         :returns: Header mapping for the WS upgrade; carries either the
             managed-host token header or — only when a token could be
             minted — ``{"Authorization": "Bearer <token>"}``.
@@ -2797,6 +2932,8 @@ class HostProcess:
         # is not a browser. Seeded before either auth branch so it is sent
         # on both the managed-token and Bearer paths.
         headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        if connection_id is not None:
+            headers[HOST_TUNNEL_CONNECTION_ID_HEADER] = connection_id
         # Workspace routing: the tunnel handshake must name the workspace or
         # it routes to the account. Empty for single-workspace and managed
         # hosts (no recorded selector), so neither is affected.
@@ -2895,6 +3032,30 @@ class HostProcess:
             installation_id=_tel_install_id,
         )
         await ws.send(encode_host_frame(hello))
+        self._conn_hello_sent = True
+        hello_sent_at = time.monotonic()
+        accepted_to_hello_ms = (
+            (hello_sent_at - self._upgrade_accepted_at) * 1000
+            if self._upgrade_accepted_at is not None
+            else None
+        )
+        hello_extra: dict[str, object] = {
+            "tunnel_connection_id": self._connection_id or "untracked",
+            "tunnel_phase": "hello_sent",
+            "host_id": self._identity.host_id,
+            "tunnel_attempt": self._connect_attempt,
+        }
+        if accepted_to_hello_ms is not None:
+            hello_extra["tunnel_accepted_to_hello_ms"] = accepted_to_hello_ms
+        _logger.info(
+            "host_tunnel phase=hello_sent connection_id=%s host_id=%s attempt=%d "
+            "accepted_to_hello_ms=%s",
+            self._connection_id or "untracked",
+            self._identity.host_id,
+            self._connect_attempt,
+            f"{accepted_to_hello_ms:.1f}" if accepted_to_hello_ms is not None else "unknown",
+            extra=hello_extra,
+        )
         self._ws = ws
         # Flush exit reports that raced a disconnect: a runner that died
         # while the tunnel was down would otherwise never be reported and

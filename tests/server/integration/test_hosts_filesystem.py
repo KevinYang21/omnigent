@@ -437,6 +437,7 @@ async def test_list_filesystem_unknown_host_returns_404(
 
 async def test_list_filesystem_offline_host_returns_409(
     fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Verify a request for an offline host returns 409.
@@ -457,6 +458,13 @@ async def test_list_filesystem_offline_host_returns_409(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/hosts/3d9665477127e41f42de3f4109418173/filesystem")
     assert resp.status_code == 409
+    unavailable = next(
+        record
+        for record in caplog.records
+        if getattr(record, "host_operation", None) == "list_dir"
+    )
+    assert unavailable.host_unavailable_classification == "offline"
+    assert unavailable.host_id == "3d9665477127e41f42de3f4109418173"
 
 
 async def test_list_filesystem_missing_path_returns_404(

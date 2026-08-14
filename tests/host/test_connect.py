@@ -54,7 +54,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.host.identity import HostIdentity
+from omnigent.host.identity import HOST_TUNNEL_CONNECTION_ID_HEADER, HostIdentity
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -3249,16 +3249,18 @@ class _ConnectSpy:
         """
         self._exceptions = exceptions
         self.call_count = 0
+        self.calls: list[dict[str, object]] = []
 
     def __call__(self, url: str, **kwargs: object) -> _HandshakeFailingConnect | _AcceptingConnect:
         """Return an async-CM scripting the handshake for this call.
 
         :param url: Tunnel URL passed by production (ignored).
-        :param kwargs: Connect kwargs passed by production (ignored).
+        :param kwargs: Connect kwargs passed by production (recorded).
         :returns: A context manager whose ``__aenter__`` raises the
             queued exception, or completes the handshake for a ``None``
             entry.
         """
+        self.calls.append(kwargs)
         exc = self._exceptions[min(self.call_count, len(self._exceptions) - 1)]
         self.call_count += 1
         if exc is None or isinstance(exc, int):
@@ -3336,6 +3338,20 @@ def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) 
     headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
 
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+def test_build_connect_headers_adds_tunnel_connection_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each attempt forwards its diagnostic id without treating it as auth."""
+    import omnigent.runner._entry as entry_mod
+
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+
+    headers = _host()._build_connect_headers(connection_id="a" * 32)
+
+    assert headers[HOST_TUNNEL_CONNECTION_ID_HEADER] == "a" * 32
 
 
 def test_build_connect_headers_retains_auth_factory(
@@ -3797,6 +3813,42 @@ async def test_run_reconnects_on_transient_upgrade_failure(
 
     # 2 = transient attempt + cancel attempt → it genuinely reconnected.
     assert spy.call_count == 2
+
+
+async def test_run_logs_correlated_tunnel_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One attempt id joins handshake, hello, disconnect, and retry evidence."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    spy = _ConnectSpy([None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with caplog.at_level(logging.INFO, logger="omnigent.host.connect"):
+        await host.run()
+
+    first_attempt = [
+        record for record in caplog.records if getattr(record, "tunnel_attempt", None) == 1
+    ]
+    phases = [record.tunnel_phase for record in first_attempt]
+    assert phases == ["connect_start", "upgrade_accepted", "hello_sent", "disconnected"]
+    connection_ids = {record.tunnel_connection_id for record in first_attempt}
+    assert len(connection_ids) == 1
+    connection_id = connection_ids.pop()
+    assert len(connection_id) == 32
+    assert all(char in "0123456789abcdef" for char in connection_id)
+
+    headers = spy.calls[0]["additional_headers"]
+    assert isinstance(headers, dict)
+    assert headers[HOST_TUNNEL_CONNECTION_ID_HEADER] == connection_id
+
+    disconnected = first_attempt[-1]
+    assert disconnected.tunnel_last_phase == "hello_sent"
+    assert disconnected.tunnel_error_type == "ConnectionClosedError"
+    assert disconnected.tunnel_elapsed_ms >= 0
 
 
 def _refused_exc() -> ConnectionRefusedError:
