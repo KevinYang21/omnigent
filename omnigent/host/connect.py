@@ -2793,7 +2793,6 @@ class HostProcess:
                     )
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
                     close_code, close_reason = _websocket_close_details(exc)
-                    reconnect_kind = "resume" if woke else ("recycle" if recycle else "backoff")
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s; "
                         "close_code=%s close_reason=%r error_type=%s",
@@ -2808,12 +2807,9 @@ class HostProcess:
                         close_reason,
                         type(exc).__name__,
                         extra={
-                            "host_id": self._identity.host_id,
                             "ws_close_code": close_code,
                             "ws_close_reason": close_reason,
                             "ws_error_type": type(exc).__name__,
-                            "ws_reconnect_delay_s": wait_s,
-                            "ws_reconnect_kind": reconnect_kind,
                         },
                     )
                     await asyncio.sleep(wait_s)

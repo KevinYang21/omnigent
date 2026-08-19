@@ -387,17 +387,7 @@ def create_host_tunnel_router(
                             host_id,
                         )
         except Exception as exc:
-            _logger.exception(
-                "Host tunnel error for %s: stage=%s error_type=%s",
-                host_id,
-                stage,
-                type(exc).__name__,
-                extra={
-                    "host_id": host_id,
-                    "ws_stage": stage,
-                    "ws_error_type": type(exc).__name__,
-                },
-            )
+            _logger.exception("Host tunnel error for %s", host_id)
             retryable = stage in {"registration", "registry", "connected"}
             await _send_connection_error(
                 ws,

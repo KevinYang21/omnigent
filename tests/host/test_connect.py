@@ -4176,8 +4176,6 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     disconnects = [record for record in caplog.records if hasattr(record, "ws_error_type")]
     assert all(record.ws_error_type == "ConnectionClosedError" for record in disconnects)
     assert all(record.ws_close_code is None for record in disconnects)
-    assert disconnects[1].ws_reconnect_kind == "recycle"
-    assert disconnects[-1].ws_reconnect_kind == "backoff"
 
 
 async def test_inbound_frame_resets_silent_connect_streak(
