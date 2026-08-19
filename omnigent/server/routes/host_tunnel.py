@@ -20,9 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import time
-import uuid
 from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -50,10 +48,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.host.identity import (
-    HOST_TUNNEL_CONNECTION_ID_HEADER,
-    MANAGED_HOST_TOKEN_HEADER,
-)
+from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
@@ -73,15 +68,6 @@ _logger = logging.getLogger(__name__)
 SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
-_CONNECTION_ID_RE = re.compile(r"[0-9a-f]{32}")
-
-
-def _connection_id(ws: WebSocket) -> tuple[str, str]:
-    """Read a safe client correlation id, or generate one for an older host."""
-    candidate = ws.headers.get(HOST_TUNNEL_CONNECTION_ID_HEADER)
-    if candidate is not None and _CONNECTION_ID_RE.fullmatch(candidate.lower()):
-        return candidate.lower(), "host"
-    return uuid.uuid4().hex, "server"
 
 
 def create_host_tunnel_router(
@@ -159,14 +145,6 @@ def create_host_tunnel_router(
         7. Start sender, receiver, and ping loops.
         8. On disconnect: deregister, set offline in DB.
         """
-        started_at = time.monotonic()
-        connection_id, connection_id_source = _connection_id(ws)
-        accepted_at: float | None = None
-        registered_at: float | None = None
-        close_code: int | None = None
-        close_reason: str | None = None
-        terminal_error_type: str | None = None
-        deregistered_current: bool | None = None
         # Legacy hosts dial in with ``host_<hex>`` — normalise to the stored
         # bare form. Malformed ids are refused here because WebSocket routes
         # bypass the app's StatementError→404 handler.
@@ -251,23 +229,6 @@ def create_host_tunnel_router(
                 return
 
         await ws.accept()
-        accepted_at = time.monotonic()
-        accept_ms = (accepted_at - started_at) * 1000
-        _logger.info(
-            "host_tunnel phase=upgrade_accepted connection_id=%s "
-            "connection_id_source=%s host_id=%s server_accept_ms=%.1f",
-            connection_id,
-            connection_id_source,
-            host_id,
-            accept_ms,
-            extra={
-                "tunnel_connection_id": connection_id,
-                "tunnel_connection_id_source": connection_id_source,
-                "tunnel_phase": "upgrade_accepted",
-                "host_id": host_id,
-                "tunnel_server_accept_ms": accept_ms,
-            },
-        )
         conn: HostConnection | None = None
         host_persisted = False
         stage = "hello"
@@ -275,23 +236,21 @@ def create_host_tunnel_router(
             raw = await ws.receive_text()
             frame = decode_host_frame(raw)
             if not isinstance(frame, HostHelloFrame):
-                close_code = 4001
-                close_reason = "expected host.hello frame"
-                await _send_connection_error(ws, stage="hello", error=close_reason)
-                await ws.close(code=4001, reason=close_reason)
+                error = "expected host.hello frame"
+                await _send_connection_error(ws, stage="hello", error=error)
+                await ws.close(code=4001, reason=error)
                 return
 
             stage = "protocol"
             remote_major = frame.frame_protocol_version
             if remote_major != SUPPORTED_FRAME_PROTOCOL_MAJOR:
-                close_code = 4002
-                close_reason = (
+                error = (
                     f"frame_protocol_version mismatch: "
                     f"server supports {SUPPORTED_FRAME_PROTOCOL_MAJOR}, "
                     f"host sent {remote_major}"
                 )
-                await _send_connection_error(ws, stage="protocol", error=close_reason)
-                await ws.close(code=4002, reason=close_reason)
+                await _send_connection_error(ws, stage="protocol", error=error)
+                await ws.close(code=4002, reason=error)
                 return
 
             stage = "registration"
@@ -312,29 +271,17 @@ def create_host_tunnel_router(
                 frame,
                 owner=tunnel_owner,
             )
-            registered_at = time.monotonic()
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             stage = "connected"
             _logger.info(
-                "Host %s connected (version=%s, name=%s, runners=%s); "
-                "host_tunnel phase=registered connection_id=%s "
-                "accepted_to_registered_ms=%.1f",
+                "Host %s connected (version=%s, name=%s, runners=%s)",
                 host_id,
                 frame.version,
                 frame.name,
                 frame.runners,
-                connection_id,
-                (registered_at - accepted_at) * 1000,
-                extra={
-                    "tunnel_connection_id": connection_id,
-                    "tunnel_phase": "registered",
-                    "host_id": host_id,
-                    "tunnel_accepted_to_registered_ms": (registered_at - accepted_at) * 1000,
-                    "host_version": frame.version,
-                },
             )
 
             sender_task = asyncio.create_task(
@@ -396,8 +343,7 @@ def create_host_tunnel_router(
                 )
                 # If the host already reconnected, this handler's connection
                 # was replaced; only the current one may mark it offline.
-                deregistered_current = host_registry.deregister(host_id, conn=conn)
-                if deregistered_current:
+                if host_registry.deregister(host_id, conn=conn):
                     await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
@@ -409,28 +355,20 @@ def create_host_tunnel_router(
                         )
 
         except WebSocketDisconnect as exc:
-            close_code = exc.code
-            close_reason = exc.reason
-            terminal_error_type = type(exc).__name__
-            disconnect_extra: dict[str, object] = {
-                "tunnel_connection_id": connection_id,
-                "tunnel_phase": "disconnect_observed",
-                "tunnel_last_phase": ("registered" if registered_at is not None else "pre_hello"),
-                "host_id": host_id,
-            }
-            if close_code is not None:
-                disconnect_extra["tunnel_close_code"] = close_code
-            if close_reason is not None:
-                disconnect_extra["tunnel_close_reason"] = close_reason
             _logger.warning(
-                "Host %s disconnected; host_tunnel phase=disconnect_observed "
-                "connection_id=%s last_phase=%s close_code=%s close_reason=%r",
+                "Host %s disconnected: close_code=%s close_reason=%r stage=%s registered=%s",
                 host_id,
-                connection_id,
-                "registered" if registered_at is not None else "pre_hello",
-                close_code,
-                close_reason,
-                extra=disconnect_extra,
+                exc.code,
+                exc.reason,
+                stage,
+                conn is not None,
+                extra={
+                    "host_id": host_id,
+                    "ws_close_code": exc.code,
+                    "ws_close_reason": exc.reason,
+                    "ws_stage": stage,
+                    "ws_registered": conn is not None,
+                },
             )
             # Only run disconnect cleanup if we actually registered this
             # host on THIS connection. A connect that failed before
@@ -449,22 +387,15 @@ def create_host_tunnel_router(
                             host_id,
                         )
         except Exception as exc:
-            terminal_error_type = type(exc).__name__
             _logger.exception(
-                "Host tunnel error for %s; host_tunnel phase=error "
-                "connection_id=%s last_phase=%s error_type=%s",
+                "Host tunnel error for %s: stage=%s error_type=%s",
                 host_id,
-                connection_id,
-                "registered" if registered_at is not None else "pre_hello",
-                terminal_error_type,
+                stage,
+                type(exc).__name__,
                 extra={
-                    "tunnel_connection_id": connection_id,
-                    "tunnel_phase": "error",
-                    "tunnel_last_phase": (
-                        "registered" if registered_at is not None else "pre_hello"
-                    ),
                     "host_id": host_id,
-                    "tunnel_error_type": terminal_error_type,
+                    "ws_stage": stage,
+                    "ws_error_type": type(exc).__name__,
                 },
             )
             retryable = stage in {"registration", "registry", "connected"}
@@ -477,56 +408,10 @@ def create_host_tunnel_router(
             with contextlib.suppress(Exception):
                 await ws.close(code=4005, reason="host connection failed")
             if conn is not None:
-                deregistered_current = host_registry.deregister(host_id, conn=conn)
-                if deregistered_current:
+                if host_registry.deregister(host_id, conn=conn):
                     await asyncio.to_thread(host_store.set_offline, host_id)
             elif host_persisted:
                 await asyncio.to_thread(host_store.set_offline, host_id)
-        finally:
-            if accepted_at is not None:
-                closed_at = time.monotonic()
-                accepted_lifetime_ms = (closed_at - accepted_at) * 1000
-                registered_lifetime_ms = (
-                    (closed_at - registered_at) * 1000 if registered_at is not None else None
-                )
-                last_phase = "registered" if registered_at is not None else "pre_hello"
-                closed_extra: dict[str, object] = {
-                    "tunnel_connection_id": connection_id,
-                    "tunnel_phase": "closed",
-                    "tunnel_last_phase": last_phase,
-                    "host_id": host_id,
-                    "tunnel_accepted_lifetime_ms": accepted_lifetime_ms,
-                }
-                if registered_lifetime_ms is not None:
-                    closed_extra["tunnel_registered_lifetime_ms"] = registered_lifetime_ms
-                if close_code is not None:
-                    closed_extra["tunnel_close_code"] = close_code
-                if close_reason is not None:
-                    closed_extra["tunnel_close_reason"] = close_reason
-                if terminal_error_type is not None:
-                    closed_extra["tunnel_error_type"] = terminal_error_type
-                if deregistered_current is not None:
-                    closed_extra["tunnel_deregistered_current"] = deregistered_current
-                _logger.info(
-                    "host_tunnel phase=closed connection_id=%s host_id=%s "
-                    "last_phase=%s accepted_lifetime_ms=%.1f "
-                    "registered_lifetime_ms=%s close_code=%s close_reason=%r "
-                    "error_type=%s deregistered_current=%s",
-                    connection_id,
-                    host_id,
-                    last_phase,
-                    accepted_lifetime_ms,
-                    (
-                        f"{registered_lifetime_ms:.1f}"
-                        if registered_lifetime_ms is not None
-                        else "unknown"
-                    ),
-                    close_code,
-                    close_reason,
-                    terminal_error_type,
-                    deregistered_current,
-                    extra=closed_extra,
-                )
 
     return router
 

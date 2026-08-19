@@ -81,7 +81,7 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
 
 
-def _host_absent_error(host: Host, *, operation: str) -> OmnigentError:
+def _host_absent_error(host: Host) -> OmnigentError:
     """Classify a "host not on this replica" miss for a host-scoped route.
 
     Every ``/v1/hosts/{id}/*`` route reaches the host over its live tunnel in
@@ -97,31 +97,11 @@ def _host_absent_error(host: Host, *, operation: str) -> OmnigentError:
     - otherwise → genuinely offline → ``CONFLICT`` (409).
 
     :param host: The host's persistent record (owner-checked by the caller).
-    :param operation: Low-cardinality host operation that could not be routed.
     :returns: The ``OmnigentError`` to raise; the global handler maps its code
         to the HTTP status and the ``{"error": {"code": ...}}`` body the
         client's re-address matches on.
     """
-    live = host_is_live(host)
-    classification = "wrong_replica" if live else "offline"
-    _logger.log(
-        logging.INFO if live else logging.WARNING,
-        "host_operation_unavailable operation=%s host_id=%s classification=%s "
-        "durable_status=%s updated_at=%s",
-        operation,
-        host.host_id,
-        classification,
-        host.status,
-        host.updated_at,
-        extra={
-            "host_operation": operation,
-            "host_id": host.host_id,
-            "host_unavailable_classification": classification,
-            "host_durable_status": host.status,
-            "host_updated_at": host.updated_at,
-        },
-    )
-    if live:
+    if host_is_live(host):
         return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
     return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
@@ -716,7 +696,7 @@ def create_hosts_router(
             raise HTTPException(status_code=403, detail="not your host")
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host, operation="model_options")
+            raise _host_absent_error(host)
 
         result = await _proxy_model_options(
             host_registry=host_registry,
@@ -1141,7 +1121,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host, operation="list_dir")
+            raise _host_absent_error(host)
 
         result = await _proxy_list_dir(
             host_registry=host_registry,
@@ -1232,7 +1212,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host, operation="create_dir")
+            raise _host_absent_error(host)
 
         result = await _proxy_create_dir(
             host_registry=host_registry,
@@ -1320,7 +1300,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host, operation="install_harness")
+            raise _host_absent_error(host)
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
         # in-flight request so a double-click (or `codex` + `codex-native`, which
@@ -1436,7 +1416,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host, operation="store_secret")
+            raise _host_absent_error(host)
 
         frame = HostStoreSecretFrame(
             request_id=secrets.token_hex(8),
@@ -1516,7 +1496,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host, operation="detect_credentials")
+            raise _host_absent_error(host)
 
         result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
         return {
@@ -1572,7 +1552,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise _host_absent_error(host, operation="list_worktrees")
+            raise _host_absent_error(host)
 
         try:
             worktrees = await list_worktrees_on_host(

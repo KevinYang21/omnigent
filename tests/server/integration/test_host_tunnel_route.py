@@ -21,7 +21,6 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.host.identity import HOST_TUNNEL_CONNECTION_ID_HEADER
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
@@ -37,14 +36,12 @@ def _websocket_scope(
     path: str,
     *,
     client_host: str = "127.0.0.1",
-    connection_id: str | None = None,
 ) -> dict[str, object]:
     """Build an ASGI WebSocket scope for a test path.
 
     :param path: WebSocket path, e.g.
         ``"/v1/hosts/1444b179a19322377dcc75cf7fcd1bd2/tunnel"``.
     :param client_host: ASGI client host, e.g. ``"127.0.0.1"``.
-    :param connection_id: Optional host-provided tunnel correlation id.
     :returns: A minimal ASGI WebSocket scope accepted by FastAPI.
     """
     return {
@@ -54,11 +51,7 @@ def _websocket_scope(
         "path": path,
         "raw_path": path.encode("ascii"),
         "query_string": b"",
-        "headers": (
-            [(HOST_TUNNEL_CONNECTION_ID_HEADER.lower().encode(), connection_id.encode())]
-            if connection_id is not None
-            else []
-        ),
+        "headers": [],
         "client": (client_host, 50000),
         "server": ("testserver", 80),
         "subprotocols": [],
@@ -68,20 +61,14 @@ def _websocket_scope(
 async def _connect_route(
     app: FastAPI,
     path: str,
-    *,
-    connection_id: str | None = None,
 ) -> ApplicationCommunicator:
     """Connect an ASGI WebSocket communicator to the host tunnel.
 
     :param app: FastAPI app containing the host tunnel router.
     :param path: WebSocket path.
-    :param connection_id: Optional host-provided tunnel correlation id.
     :returns: The connected ASGI communicator.
     """
-    communicator = ApplicationCommunicator(
-        app,
-        _websocket_scope(path, connection_id=connection_id),
-    )
+    communicator = ApplicationCommunicator(app, _websocket_scope(path))
     await communicator.send_input({"type": "websocket.connect"})
     accepted = await communicator.receive_output(timeout=1.0)
     assert accepted["type"] == "websocket.accept", f"Expected {path} to accept; got {accepted!r}"
@@ -283,6 +270,7 @@ async def test_host_tunnel_accepts_and_registers(
 
 async def test_host_tunnel_deregisters_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Verify that the host is removed from the registry on disconnect.
@@ -295,74 +283,19 @@ async def test_host_tunnel_deregisters_on_disconnect(
     await _send_hello_and_wait(comm, registry)
     assert registry.get(_HOST_ID) is not None
 
-    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
-    # Give the handler a moment to process the disconnect.
-    await asyncio.sleep(0.1)
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.host_tunnel"):
+        await comm.send_input(
+            {"type": "websocket.disconnect", "code": 1001, "reason": "rolling restart"}
+        )
+        # Give the handler a moment to process the disconnect.
+        await asyncio.sleep(0.1)
 
     assert registry.get(_HOST_ID) is None
-
-
-async def test_host_tunnel_logs_pre_hello_disconnect(
-    host_app: tuple[FastAPI, HostRegistry, HostStore],
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Accepted probes that vanish before hello are identifiable in logs."""
-    app, _registry, _store = host_app
-    connection_id = "a" * 32
-
-    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.host_tunnel"):
-        comm = await _connect_route(app, _TUNNEL_PATH, connection_id=connection_id)
-        await comm.send_input(
-            {
-                "type": "websocket.disconnect",
-                "code": 1006,
-                "reason": "network lost",
-            }
-        )
-        await comm.wait(timeout=1.0)
-
-    accepted = next(
-        r for r in caplog.records if getattr(r, "tunnel_phase", None) == "upgrade_accepted"
-    )
-    closed = next(r for r in caplog.records if getattr(r, "tunnel_phase", None) == "closed")
-    assert accepted.tunnel_connection_id == connection_id
-    assert accepted.tunnel_connection_id_source == "host"
-    assert closed.tunnel_connection_id == connection_id
-    assert closed.tunnel_last_phase == "pre_hello"
-    assert closed.tunnel_close_code == 1006
-    assert not hasattr(closed, "tunnel_registered_lifetime_ms")
-
-
-async def test_host_tunnel_logs_registered_connection_lifecycle(
-    host_app: tuple[FastAPI, HostRegistry, HostStore],
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Registration and close timings retain the host correlation id."""
-    app, registry, _store = host_app
-    connection_id = "b" * 32
-
-    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.host_tunnel"):
-        comm = await _connect_route(app, _TUNNEL_PATH, connection_id=connection_id)
-        await _send_hello_and_wait(comm, registry)
-        await comm.send_input(
-            {
-                "type": "websocket.disconnect",
-                "code": 1001,
-                "reason": "going away",
-            }
-        )
-        await comm.wait(timeout=1.0)
-
-    registered = next(
-        r for r in caplog.records if getattr(r, "tunnel_phase", None) == "registered"
-    )
-    closed = next(r for r in caplog.records if getattr(r, "tunnel_phase", None) == "closed")
-    assert registered.tunnel_connection_id == connection_id
-    assert registered.tunnel_accepted_to_registered_ms >= 0
-    assert closed.tunnel_connection_id == connection_id
-    assert closed.tunnel_last_phase == "registered"
-    assert closed.tunnel_close_code == 1001
-    assert closed.tunnel_registered_lifetime_ms >= 0
+    disconnect = next(record for record in caplog.records if hasattr(record, "ws_close_code"))
+    assert disconnect.ws_close_code == 1001
+    assert disconnect.ws_close_reason == "rolling restart"
+    assert disconnect.ws_stage == "connected"
+    assert disconnect.ws_registered is True
 
 
 async def test_host_tunnel_upserts_db_on_connect(
