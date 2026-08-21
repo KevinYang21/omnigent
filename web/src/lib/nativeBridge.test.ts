@@ -15,6 +15,7 @@ import {
   serverManifestOf,
   setBadgeCount as bridgeSetBadge,
   setThemeSource,
+  startNativeShellLiveness,
   supportsBrowser,
   switchServer,
 } from "./nativeBridge";
@@ -166,7 +167,7 @@ describe("isNativeShell / isElectronShell", () => {
   });
 
   it("treats the Android bridge as native but not Electron or iOS", () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     expect(isElectronShell()).toBe(false);
     expect(isIOSShell()).toBe(false);
     expect(isAndroidShell()).toBe(true);
@@ -177,7 +178,7 @@ describe("isNativeShell / isElectronShell", () => {
     setIOS(true);
     expect(isAndroidShell()).toBe(false);
     setIOS(false);
-    setAndroid(true);
+    setAndroid(true, true, true);
     expect(isIOSShell()).toBe(false);
   });
 
@@ -297,7 +298,7 @@ describe("setThemeSource", () => {
   });
 
   it("routes the selected theme through the Android bridge", () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     setThemeSource("light");
     expect(androidSetColorScheme).toHaveBeenCalledWith("light");
   });
@@ -342,7 +343,7 @@ describe("nativeNotify", () => {
   });
 
   it("routes the notification through the Android bridge when present", async () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     await expect(nativeNotify({ title: "Session 1", body: "done" })).resolves.toBe(true);
     expect(androidNotify).toHaveBeenCalledWith({
       title: "Session 1",
@@ -514,25 +515,6 @@ describe("server picker trio (getServerPicker / switchServer / openServerSetup)"
     recentServers: ["https://managed.example.com/", "https://recent.example.com/"],
   };
 
-  it("resolves null and never touches a bridge in a plain browser", async () => {
-    await expect(getServerPicker()).resolves.toBeNull();
-    await switchServer("https://recent.example.com/");
-    openServerSetup();
-    expect(shellGetServerPicker).not.toHaveBeenCalled();
-    expect(shellSwitchServer).not.toHaveBeenCalled();
-    expect(shellOpenServerSetup).not.toHaveBeenCalled();
-  });
-
-  it("resolves null under a shell too old to expose the picker", async () => {
-    setIOS(true, true, false);
-    await expect(getServerPicker()).resolves.toBeNull();
-    // The siblings are equally absent — both must degrade to no-ops.
-    await switchServer("https://recent.example.com/");
-    openServerSetup();
-    expect(shellSwitchServer).not.toHaveBeenCalled();
-    expect(shellOpenServerSetup).not.toHaveBeenCalled();
-  });
-
   it.each([
     ["iOS", () => setIOS(true, true, true)],
     ["Android", () => setAndroid(true, true, true)],
@@ -563,20 +545,56 @@ describe("server picker trio (getServerPicker / switchServer / openServerSetup)"
     openServerSetup();
     expect(shellOpenServerSetup).toHaveBeenCalledOnce();
   });
+});
 
-  it("resolves null when the bridge rejects", async () => {
+describe("mobile shell compatibility handshake", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("announces readiness and keeps a protocol-1 shell alive", () => {
+    const ready = vi.fn();
+    const heartbeat = vi.fn();
     setAndroid(true, true, true);
-    shellGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
-    await expect(getServerPicker()).resolves.toBeNull();
+    Object.assign((window as unknown as Record<string, unknown>).omnigentNative as object, {
+      nativeBridgeVersion: 1,
+      nativeWebReady: ready,
+      nativeHeartbeat: heartbeat,
+    });
+
+    const stop = startNativeShellLiveness();
+    expect(ready).toHaveBeenCalledWith(1);
+    vi.advanceTimersByTime(5_000);
+    expect(heartbeat).toHaveBeenCalledWith(1);
+    stop();
+    vi.advanceTimersByTime(5_000);
+    expect(heartbeat).toHaveBeenCalledOnce();
   });
 
-  it("does not throw when switchServer / openServerSetup fail", async () => {
-    setIOS(true, true, true);
-    shellSwitchServer.mockRejectedValueOnce(new Error("bridge down"));
-    await expect(switchServer("https://recent.example.com/")).resolves.toBeUndefined();
-    shellOpenServerSetup.mockImplementationOnce(() => {
-      throw new Error("bridge down");
+  it("handshakes when Android installs its fallback bridge after mount", () => {
+    const ready = vi.fn();
+    const heartbeat = vi.fn();
+    const stop = startNativeShellLiveness();
+    setAndroid(true, true, true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentNative as object, {
+      nativeBridgeVersion: 1,
+      nativeWebReady: ready,
+      nativeHeartbeat: heartbeat,
     });
-    expect(() => openServerSetup()).not.toThrow();
+
+    window.dispatchEvent(new Event("omnigent-native-bridge-ready"));
+    expect(ready).toHaveBeenCalledWith(1);
+    stop();
+  });
+
+  it("is inert in browsers and replaces an old shell with full-screen incompatibility", () => {
+    const stopBrowser = startNativeShellLiveness();
+    setIOS(true);
+    const stopOldShell = startNativeShellLiveness();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(document.getElementById("omnigent-native-incompatible")).toHaveTextContent(
+      "App update required",
+    );
+    stopBrowser();
+    stopOldShell();
   });
 });

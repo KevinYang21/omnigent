@@ -626,12 +626,8 @@ aside[aria-label="Workspace"][data-maximized] {
   -webkit-app-region: no-drag;
 }
 
-/* On the phone-shaped native shells the header band is tight, so the folder /
- * title / sub-agent segments are dropped there. Keep the parent-session
- * link: native back is off and edge-pan opens the sidebar, so that link is
- * the only in-header climb-out of a sub-agent. Hide the empty nav when there
- * is no parent link (top-level). Not scoped to a width media query so it
- * holds on wider native shells (e.g. iPad) too. */
+/* Native navigation keeps the parent-session link as the only in-header
+ * climb-out from a child while suppressing redundant title segments. */
 [data-ios-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)),
 [data-android-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)) {
   display: none;

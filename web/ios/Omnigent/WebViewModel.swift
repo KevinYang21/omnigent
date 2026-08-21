@@ -23,6 +23,10 @@ final class WebViewModel: ObservableObject {
 
   weak var webView: WKWebView?
 
+  func reload() {
+    webView?.reload()
+  }
+
   func emitNotificationActivation(_ path: String) {
     guard path.starts(with: "/") else { return }
     let script =
@@ -43,12 +47,13 @@ final class WebViewModel: ObservableObject {
   }
 
   /// Push the footprint (in CSS px, excluding the OS safe area which the web
-  /// layer adds via `env()`) of the native floating bottom bar to the web app.
-  /// The web side folds it into its `--omnigent-inset-bottom` variable so page
-  /// content reserves the right amount of space — making the native bar
-  /// dimension the single source of truth instead of a magic number in CSS.
+  /// layer adds via `env()`) of the native floating bar to the web app. The
+  /// web side folds these into its `--omnigent-inset-*` variables so page
+  /// content reserves the right amount of space — making native bar dimensions
+  /// the single source of truth instead of magic numbers duplicated in CSS.
   func emitInsets(bottomBar: CGFloat) {
-    let script = "window.__omnigentNativeEmitInsets?.(\(jsNumber(bottomBar)));"
+    let script =
+      "window.__omnigentNativeEmitInsets?.(\(jsNumber(bottomBar)));"
     webView?.evaluateJavaScript(script)
   }
 

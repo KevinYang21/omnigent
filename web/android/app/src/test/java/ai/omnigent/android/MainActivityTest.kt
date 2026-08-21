@@ -83,49 +83,7 @@ class MainActivityTest {
     }
 
     @Test
-    fun `web picker switch to an offered server reloads onto it`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val store = ServerStore(context)
-        store.connect("https://recent.example.com")
-        store.connect("https://example.com")
-        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-
-        activity.switchServerFromWeb("https://recent.example.com/")
-
-        assertEquals("https://recent.example.com", shadowOf(activity.webView()).lastLoadedUrl)
-        assertEquals("https://recent.example.com", ServerStore(context).currentServerUrl())
-    }
-
-    @Test
-    fun `web picker switch to an unoffered server is refused`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        ServerStore(context).connect("https://example.com")
-        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-
-        activity.switchServerFromWeb("https://attacker.example.com")
-
-        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
-        assertEquals("https://example.com", ServerStore(context).currentServerUrl())
-    }
-
-    @Test
-    fun `web picker switch to the current origin is a no-op`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val store = ServerStore(context)
-        store.connect("https://recent.example.com")
-        store.connect("https://example.com")
-        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
-        // An in-app navigation marker: a wrongly-honored same-origin switch
-        // would reload the clean server URL over it.
-        activity.webView().loadUrl("https://example.com/marker")
-
-        activity.switchServerFromWeb("https://example.com/some/path")
-
-        assertEquals("https://example.com/marker", shadowOf(activity.webView()).lastLoadedUrl)
-    }
-
-    @Test
-    fun `a managed preset never overrides the server the user picked`() {
+    fun `unsupported secure bridge opens full-screen recovery with user server`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         ServerStore(context).connect("https://example.com")
         val manager = context.getSystemService(RestrictionsManager::class.java)
@@ -139,7 +97,10 @@ class MainActivityTest {
 
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
-        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals("https://example.com", ServerStore(context).currentServerUrl())
+        val recovery = shadowOf(activity).nextStartedActivity
+        assertEquals(ConnectActivity::class.java.name, recovery.component?.className)
+        assertEquals("https://example.com", recovery.getStringExtra(ConnectActivity.EXTRA_PREFILL))
     }
 
     private fun MainActivity.webView(): WebView =

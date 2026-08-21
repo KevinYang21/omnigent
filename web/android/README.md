@@ -54,12 +54,6 @@ when the bridge methods are absent, so the Android shell omits them for now:
   opens from the in-page hamburger, exactly as in a browser tab.
 - **Chat/Terminal bar.** Rendered in-page by the SPA.
 
-Server switching is web-owned everywhere: the SPA's sidebar server picker
-drives it through the bridge (`getServerPicker` / `switchServer` /
-`openServerSetup` in `NativeBridgeScript`), and the shell only executes
-switches to servers it already offers. There is no native switcher UI; a page
-that fails to load recovers through the full-screen `ConnectActivity`.
-
 ## Databricks workspaces
 
 A Databricks workspace serves its own landing page at the root and mounts the
@@ -114,8 +108,8 @@ to enrolled devices:
 Behaviour (`ManagedConfig` + `ServerStore`):
 
 - The URLs are **offered**, listed ahead of the user's recent servers on the
-  connect screen and in the SPA's sidebar server picker. The user still taps one
-  to connect — this is true for a single URL as much as for several.
+  connect screen and in the sidebar server picker. The user still taps one to connect —
+  this is true for a single URL as much as for several.
 - The app never auto-connects to a preset and never skips the connect screen, so
   a policy can't silently move someone onto a different server.
 - Presets are not a lock either: a user can still type any other server, and the

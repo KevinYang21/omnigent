@@ -1,8 +1,5 @@
 package ai.omnigent.android
 
-import org.json.JSONArray
-import org.json.JSONObject
-
 /**
  * The JavaScript injected into the main frame on every load to expose
  * `window.omnigentNative` with `kind: "android"`, mirroring the iOS shell's
@@ -16,32 +13,12 @@ import org.json.JSONObject
  * frames on the pinned origin. `notify()` resolves `true` optimistically (as on
  * iOS) since the post is fire-and-forget. native -> web is driven by
  * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here.
- *
- * [source] takes the server-picker payload (see [serverPickerJson]) baked in:
- * the offered-server list is fixed for a page's lifetime — every flow that
- * changes it (a switch, ConnectActivity) reinstalls the bridge and reloads —
- * so `getServerPicker()` can resolve a literal instead of a round trip.
  */
 object NativeBridgeScript {
-    /**
-     * The `getServerPicker` payload for [source]: the pinned origin plus every
-     * server the store offers (organization presets first, then recents),
-     * matching the web's `ServerPickerInfo` shape. JSON-encoded, with the
-     * U+2028/U+2029 line separators escaped (valid in JSON, invalid in a JS
-     * literal) so the result is always a valid JS expression.
-     */
-    fun serverPickerJson(
-        currentOrigin: String,
-        servers: List<String>,
-    ): String =
-        JSONObject()
-            .put("currentOrigin", currentOrigin)
-            .put("recentServers", JSONArray(servers))
-            .toString()
-            .replace(" ", "\\u2028")
-            .replace(" ", "\\u2029")
+    const val PROTOCOL_VERSION = 1
+    val source: String = source()
 
-    fun source(serverPicker: String): String =
+    fun source(): String =
         """
         (() => {
           if (window.omnigentNative && window.omnigentNative.kind === "android") return;
@@ -114,6 +91,8 @@ object NativeBridgeScript {
               if (bridge) bridge.postMessage(JSON.stringify(payload));
             } catch (_) {}
           };
+          const pickerRequests = new Map();
+          let nextPickerRequest = 1;
 
           const notificationCallbacks = new Set();
           // An activation is a fire-once event, but the native side may emit it
@@ -137,13 +116,22 @@ object NativeBridgeScript {
           let lastInsets = null;
           Object.defineProperty(window, "__omnigentNativeEmitInsets", {
             configurable: false, enumerable: false, writable: false,
-            value(topBar, bottomBar) {
+            value(bottomBar) {
               const insets = {
-                topBar: typeof topBar === "number" && Number.isFinite(topBar) ? topBar : 0,
                 bottomBar: typeof bottomBar === "number" && Number.isFinite(bottomBar) ? bottomBar : 0,
               };
               lastInsets = insets;
               for (const cb of insetCallbacks) { try { cb(insets); } catch (_) {} }
+            },
+          });
+          Object.defineProperty(window, "__omnigentNativeEmitServerPicker", {
+            configurable: false, enumerable: false, writable: false,
+            value(requestId, info) {
+              const pending = pickerRequests.get(requestId);
+              if (!pending) return;
+              pickerRequests.delete(requestId);
+              clearTimeout(pending.timer);
+              pending.resolve(info && typeof info === "object" ? info : null);
             },
           });
 
@@ -229,6 +217,13 @@ object NativeBridgeScript {
 
           window.omnigentNative = Object.freeze({
             kind: "android",
+            nativeBridgeVersion: $PROTOCOL_VERSION,
+            nativeWebReady(version) {
+              post({ method: "nativeWebReady", version });
+            },
+            nativeHeartbeat(version) {
+              post({ method: "nativeHeartbeat", version });
+            },
             setColorScheme(scheme) {
               if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
               post({ method: "setColorScheme", scheme });
@@ -276,17 +271,27 @@ object NativeBridgeScript {
               if (lastInsets) { try { callback(lastInsets); } catch (_) {} }
               return () => insetCallbacks.delete(callback);
             },
-            getServerPicker() {
-              return Promise.resolve($serverPicker);
+          getServerPicker() {
+              const requestId = nextPickerRequest++;
+              return new Promise((resolve) => {
+                const timer = setTimeout(() => {
+                  pickerRequests.delete(requestId);
+                  resolve(null);
+                }, 3000);
+                pickerRequests.set(requestId, { resolve, timer });
+                post({ method: "getServerPicker", requestId });
+              });
             },
             switchServer(url) {
-              if (typeof url === "string") post({ method: "switchServer", url });
+              if (typeof url !== "string") return Promise.reject(new Error("invalid server"));
+              post({ method: "switchServer", url });
               return Promise.resolve();
             },
             openServerSetup() {
               post({ method: "openServerSetup" });
             },
           });
+          window.dispatchEvent(new Event("omnigent-native-bridge-ready"));
         })();
         """.trimIndent()
 }

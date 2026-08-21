@@ -52,8 +52,7 @@ import java.io.File
  * launching via ActivityScenario, would stay in the test process and MainActivity
  * would never foreground.)
  *
- * Once MainActivity is up, the test waits for the floating server-switcher pill
- * (added after the WebView is built and loadUrl is called) as the "shell is up"
+ * Once MainActivity is up, the test waits for its WebView as the "shell is up"
  * signal, plus a render buffer for the web content, then captures via
  * [UiDevice.takeScreenshot].
  */
@@ -123,7 +122,7 @@ class ScreenshotTest {
 
     /**
      * Drives ConnectActivity: types the server URL (base + [routePath]), taps
-     * Connect, waits for the shell (WebView), then captures the rendered
+     * Connect, waits for the WebView shell, then captures the rendered
      * SPA at that route. The SPA fully supports deep-linking (server-side SPA
      * fallback returns index.html, react-router resolves the path), so loading
      * base + `/c/:id` renders the session page directly.
@@ -142,14 +141,14 @@ class ScreenshotTest {
             if (it) device.findObject(By.textStartsWith("Allow"))?.click()
         }
 
-        // MainActivity's WebView appearing means the shell is up (ConnectActivity
-        // accepted the URL and handed over). The SPA render itself is covered by
-        // the buffer below — server switching now lives in the SPA's sidebar
-        // picker, so there is no native chrome to key on.
         assertTrue(
-            "WebView shell never appeared — is the Vite dev server up at " +
-                "$serverBaseUrl and is `adb reverse tcp:5173 tcp:5173` in place?",
-            device.wait(Until.hasObject(By.clazz("android.webkit.WebView")), SHELL_UP_TIMEOUT_MS),
+            "WebView shell never appeared — " +
+                "is the Vite dev server up at $serverBaseUrl and is " +
+                "`adb reverse tcp:5173 tcp:5173` in place?",
+            device.wait(
+                Until.hasObject(By.clazz("android.webkit.WebView")),
+                SHELL_UP_TIMEOUT_MS,
+            ),
         )
 
         // Render buffer for the network load + first paint of the SPA route.

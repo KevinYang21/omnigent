@@ -68,7 +68,7 @@ struct ChatTerminalBar: View {
 }
 
 /// Wraps the bar in the system glass material where available, otherwise a
-/// hand-rolled material capsule.
+/// hand-rolled material capsule used on earlier iOS versions.
 private struct GlassCapsule: ViewModifier {
   let colorScheme: ColorScheme
 

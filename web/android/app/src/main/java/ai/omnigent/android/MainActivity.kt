@@ -10,6 +10,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.MimeTypeMap
@@ -17,7 +20,6 @@ import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebView
-import android.widget.FrameLayout
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -31,6 +33,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * The single WebView host. Mirrors the iOS `WebShellView` + `OmnigentWebView`:
@@ -56,6 +60,35 @@ class MainActivity : AppCompatActivity() {
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
+    private val livenessHandler = Handler(Looper.getMainLooper())
+    private var compatibilityReady = false
+    private var recoveryShown = false
+    private val livenessWatchdog by lazy {
+        LivenessWatchdog(
+            scheduler =
+                object : WatchdogScheduler {
+                    private var pending: Runnable? = null
+
+                    override fun schedule(
+                        delayMs: Long,
+                        action: () -> Unit,
+                    ) {
+                        val runnable = Runnable(action)
+                        pending = runnable
+                        livenessHandler.postDelayed(runnable, delayMs)
+                    }
+
+                    override fun cancel() {
+                        pending?.let(livenessHandler::removeCallbacks)
+                        pending = null
+                    }
+                },
+            onTimeout = { showFullScreenRecovery("The server UI stopped responding.") },
+            onIncompatible = {
+                showFullScreenRecovery("The server UI is incompatible with this app version.")
+            },
+        )
+    }
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -132,9 +165,12 @@ class MainActivity : AppCompatActivity() {
                         shouldInjectBridgeAtPageReady = {
                             bridgeTransportInstalled && bridgeScriptHandler == null
                         },
-                        bridgeScript = { NativeBridgeScript.source(serverPickerJson()) },
                         onPageReady = ::onPageReady,
+                        onMainFrameOriginChanged = ::onMainFrameOriginChanged,
+                        onPinnedDocumentStarted = ::onPinnedDocumentStarted,
+                        onLoadFailure = ::showFullScreenRecovery,
                         onLoginRequired = ::startLogin,
+                        bridgeScriptSource = ::nativeBridgeScriptSource,
                     )
                 webChromeClient =
                     OmnigentWebChromeClient(
@@ -145,14 +181,13 @@ class MainActivity : AppCompatActivity() {
                     downloadFile(downloadUrl, contentDisposition, mimeType)
                 }
             }
-        // Wrap the WebView in a FrameLayout so the insets listener below can
-        // resize it via a bottom margin when the IME opens (margins need a
-        // parent-owned MarginLayoutParams).
-        val container = FrameLayout(this)
-        container.addView(webView)
-        setContentView(container)
+        setContentView(webView)
         applySystemBarContrast()
         installBridge()
+        if (!bridgeTransportInstalled) {
+            showFullScreenRecovery("This Android WebView cannot run the required secure bridge.")
+            return
+        }
 
         // Measure the OS safe area and push it into the page as CSS custom
         // properties — Android WebView can't rely on `env(safe-area-inset-*)`
@@ -236,12 +271,26 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
+        livenessWatchdog.beginInitialWindow()
         webView.loadUrl(serverUrl)
+    }
+
+    override fun onPause() {
+        livenessWatchdog.setActive(false)
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::webView.isInitialized) {
+            livenessWatchdog.setOnPinnedOrigin(originOf(webView.url) == pinnedOrigin)
+            livenessWatchdog.setActive(true)
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        applySystemBarContrast()
+        applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
@@ -267,10 +316,11 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
-                    onSwitchServer = ::switchServerFromWeb,
-                    onOpenServerSetup = {
-                        startActivity(Intent(this, ConnectActivity::class.java))
-                    },
+                    onNativeWebReady = ::onNativeWebReady,
+                    onNativeHeartbeat = ::onNativeHeartbeat,
+                    onGetServerPicker = ::emitServerPicker,
+                    onSwitchServer = ::switchServerFromBridge,
+                    onOpenServerSetup = ::openServerSetupFromBridge,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -283,7 +333,7 @@ class MainActivity : AppCompatActivity() {
                 bridgeScriptHandler =
                     WebViewCompat.addDocumentStartJavaScript(
                         webView,
-                        NativeBridgeScript.source(serverPickerJson()),
+                        nativeBridgeScriptSource(),
                         setOf(origin),
                     )
             } catch (_: IllegalArgumentException) {
@@ -292,39 +342,68 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * The `getServerPicker` payload baked into the bridge facade: the pinned
-     * origin plus the store's offered servers. Read fresh on every bridge
-     * install, so a switch or a ConnectActivity round trip (both reinstall the
-     * bridge and reload) carries the updated list.
-     */
-    private fun serverPickerJson(): String =
-        NativeBridgeScript.serverPickerJson(
-            currentOrigin = pinnedOrigin.orEmpty(),
-            servers = ServerStore(this).offeredServers(),
-        )
+    private fun nativeBridgeScriptSource(): String = NativeBridgeScript.source
 
-    /**
-     * Execute a server switch the web sidebar picker requested. Only servers
-     * the store already offers (organization presets + recents) are reachable,
-     * and the switch lands on the store's own entry — the page can pick from
-     * the offered list, never add to it. A same-origin request is a no-op.
-     * Internal (like [OmnigentBridgeListener.handle]) so tests can drive it.
-     */
-    internal fun switchServerFromWeb(requestedUrl: String) {
-        val requestedOrigin = originOf(requestedUrl) ?: return
-        if (requestedOrigin == pinnedOrigin) return
-        val store = ServerStore(this)
-        val target =
-            store.offeredServers().firstOrNull { originOf(it) == requestedOrigin } ?: return
-        store.connect(target)
-        val serverUrl = store.currentServerUrl()
-        originOf(serverUrl)?.let { reloadWithNewServer(serverUrl, it) }
+    private fun onNativeWebReady(version: Int) {
+        if (!livenessWatchdog.protocolReady(version, NativeBridgeScript.PROTOCOL_VERSION)) return
+        compatibilityReady = true
     }
 
-    private fun applySystemBarContrast() {
+    private fun onNativeHeartbeat(version: Int) {
+        if (!compatibilityReady || version != NativeBridgeScript.PROTOCOL_VERSION) return
+        livenessWatchdog.heartbeat()
+    }
+
+    private fun showFullScreenRecovery(message: String) {
+        if (recoveryShown || isFinishing || isDestroyed) return
+        recoveryShown = true
+        livenessWatchdog.cancel()
+        val prefill = runCatching { ServerStore(this).currentServerUrl() }.getOrNull()
+        startActivity(
+            Intent(this, ConnectActivity::class.java)
+                .putExtra(ConnectActivity.EXTRA_PREFILL, prefill)
+                .putExtra(ConnectActivity.EXTRA_ERROR, message),
+        )
+        finish()
+    }
+
+    private fun emitServerPicker(requestId: Int) {
+        if (!::webView.isInitialized || recoveryShown) return
+        val store = ServerStore(this)
+        val info =
+            JSONObject()
+                .put("currentOrigin", pinnedOrigin.orEmpty())
+                .put("currentServerUrl", store.currentServerUrl())
+                .put("managedServers", JSONArray(store.managedServers()))
+                .put("recentServers", JSONArray(store.recentServersForPicker()))
+        webView.evaluateJavascript(
+            "window.__omnigentNativeEmitServerPicker?.($requestId,$info);",
+            null,
+        )
+    }
+
+    private fun switchServerFromBridge(url: String) {
+        val store = ServerStore(this)
+        val requestedKey = serverKey(url)
+        val offered = store.offeredServers().firstOrNull { serverKey(it) == requestedKey }
+        if (offered == null) {
+            showFullScreenRecovery(
+                "That server is no longer available. Choose a server to reconnect.",
+            )
+            return
+        }
+        val newOrigin = originOf(offered) ?: return
+        store.connect(offered)
+        reloadWithNewServer(offered, newOrigin)
+    }
+
+    private fun openServerSetupFromBridge() {
+        startActivity(Intent(this, ConnectActivity::class.java))
+    }
+
+    private fun applySystemBarContrast(configuration: Configuration = resources.configuration) {
         val isLightMode =
-            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+            configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
         WindowInsetsControllerCompat(window, window.decorView).apply {
             isAppearanceLightStatusBars = isLightMode
@@ -447,6 +526,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        livenessWatchdog.cancel()
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
@@ -495,9 +575,16 @@ class MainActivity : AppCompatActivity() {
         removeBridge()
         pinnedOrigin = newOrigin
         pageLoaded = false
+        compatibilityReady = false
+        recoveryShown = false
         historyCleared = false
         loginAttempts = 0
         installBridge()
+        if (!bridgeTransportInstalled) {
+            showFullScreenRecovery("This Android WebView cannot run the required secure bridge.")
+            return
+        }
+        livenessWatchdog.beginInitialWindow()
         webView.loadUrl(serverUrl)
     }
 
@@ -533,6 +620,15 @@ class MainActivity : AppCompatActivity() {
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         flushPendingActivation()
         emitInsets()
+    }
+
+    private fun onMainFrameOriginChanged(url: String?) {
+        livenessWatchdog.setOnPinnedOrigin(originOf(url) == pinnedOrigin)
+    }
+
+    private fun onPinnedDocumentStarted() {
+        compatibilityReady = false
+        livenessWatchdog.beginInitialWindow()
     }
 
     private fun flushPendingActivation() {

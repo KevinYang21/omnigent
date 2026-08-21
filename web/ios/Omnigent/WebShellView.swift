@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct WebShellView: View {
+  let serverURL: URL
   let initialURL: URL
   let connectToNewServer: () -> Void
   let switchToServer: (URL) -> Void
@@ -19,47 +20,45 @@ struct WebShellView: View {
   @State private var deferredOpenPath: String?
 
   var body: some View {
-    OmnigentWebView(
-      initialURL: initialURL,
-      model: model,
-      settings: settings,
-      // The web sidebar's server picker is the only picker; the shell just
-      // answers its bridge requests with the servers it offers (managed
-      // presets first, then recents) and executes the switch/setup it asks
-      // for. Failed loads recover through the full-screen ConnectView.
-      offeredServers: {
-        ManagedServers.merged(
-          managed: managedConfiguration.serverURLs, recents: settings.recentServers)
-      },
-      switchToServer: switchToServer,
-      connectToNewServer: connectToNewServer,
-      loadFailed: loadFailed,
-      loadSucceeded: loadSucceeded
-    )
-    .ignoresSafeArea()
-    .ignoresSafeArea(.keyboard)
-    .background(DesignTokens.background(colorScheme).ignoresSafeArea())
-    .overlay(alignment: .bottom) {
-      // Always present, shown/hidden by opacity rather than insert/remove, so
-      // a transient visibility flip never slides the bar in and out. The web
-      // layer reserves a fixed footprint for it (`.omnigent-native-bottom-
-      // spacer` in index.css), so there's no size round-trip to coordinate.
-      ChatTerminalBar(
-        mode: $model.viewMode,
-        terminalEnabled: model.terminalEnabled,
-        terminalStartingUp: model.terminalStartingUp,
-        onSelect: { newMode in
-          model.viewMode = newMode
-          model.emitViewModeChanged(newMode)
-        }
+    ZStack {
+      OmnigentWebView(
+        serverURL: serverURL,
+        initialURL: initialURL,
+        managedServers: managedConfiguration.serverURLs.map(\.absoluteString),
+        recentServers: ManagedServers.recents(
+          settings.recentServers, excludingManaged: managedConfiguration.serverURLs),
+        model: model,
+        settings: settings,
+        switchToServer: switchToServer,
+        connectToNewServer: connectToNewServer,
+        loadFailed: loadFailed,
+        loadSucceeded: loadSucceeded
       )
-      .padding(.bottom, InsetMetrics.barBottomPadding)
-      .opacity(model.bottomBarVisible ? 1 : 0)
-      .allowsHitTesting(model.bottomBarVisible)
-      .accessibilityHidden(!model.bottomBarVisible)
-      .animation(.easeInOut(duration: 0.2), value: model.bottomBarVisible)
+      .ignoresSafeArea()
+      .ignoresSafeArea(.keyboard)
+      .background(DesignTokens.background(colorScheme).ignoresSafeArea())
+      .overlay(alignment: .bottom) {
+        // Always present, shown/hidden by opacity rather than insert/remove, so
+        // a transient visibility flip never slides the bar in and out. The web
+        // layer reserves a fixed footprint for it (`.omnigent-native-bottom-
+        // spacer` in index.css), so there's no size round-trip to coordinate.
+        ChatTerminalBar(
+          mode: $model.viewMode,
+          terminalEnabled: model.terminalEnabled,
+          terminalStartingUp: model.terminalStartingUp,
+          onSelect: { newMode in
+            model.viewMode = newMode
+            model.emitViewModeChanged(newMode)
+          }
+        )
+        .padding(.bottom, InsetMetrics.barBottomPadding)
+        .opacity(model.bottomBarVisible ? 1 : 0)
+        .allowsHitTesting(model.bottomBarVisible)
+        .accessibilityHidden(!model.bottomBarVisible)
+        .animation(.easeInOut(duration: 0.2), value: model.bottomBarVisible)
+      }
+      .ignoresSafeArea(.keyboard)
     }
-    .ignoresSafeArea(.keyboard)
     .onChange(of: router.pendingNotificationPath) { _, _ in
       if let path = router.consumeNotificationPath() {
         model.emitNotificationActivation(path)
@@ -84,7 +83,7 @@ struct WebShellView: View {
       }
     }
     .onChange(of: model.isLoading) { _, loading in
-      // Re-push the native bar footprint once each load completes; the JS
+      // Re-push the native bar footprints once each load completes; the JS
       // bridge caches the value so a later-mounting subscriber still gets it.
       if !loading {
         model.emitInsets(bottomBar: InsetMetrics.bottomBarFootprint)
@@ -94,11 +93,11 @@ struct WebShellView: View {
 }
 
 /// Single source of truth for the floating native bar's dimensions. These drive
-/// both the SwiftUI layout (the `.frame`/`.padding` calls in `ChatTerminalBar`)
-/// and the footprint pushed to the web layer via `WebViewModel.emitInsets`, so
-/// the web's content insets can never drift from the bar's real size. Values
-/// are CSS points, excluding the OS safe area (the web layer adds that with
-/// `env(safe-area-inset-*)`).
+/// both the SwiftUI layout (the `.frame`/`.padding` calls above and in
+/// `ChatTerminalBar`) and the footprint pushed to the web layer via
+/// `WebViewModel.emitInsets`, so the web's content insets can never drift from
+/// the bars' real size. Values are CSS points, excluding the OS safe area (the
+/// web layer adds that with `env(safe-area-inset-*)`).
 enum InsetMetrics {
   // Chat/Terminal bar — the bottom floating capsule. The capsule wraps the
   // segment row (`barSegmentHeight`) in `barCapsulePadding` on every side.

@@ -25,23 +25,27 @@ class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
+    private val switchedServers = mutableListOf<String>()
+    private var serverSetupOpenCount = 0
+    private val readyVersions = mutableListOf<Int>()
+    private val heartbeatVersions = mutableListOf<Int>()
+    private val pickerRequests = mutableListOf<Int>()
 
     private val badgeId = 1
-    private val switchedServers = mutableListOf<String>()
-    private var serverSetupOpened = 0
 
     @Before
     fun setUp() {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         context = ApplicationProvider.getApplicationContext()
-        switchedServers.clear()
-        serverSetupOpened = 0
         listener =
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
-                onSwitchServer = { switchedServers.add(it) },
-                onOpenServerSetup = { serverSetupOpened++ },
+                onNativeWebReady = readyVersions::add,
+                onNativeHeartbeat = heartbeatVersions::add,
+                onGetServerPicker = pickerRequests::add,
+                onSwitchServer = switchedServers::add,
+                onOpenServerSetup = { serverSetupOpenCount++ },
             )
         shadow =
             shadowOf(
@@ -140,21 +144,25 @@ class OmnigentBridgeListenerTest {
     }
 
     @Test
-    fun `switchServer message hands the url to the host`() {
-        listener.handle("""{"method":"switchServer","url":"https://other.example.com"}""")
-        assertEquals(listOf("https://other.example.com"), switchedServers)
-    }
-
-    @Test
-    fun `switchServer without a url is dropped`() {
+    fun `server picker messages dispatch valid native actions`() {
+        listener.handle("""{"method":"switchServer","url":"https://known.example.com"}""")
+        listener.handle("""{"method":"switchServer","url":123}""")
         listener.handle("""{"method":"switchServer"}""")
-        listener.handle("""{"method":"switchServer","url":""}""")
-        assertEquals(emptyList<String>(), switchedServers)
+        listener.handle("""{"method":"openServerSetup"}""")
+
+        assertEquals(listOf("https://known.example.com"), switchedServers)
+        assertEquals(1, serverSetupOpenCount)
     }
 
     @Test
-    fun `openServerSetup message asks the host to open the connect screen`() {
-        listener.handle("""{"method":"openServerSetup"}""")
-        assertEquals(1, serverSetupOpened)
+    fun `compatibility and live picker messages dispatch typed values`() {
+        listener.handle("""{"method":"nativeWebReady","version":1}""")
+        listener.handle("""{"method":"nativeHeartbeat","version":1}""")
+        listener.handle("""{"method":"getServerPicker","requestId":42}""")
+        listener.handle("""{"method":"getServerPicker","requestId":"bad"}""")
+
+        assertEquals(listOf(1), readyVersions)
+        assertEquals(listOf(1), heartbeatVersions)
+        assertEquals(listOf(42), pickerRequests)
     }
 }
