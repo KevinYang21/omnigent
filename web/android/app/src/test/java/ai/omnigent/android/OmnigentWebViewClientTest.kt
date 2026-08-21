@@ -42,7 +42,7 @@ class OmnigentWebViewClientTest {
         // Chrome-hide CSS first, then the facade — the facade's callback is what
         // declares the page ready, so it has to be the last script evaluated.
         assertEquals(
-            listOf(WorkspaceChromeScript.source, NativeBridgeScript.source),
+            listOf(WorkspaceChromeScript.source, TEST_BRIDGE_SCRIPT),
             webView.evaluatedScripts,
         )
         assertNull(readyUrl)
@@ -299,6 +299,7 @@ class OmnigentWebViewClientTest {
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
+        bridgeScript = { TEST_BRIDGE_SCRIPT },
         onPageReady = onPageReady,
         onLoginRequired = onLoginRequired,
     )
@@ -355,6 +356,10 @@ class OmnigentWebViewClientTest {
     private companion object {
         const val PINNED_ORIGIN = "https://example.com"
         const val PINNED_URL = "$PINNED_ORIGIN/app"
+
+        // Stand-in for the picker-payload-bearing facade; the client treats the
+        // script as opaque, so any marker string proves what was injected.
+        const val TEST_BRIDGE_SCRIPT = "/* bridge facade */"
         const val DATABRICKS_ORIGIN = "https://myshard.cloud.databricks.com"
         const val IDP_URL = "https://databricks.okta.com/authorize?state=abc"
     }

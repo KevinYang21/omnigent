@@ -26,6 +26,8 @@ import android.webkit.WebViewClient
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
+    /** The bridge facade to inject at page-ready; read lazily so it carries the current server-picker payload. */
+    private val bridgeScript: () -> String,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
 ) : WebViewClient() {
@@ -115,7 +117,7 @@ class OmnigentWebViewClient(
             view.evaluateJavascript(WorkspaceChromeScript.source, null)
         }
         if (onPinnedOrigin && shouldInjectBridgeAtPageReady()) {
-            view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
+            view.evaluateJavascript(bridgeScript()) { onPageReady(url) }
             return
         }
         onPageReady(url)

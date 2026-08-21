@@ -161,3 +161,30 @@ enum ManagedServers {
     declarative.isEmpty ? legacy : declarative
   }
 }
+
+/// Backs the web sidebar server picker's bridge requests (`getServerPicker` /
+/// `switchServer` in `OmnigentWebView`). Pure so the offer/switch rules are
+/// unit-testable without a WKWebView.
+enum ServerPickerBridge {
+  /// The `getServerPicker` reply: the pinned origin plus every server on offer
+  /// (managed presets first, then recents — `ManagedServers.merged`), matching
+  /// the web's `ServerPickerInfo` shape.
+  static func payload(currentOrigin: String, offered: [String]) -> [String: Any] {
+    ["currentOrigin": currentOrigin, "recentServers": offered]
+  }
+
+  /// Resolve a web-requested switch to a server the shell already offers, or
+  /// nil. The page can only nominate an origin it learned from the picker
+  /// payload; the returned URL is the shell's own offered entry (which may
+  /// carry a workspace mount), never the raw string the page sent — so a
+  /// compromised page cannot steer the shell to a server it doesn't know.
+  static func switchTarget(requested: String, offered: [String]) -> URL? {
+    guard let requestedOrigin = URL(string: requested)?.omnigentOrigin else { return nil }
+    for entry in offered {
+      if let url = URL(string: entry), url.omnigentOrigin == requestedOrigin {
+        return url
+      }
+    }
+    return nil
+  }
+}

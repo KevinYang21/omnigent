@@ -227,7 +227,7 @@ final class ManagedConfigurationTests: XCTestCase {
   }
 }
 
-/// The merge that decides what the connect screen and the server switcher show.
+/// The merge that decides what the connect screen and the sidebar picker show.
 final class ManagedServersTests: XCTestCase {
   private let managed = [URL(string: "https://corp.example.com")!]
 
@@ -262,5 +262,47 @@ final class ManagedServersTests: XCTestCase {
       managed: managed, recents: ["https://mine.example.com", "https://corp.example.com"])
 
     XCTAssertEqual(merged, ["https://corp.example.com", "https://mine.example.com"])
+  }
+}
+
+/// The rules behind the web sidebar picker's bridge: what `getServerPicker`
+/// replies with, and which `switchServer` requests the shell will honor.
+final class ServerPickerBridgeTests: XCTestCase {
+  private let offered = [
+    "https://corp.example.com",
+    "https://mine.example.com/omnigent",
+  ]
+
+  func testPayloadCarriesOriginAndOfferedServers() {
+    let payload = ServerPickerBridge.payload(
+      currentOrigin: "https://corp.example.com", offered: offered)
+
+    XCTAssertEqual(payload["currentOrigin"] as? String, "https://corp.example.com")
+    XCTAssertEqual(payload["recentServers"] as? [String], offered)
+  }
+
+  func testSwitchResolvesToTheOfferedEntryNotTheRequestedString() {
+    // The offered entry may carry a workspace mount the page's origin string
+    // lacks; the switch must land on the shell's own URL.
+    let target = ServerPickerBridge.switchTarget(
+      requested: "https://mine.example.com/", offered: offered)
+
+    XCTAssertEqual(target?.absoluteString, "https://mine.example.com/omnigent")
+  }
+
+  func testSwitchToAnUnofferedServerIsRefused() {
+    XCTAssertNil(
+      ServerPickerBridge.switchTarget(
+        requested: "https://attacker.example.com", offered: offered))
+  }
+
+  func testSwitchMatchesByOriginSoADifferentPortIsRefused() {
+    XCTAssertNil(
+      ServerPickerBridge.switchTarget(
+        requested: "https://corp.example.com:8443", offered: offered))
+  }
+
+  func testUnparseableRequestIsRefused() {
+    XCTAssertNil(ServerPickerBridge.switchTarget(requested: "not a url", offered: offered))
   }
 }

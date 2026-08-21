@@ -6,6 +6,14 @@ struct OmnigentWebView: UIViewRepresentable {
   let initialURL: URL
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
+  /// Every server the shell offers the web sidebar picker: managed presets
+  /// first, then recents (`ManagedServers.merged`). A closure so each bridge
+  /// request reads the current lists rather than a snapshot.
+  let offeredServers: () -> [String]
+  /// Re-point the shell to an offered server (the picker's server rows).
+  let switchToServer: (URL) -> Void
+  /// Return to the native ConnectView (the picker's "Connect to new server…").
+  let connectToNewServer: () -> Void
   let loadFailed: (URL, String) -> Void
   let loadSucceeded: () -> Void
 
@@ -16,6 +24,10 @@ struct OmnigentWebView: UIViewRepresentable {
   func makeUIView(context: Context) -> WKWebView {
     let contentController = WKUserContentController()
     contentController.add(context.coordinator, name: "omnigentNative")
+    // Request/response channel for the web sidebar server picker: a with-reply
+    // handler so `getServerPicker()` resolves a JS Promise with the payload.
+    contentController.addScriptMessageHandler(
+      context.coordinator, contentWorld: .page, name: "omnigentNativePicker")
     contentController.addUserScript(
       WKUserScript(
         source: Self.nativeBridgeScript,
@@ -75,6 +87,8 @@ struct OmnigentWebView: UIViewRepresentable {
 
   static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
     uiView.configuration.userContentController.removeScriptMessageHandler(forName: "omnigentNative")
+    uiView.configuration.userContentController.removeScriptMessageHandler(
+      forName: "omnigentNativePicker", contentWorld: .page)
     coordinator.detach()
   }
 
@@ -184,9 +198,11 @@ struct OmnigentWebView: UIViewRepresentable {
       // first emitted (the React app mounts later than document-start) still
       // gets the current value immediately on subscribe.
       let lastInsets = null;
-      defineEmit("__omnigentNativeEmitInsets", (topBar, bottomBar) => {
+      defineEmit("__omnigentNativeEmitInsets", (bottomBar) => {
         const insets = {
-          topBar: typeof topBar === "number" && Number.isFinite(topBar) ? topBar : 0,
+          // Older web bundles still read a topBar field; there is no native
+          // top bar, so it is always 0.
+          topBar: 0,
           bottomBar: typeof bottomBar === "number" && Number.isFinite(bottomBar) ? bottomBar : 0,
         };
         lastInsets = insets;
@@ -252,16 +268,24 @@ struct OmnigentWebView: UIViewRepresentable {
           sidebarDragCallbacks.add(callback);
           return () => sidebarDragCallbacks.delete(callback);
         },
-        setServerSwitcherHidden(hidden) {
-          window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "setServerSwitcherHidden",
-            hidden: hidden === true,
-          });
+        getServerPicker() {
+          return window.webkit.messageHandlers.omnigentNativePicker
+            .postMessage({ method: "getServerPicker" })
+            .then((info) => (info && typeof info === "object" ? info : null))
+            .catch(() => null);
         },
-        setSidebarOpen(open) {
+        switchServer(url) {
+          if (typeof url === "string") {
+            window.webkit.messageHandlers.omnigentNative.postMessage({
+              method: "switchServer",
+              url,
+            });
+          }
+          return Promise.resolve();
+        },
+        openServerSetup() {
           window.webkit.messageHandlers.omnigentNative.postMessage({
-            method: "setServerSwitcherHidden",
-            hidden: open === true,
+            method: "openServerSetup",
           });
         },
         setViewMode(params) {
@@ -291,7 +315,7 @@ struct OmnigentWebView: UIViewRepresentable {
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
-    UIGestureRecognizerDelegate
+    WKScriptMessageHandlerWithReply, UIGestureRecognizerDelegate
   {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
@@ -328,7 +352,6 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func detach() {
-      parent.model.cancelServerSwitcherWatchdog()
       urlObservation = nil
       oidcLoginManager.cancel()
       webView = nil
@@ -411,18 +434,37 @@ struct OmnigentWebView: UIViewRepresentable {
       rootBounces = 0
       publishModelChanges { model in
         model.currentURL = url
-        model.serverSwitcherHidden = true
       }
       webView.load(URLRequest(url: url))
+    }
+
+    /// Answers the web sidebar picker's `getServerPicker()` with the pinned
+    /// origin plus the offered servers. Nil-replies (rejecting the JS promise,
+    /// which the injected script maps to `null`) on an untrusted frame or an
+    /// unknown request, so a foreign page learns nothing about the server list.
+    func userContentController(
+      _ userContentController: WKUserContentController,
+      didReceive message: WKScriptMessage,
+      replyHandler: @escaping (Any?, String?) -> Void
+    ) {
+      guard isTrustedBridgeMessage(message),
+        let body = message.body as? [String: Any],
+        body["method"] as? String == "getServerPicker",
+        let origin = pinnedOrigin
+      else {
+        replyHandler(nil, "unsupported picker request")
+        return
+      }
+      replyHandler(
+        ServerPickerBridge.payload(currentOrigin: origin, offered: parent.offeredServers()),
+        nil
+      )
     }
 
     func userContentController(
       _ userContentController: WKUserContentController, didReceive message: WKScriptMessage
     ) {
       guard isTrustedBridgeMessage(message) else { return }
-      // Any trusted message proves the page is alive and driving the bridge, so
-      // stand down the liveness watchdog — the page owns the switcher from here.
-      parent.model.cancelServerSwitcherWatchdog()
       guard let body = message.body as? [String: Any],
         let method = body["method"] as? String
       else { return }
@@ -446,10 +488,18 @@ struct OmnigentWebView: UIViewRepresentable {
           body: params["body"] as? String,
           navigatePath: params["navigatePath"] as? String
         )
-      case "setServerSwitcherHidden":
-        parent.model.serverSwitcherHidden = (body["hidden"] as? NSNumber)?.boolValue ?? true
-      case "setSidebarOpen":
-        parent.model.serverSwitcherHidden = (body["open"] as? NSNumber)?.boolValue ?? true
+      case "switchServer":
+        // Only servers the shell already offers are reachable, and the switch
+        // goes to the shell's own offered entry — the page can pick from the
+        // list, never add to it. A same-origin request is a no-op.
+        guard let requested = body["url"] as? String,
+          let target = ServerPickerBridge.switchTarget(
+            requested: requested, offered: parent.offeredServers()),
+          target.omnigentOrigin != pinnedOrigin
+        else { return }
+        parent.switchToServer(target)
+      case "openServerSetup":
+        parent.connectToNewServer()
       case "setViewMode":
         let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
         parent.model.viewMode = mode
@@ -473,8 +523,6 @@ struct OmnigentWebView: UIViewRepresentable {
       }
       parent.model.isLoading = true
       parent.model.currentURL = webView.url ?? parent.model.currentURL
-      parent.model.serverSwitcherHidden = true
-      parent.model.armServerSwitcherWatchdog()
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
@@ -683,7 +731,6 @@ struct OmnigentWebView: UIViewRepresentable {
       let nsError = error as NSError
       guard nsError.code != NSURLErrorCancelled else { return }
       parent.model.isLoading = false
-      parent.model.cancelServerSwitcherWatchdog()
 
       let failedURL = failedURL(from: nsError) ?? webView.url ?? pinnedURL ?? parent.initialURL
       guard failedURL.omnigentOrigin == pinnedOrigin else { return }

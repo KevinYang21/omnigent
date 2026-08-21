@@ -10,8 +10,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.view.Gravity
-import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.MimeTypeMap
@@ -20,15 +18,12 @@ import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.widget.FrameLayout
-import android.widget.PopupMenu
-import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
-import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -61,11 +56,6 @@ class MainActivity : AppCompatActivity() {
     private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
-
-    // Floating server switcher — mirrors the iOS `ServerSwitcher`. Always
-    // visible so it's always available as a recovery path (backward compatible
-    // with older web builds). Theme-aware via brand colors (light/dark XML).
-    private lateinit var switchButton: View
 
     // WebChromeClient affordances that need Activity-scoped result launchers.
     // Transient by design: rotation is covered by configChanges (no recreation),
@@ -142,6 +132,7 @@ class MainActivity : AppCompatActivity() {
                         shouldInjectBridgeAtPageReady = {
                             bridgeTransportInstalled && bridgeScriptHandler == null
                         },
+                        bridgeScript = { NativeBridgeScript.source(serverPickerJson()) },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
                     )
@@ -154,37 +145,11 @@ class MainActivity : AppCompatActivity() {
                     downloadFile(downloadUrl, contentDisposition, mimeType)
                 }
             }
-        // Wrap the WebView in a FrameLayout so the floating server-switcher
-        // pill can sit on top of it. The pill uses the app's brand palette
-        // (values/values-night colors.xml) so it adapts to light/dark mode.
+        // Wrap the WebView in a FrameLayout so the insets listener below can
+        // resize it via a bottom margin when the IME opens (margins need a
+        // parent-owned MarginLayoutParams).
         val container = FrameLayout(this)
         container.addView(webView)
-        val dp = resources.displayMetrics.density
-        switchButton =
-            TextView(this).apply {
-                text = hostLabelOf(serverUrl)
-                background =
-                    ContextCompat.getDrawable(this@MainActivity, R.drawable.bg_floating_switch)
-                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.brand_foreground))
-                textSize = 12f
-                setPadding((12 * dp).toInt(), (6 * dp).toInt(), (12 * dp).toInt(), (6 * dp).toInt())
-                elevation = 6 * dp
-                isClickable = true
-                isFocusable = true
-                setOnClickListener { showServerSwitcherMenu(it) }
-            }
-        switchButton.layoutParams =
-            FrameLayout
-                .LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.TOP or Gravity.CENTER_HORIZONTAL,
-                ).apply {
-                    // Initial position below the status bar; corrected by the
-                    // insets listener once system bar insets are measured.
-                    topMargin = (8 * dp).toInt()
-                }
-        container.addView(switchButton)
         setContentView(container)
         applySystemBarContrast()
         installBridge()
@@ -222,12 +187,6 @@ class MainActivity : AppCompatActivity() {
             // keyboard covers the nav bar). Top/left/right are IME-independent.
             val bottom = if (ime.bottom > 0) 0 else bars.bottom
             lastInsets = Insets.of(bars.left, bars.top, bars.right, bottom)
-            // Push the floating switch button below the status bar so it doesn't
-            // disappear under the notch/status icons on edge-to-edge layouts.
-            (switchButton.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-                lp.topMargin = bars.top + (8 * dp).toInt()
-                switchButton.layoutParams = lp
-            }
             emitInsets()
             insets
         }
@@ -308,6 +267,10 @@ class MainActivity : AppCompatActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onSwitchServer = ::switchServerFromWeb,
+                    onOpenServerSetup = {
+                        startActivity(Intent(this, ConnectActivity::class.java))
+                    },
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -320,13 +283,43 @@ class MainActivity : AppCompatActivity() {
                 bridgeScriptHandler =
                     WebViewCompat.addDocumentStartJavaScript(
                         webView,
-                        NativeBridgeScript.source,
+                        NativeBridgeScript.source(serverPickerJson()),
                         setOf(origin),
                     )
             } catch (_: IllegalArgumentException) {
                 // Keep the transport; onPageFinished will inject the facade instead.
             }
         }
+    }
+
+    /**
+     * The `getServerPicker` payload baked into the bridge facade: the pinned
+     * origin plus the store's offered servers. Read fresh on every bridge
+     * install, so a switch or a ConnectActivity round trip (both reinstall the
+     * bridge and reload) carries the updated list.
+     */
+    private fun serverPickerJson(): String =
+        NativeBridgeScript.serverPickerJson(
+            currentOrigin = pinnedOrigin.orEmpty(),
+            servers = ServerStore(this).offeredServers(),
+        )
+
+    /**
+     * Execute a server switch the web sidebar picker requested. Only servers
+     * the store already offers (organization presets + recents) are reachable,
+     * and the switch lands on the store's own entry — the page can pick from
+     * the offered list, never add to it. A same-origin request is a no-op.
+     * Internal (like [OmnigentBridgeListener.handle]) so tests can drive it.
+     */
+    internal fun switchServerFromWeb(requestedUrl: String) {
+        val requestedOrigin = originOf(requestedUrl) ?: return
+        if (requestedOrigin == pinnedOrigin) return
+        val store = ServerStore(this)
+        val target =
+            store.offeredServers().firstOrNull { originOf(it) == requestedOrigin } ?: return
+        store.connect(target)
+        val serverUrl = store.currentServerUrl()
+        originOf(serverUrl)?.let { reloadWithNewServer(serverUrl, it) }
     }
 
     private fun applySystemBarContrast() {
@@ -453,26 +446,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Extract a short host[:port] label from a URL for the server switcher pill.
-     * Mirrors the iOS `URL.omnigentHostLabel` in `URL+Omnigent.swift`.
-     */
-    private fun hostLabelOf(url: String): String {
-        val uri = Uri.parse(url)
-        val host = uri.host ?: return url
-        val port = uri.port
-        return if (port != -1 &&
-            !(
-                (uri.scheme?.lowercase() == "https" && port == 443) ||
-                    (uri.scheme?.lowercase() == "http" && port == 80)
-            )
-        ) {
-            "$host:$port"
-        } else {
-            host
-        }
-    }
-
     override fun onDestroy() {
         // Unblock a pending file input / mic request, then release WebView + worker.
         pendingFileCallback?.onReceiveValue(null)
@@ -524,7 +497,6 @@ class MainActivity : AppCompatActivity() {
         pageLoaded = false
         historyCleared = false
         loginAttempts = 0
-        (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
         installBridge()
         webView.loadUrl(serverUrl)
     }
@@ -541,58 +513,6 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Exception) {
             // Not registered (feature unsupported, or already removed) — no-op.
         }
-    }
-
-    /**
-     * Show the server-switcher dropdown menu, mirroring the iOS `ServerSwitcher`
-     * `Menu`. Lists the current server (disabled header), the other servers on
-     * offer (organization presets, then recents), Reload, and Connect to New
-     * Server. Tapping a server switches directly without leaving the app;
-     * "Connect to New Server" opens [ConnectActivity] for manual URL entry.
-     */
-    private fun showServerSwitcherMenu(anchor: View) {
-        val store = ServerStore(this)
-        val currentUrl = store.currentServerUrl()
-        val otherServers = store.offeredServers().filter { originOf(it) != pinnedOrigin }
-
-        val popup = PopupMenu(this, anchor, Gravity.TOP)
-        MenuCompat.setGroupDividerEnabled(popup.menu, true)
-        popup.menu.apply {
-            // Group 0: current server — disabled header.
-            add(0, 0, 0, hostLabelOf(currentUrl)).isEnabled = false
-            // Group 1: the other servers on offer (divider before this group).
-            otherServers.forEachIndexed { i, url ->
-                add(1, 100 + i, 0, hostLabelOf(url))
-            }
-            // Group 2: actions (divider before this group).
-            add(2, 3, 0, getString(R.string.menu_reload))
-            add(2, 4, 0, getString(R.string.menu_connect_new))
-        }
-        popup.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                3 -> {
-                    webView.reload()
-                    true
-                }
-
-                4 -> {
-                    startActivity(Intent(this@MainActivity, ConnectActivity::class.java))
-                    true
-                }
-
-                in 100..Int.MAX_VALUE -> {
-                    val url = otherServers[item.itemId - 100]
-                    store.connect(url)
-                    originOf(url)?.let { reloadWithNewServer(url, it) }
-                    true
-                }
-
-                else -> {
-                    false
-                }
-            }
-        }
-        popup.show()
     }
 
     /** Run bridge-dependent work once a pinned-origin page has finished loading. */

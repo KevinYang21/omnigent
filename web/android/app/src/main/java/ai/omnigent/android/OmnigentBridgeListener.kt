@@ -23,6 +23,10 @@ import org.json.JSONObject
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    /** Web sidebar picker picked a server; the host validates and switches. */
+    private val onSwitchServer: (String) -> Unit,
+    /** Web sidebar picker asked for "Connect to new server…" (ConnectActivity). */
+    private val onOpenServerSetup: () -> Unit,
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -93,6 +97,14 @@ class OmnigentBridgeListener(
                     mimeType = json.optString("mimeType").ifEmpty { "application/octet-stream" },
                     suggestedName = json.optString("name"),
                 )
+            }
+
+            "switchServer" -> {
+                onSwitchServer(json.optString("url").ifEmpty { return })
+            }
+
+            "openServerSetup" -> {
+                onOpenServerSetup()
             }
         }
     }

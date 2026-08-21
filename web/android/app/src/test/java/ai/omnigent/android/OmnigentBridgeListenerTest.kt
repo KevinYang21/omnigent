@@ -27,15 +27,21 @@ class OmnigentBridgeListenerTest {
     private lateinit var shadow: ShadowNotificationManager
 
     private val badgeId = 1
+    private val switchedServers = mutableListOf<String>()
+    private var serverSetupOpened = 0
 
     @Before
     fun setUp() {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         context = ApplicationProvider.getApplicationContext()
+        switchedServers.clear()
+        serverSetupOpened = 0
         listener =
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
+                onSwitchServer = { switchedServers.add(it) },
+                onOpenServerSetup = { serverSetupOpened++ },
             )
         shadow =
             shadowOf(
@@ -131,5 +137,24 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"method":"unknownThing","count":5}""")
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
+    }
+
+    @Test
+    fun `switchServer message hands the url to the host`() {
+        listener.handle("""{"method":"switchServer","url":"https://other.example.com"}""")
+        assertEquals(listOf("https://other.example.com"), switchedServers)
+    }
+
+    @Test
+    fun `switchServer without a url is dropped`() {
+        listener.handle("""{"method":"switchServer"}""")
+        listener.handle("""{"method":"switchServer","url":""}""")
+        assertEquals(emptyList<String>(), switchedServers)
+    }
+
+    @Test
+    fun `openServerSetup message asks the host to open the connect screen`() {
+        listener.handle("""{"method":"openServerSetup"}""")
+        assertEquals(1, serverSetupOpened)
     }
 }
