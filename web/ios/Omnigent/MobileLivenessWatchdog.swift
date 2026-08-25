@@ -8,7 +8,7 @@ enum NativeBridgeProtocol {
 final class MobileLivenessWatchdog {
   typealias Schedule = (_ delay: TimeInterval, _ action: @escaping () -> Void) -> () -> Void
 
-  static let initialReadiness: TimeInterval = 20
+  static let reactivationGrace: TimeInterval = 20
   static let heartbeat: TimeInterval = 15
 
   private let schedule: Schedule
@@ -37,13 +37,14 @@ final class MobileLivenessWatchdog {
     self.onIncompatible = onIncompatible
   }
 
-  func beginInitialWindow() {
+  func beginDocument() {
     compatible = false
-    arm(after: Self.initialReadiness)
+    cancel()
   }
 
   func protocolReady(version: Int, expectedVersion: Int) -> Bool {
     guard version == expectedVersion else {
+      compatible = false
       cancel()
       onIncompatible()
       return false
@@ -60,13 +61,13 @@ final class MobileLivenessWatchdog {
   func setActive(_ value: Bool) {
     guard active != value else { return }
     active = value
-    value ? arm(after: Self.initialReadiness) : cancel()
+    value ? arm(after: Self.reactivationGrace) : cancel()
   }
 
   func setOnPinnedOrigin(_ value: Bool) {
     guard onPinnedOrigin != value else { return }
     onPinnedOrigin = value
-    value ? arm(after: Self.initialReadiness) : cancel()
+    value ? arm(after: Self.reactivationGrace) : cancel()
   }
 
   func cancel() {
@@ -76,7 +77,7 @@ final class MobileLivenessWatchdog {
 
   private func arm(after delay: TimeInterval) {
     cancel()
-    guard active, onPinnedOrigin else { return }
+    guard active, onPinnedOrigin, compatible else { return }
     cancelScheduled = schedule(delay, onTimeout)
   }
 

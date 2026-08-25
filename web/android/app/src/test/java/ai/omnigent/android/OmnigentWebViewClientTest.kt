@@ -35,7 +35,7 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
-    fun `same-origin document start resets liveness but auth return does not`() {
+    fun `same-origin document disables liveness until handshake but auth return preserves it`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val scheduler = TestWatchdogScheduler()
         var failures = 0
@@ -46,17 +46,18 @@ class OmnigentWebViewClientTest {
                 onMainFrameOriginChanged = {
                     watchdog.setOnPinnedOrigin(originOf(it) == DATABRICKS_ORIGIN)
                 },
-                onPinnedDocumentStarted = watchdog::beginInitialWindow,
+                onPinnedDocumentStarted = watchdog::beginDocument,
             )
 
-        watchdog.beginInitialWindow()
+        watchdog.beginDocument()
         watchdog.protocolReady(1, 1)
         client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent", null)
         client.onPageStarted(webView, "$DATABRICKS_ORIGIN/omnigent/c/new", null)
         scheduler.advanceBy(10_000)
         watchdog.heartbeat() // outgoing document
         scheduler.advanceBy(10_000)
-        assertEquals(1, failures)
+        assertEquals(0, failures)
+        assertEquals(null, scheduler.remainingOrNull())
 
         watchdog.protocolReady(1, 1)
         client.onPageStarted(webView, IDP_URL, null)
@@ -64,7 +65,7 @@ class OmnigentWebViewClientTest {
         scheduler.advanceBy(14_000)
         watchdog.heartbeat()
         scheduler.advanceBy(14_000)
-        assertEquals(1, failures)
+        assertEquals(0, failures)
     }
 
     @Test
@@ -397,6 +398,8 @@ class OmnigentWebViewClientTest {
                 pending?.invoke()
             }
         }
+
+        fun remainingOrNull(): Long? = due?.minus(now)
     }
 
     private fun request(

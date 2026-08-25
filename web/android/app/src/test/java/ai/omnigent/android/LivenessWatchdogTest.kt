@@ -6,25 +6,25 @@ import org.junit.Test
 
 class LivenessWatchdogTest {
     @Test
-    fun `cached old web readiness and heartbeat loss time out deterministically`() {
+    fun `pre-protocol web disables liveness and negotiated heartbeat loss times out`() {
         val scheduler = FakeScheduler()
         var failures = 0
         val watchdog = LivenessWatchdog(scheduler, onTimeout = { failures++ })
 
-        watchdog.beginInitialWindow()
-        scheduler.advanceBy(19_999)
+        watchdog.beginDocument()
+        watchdog.setActive(false)
+        watchdog.setActive(true)
+        watchdog.setOnPinnedOrigin(false)
+        watchdog.setOnPinnedOrigin(true)
+        scheduler.advanceBy(60_000)
+        assertEquals(0, failures)
+        assertEquals(null, scheduler.remainingOrNull())
+
+        watchdog.protocolReady(1, 1)
+        scheduler.advanceBy(14_999)
         assertEquals(0, failures)
         scheduler.advanceBy(1)
         assertEquals(1, failures)
-
-        watchdog.beginInitialWindow()
-        watchdog.protocolReady(1, 1)
-        scheduler.advanceBy(14_999)
-        watchdog.heartbeat()
-        scheduler.advanceBy(14_999)
-        assertEquals(1, failures)
-        scheduler.advanceBy(1)
-        assertEquals(2, failures)
     }
 
     @Test
@@ -33,7 +33,7 @@ class LivenessWatchdogTest {
         var incompatibilities = 0
         val watchdog = LivenessWatchdog(scheduler, onTimeout = {}) { incompatibilities++ }
 
-        watchdog.beginInitialWindow()
+        watchdog.beginDocument()
         assertFalse(watchdog.protocolReady(2, 1))
         assertEquals(1, incompatibilities)
         assertEquals(null, scheduler.remainingOrNull())
@@ -45,13 +45,13 @@ class LivenessWatchdogTest {
         var failures = 0
         val watchdog = LivenessWatchdog(scheduler, onTimeout = { failures++ })
 
-        watchdog.beginInitialWindow()
+        watchdog.beginDocument()
         watchdog.protocolReady(1, 1)
         watchdog.setActive(false)
         scheduler.advanceBy(60_000)
         assertEquals(0, failures)
         watchdog.setActive(true)
-        assertEquals(LivenessWatchdog.INITIAL_READY_TIMEOUT_MS, scheduler.remaining())
+        assertEquals(LivenessWatchdog.REACTIVATION_GRACE_MS, scheduler.remaining())
         scheduler.advanceBy(14_000)
         watchdog.heartbeat()
         scheduler.advanceBy(14_000)
@@ -61,7 +61,7 @@ class LivenessWatchdogTest {
         scheduler.advanceBy(60_000)
         assertEquals(0, failures)
         watchdog.setOnPinnedOrigin(true)
-        assertEquals(LivenessWatchdog.INITIAL_READY_TIMEOUT_MS, scheduler.remaining())
+        assertEquals(LivenessWatchdog.REACTIVATION_GRACE_MS, scheduler.remaining())
         scheduler.advanceBy(14_000)
         watchdog.heartbeat()
         scheduler.advanceBy(14_000)
@@ -69,17 +69,21 @@ class LivenessWatchdogTest {
     }
 
     @Test
-    fun `new document resets compatibility and requires readiness`() {
+    fun `new document disables liveness until readiness is negotiated again`() {
         val scheduler = FakeScheduler()
         var failures = 0
         val watchdog = LivenessWatchdog(scheduler, onTimeout = { failures++ })
 
-        watchdog.beginInitialWindow()
+        watchdog.beginDocument()
         watchdog.protocolReady(1, 1)
-        watchdog.beginInitialWindow()
-        scheduler.advanceBy(10_000)
+        watchdog.beginDocument()
+        scheduler.advanceBy(60_000)
         watchdog.heartbeat()
-        scheduler.advanceBy(10_000)
+        assertEquals(0, failures)
+        assertEquals(null, scheduler.remainingOrNull())
+
+        watchdog.protocolReady(1, 1)
+        scheduler.advanceBy(LivenessWatchdog.HEARTBEAT_TIMEOUT_MS)
         assertEquals(1, failures)
     }
 

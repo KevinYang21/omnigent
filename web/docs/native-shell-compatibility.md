@@ -7,18 +7,21 @@ never add a top-center picker or recovery overlay.
 ## Protocol
 
 Mobile bridge protocol version `1` requires the mounted web app to call
-`nativeWebReady(1)` and send `nativeHeartbeat(1)` periodically. The shell waits
-20 seconds for readiness and 15 seconds between heartbeats. A missing or
-different version, a renderer crash, or a liveness timeout leaves the WebView
-and opens the existing full-screen connect view with an error and the current
-server prefilled.
+`nativeWebReady(1)` and send `nativeHeartbeat(1)` periodically. Readiness is the
+capability probe: until a compatible document calls it, the shell leaves its
+watchdog disabled so a pre-protocol server UI remains usable. After readiness,
+the shell waits 15 seconds between heartbeats. A different version, a renderer
+crash, or a negotiated liveness timeout leaves the WebView and opens the
+existing full-screen connect view with an error and the current server
+prefilled.
 
 The watchdog is suspended while the app is inactive, locked, backgrounded, or
 showing external authentication, and whenever the main frame is away from the
 pinned server origin for embedded IdP/MFA. Returning to the foreground or pinned
-origin grants a fresh 20-second grace window while preserving an established
-handshake; heartbeats resume liveness without another `nativeWebReady`. Only a
-new document load clears compatibility and requires a new handshake.
+origin grants a 20-second grace window after an established handshake;
+heartbeats resume liveness without another `nativeWebReady`. A new document
+clears compatibility and leaves the watchdog disabled until that document
+negotiates readiness.
 
 Picker reads are native round trips. Each `getServerPicker()` request reads the
 current managed configuration and persisted recents, and switching is checked
@@ -30,7 +33,7 @@ key (including mount path and query, excluding default ports and fragments).
 | Shell                                            | Server-served web       | Result                                                                                        |
 | ------------------------------------------------ | ----------------------- | --------------------------------------------------------------------------------------------- |
 | Protocol-1 mobile shell                          | Protocol-1 web          | Sidebar picker and heartbeat operate normally.                                                |
-| Protocol-1 mobile shell                          | Cached pre-protocol web | Readiness times out into full-screen connect/failure.                                         |
+| Protocol-1 mobile shell                          | Pre-protocol web        | Web remains loaded with liveness disabled; the native sidebar picker is unavailable.          |
 | Protocol-1 mobile shell                          | Future/incompatible web | Version mismatch opens full-screen connect/failure.                                           |
 | Pre-protocol mobile shell                        | Protocol-1 web          | Unsupported; web replaces its surface with the best available full-screen app-update outcome. |
 | Android without the origin-scoped message bridge | Any web                 | MainActivity opens full-screen connect/failure before loading the server UI.                  |

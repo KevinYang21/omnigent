@@ -481,7 +481,7 @@ struct OmnigentWebView: UIViewRepresentable {
       rootBounces = 0
       compatibilityReady = false
       recoveryShown = false
-      livenessWatchdog.beginInitialWindow()
+      livenessWatchdog.beginDocument()
       publishModelChanges { $0.currentURL = url }
       webView.load(URLRequest(url: url))
     }
@@ -495,7 +495,7 @@ struct OmnigentWebView: UIViewRepresentable {
       let startsPinnedDocument = url?.omnigentOrigin == pinnedOrigin
       if startsPinnedDocument && mainFrameOnPinnedOrigin {
         compatibilityReady = false
-        livenessWatchdog.beginInitialWindow()
+        livenessWatchdog.beginDocument()
       }
       mainFrameOnPinnedOrigin = startsPinnedDocument
       livenessWatchdog.setOnPinnedOrigin(startsPinnedDocument)

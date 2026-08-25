@@ -4,25 +4,25 @@ import XCTest
 
 @MainActor
 final class MobileLivenessWatchdogTests: XCTestCase {
-  func testCachedOldWebReadinessAndHeartbeatLossTimeouts() {
+  func testPreProtocolWebDisablesLivenessAndNegotiatedHeartbeatLossTimesOut() {
     let clock = ManualWatchdogClock()
     var failures = 0
     let watchdog = MobileLivenessWatchdog(schedule: clock.schedule) { failures += 1 }
 
-    watchdog.beginInitialWindow()
-    clock.advance(by: 19.99)
+    watchdog.beginDocument()
+    watchdog.setActive(false)
+    watchdog.setActive(true)
+    watchdog.setOnPinnedOrigin(false)
+    watchdog.setOnPinnedOrigin(true)
+    clock.advance(by: 60)
+    XCTAssertEqual(failures, 0)
+    XCTAssertNil(clock.remaining)
+
+    XCTAssertTrue(watchdog.protocolReady(version: 1, expectedVersion: 1))
+    clock.advance(by: 14.99)
     XCTAssertEqual(failures, 0)
     clock.advance(by: 0.01)
     XCTAssertEqual(failures, 1)
-
-    watchdog.beginInitialWindow()
-    XCTAssertTrue(watchdog.protocolReady(version: 1, expectedVersion: 1))
-    clock.advance(by: 14.99)
-    watchdog.receivedHeartbeat()
-    clock.advance(by: 14.99)
-    XCTAssertEqual(failures, 1)
-    clock.advance(by: 0.01)
-    XCTAssertEqual(failures, 2)
   }
 
   func testProtocolMismatchFailsImmediately() {
@@ -31,7 +31,7 @@ final class MobileLivenessWatchdogTests: XCTestCase {
     let watchdog = MobileLivenessWatchdog(
       schedule: clock.schedule, onTimeout: {}, onIncompatible: { incompatibilities += 1 })
 
-    watchdog.beginInitialWindow()
+    watchdog.beginDocument()
     XCTAssertFalse(watchdog.protocolReady(version: 2, expectedVersion: 1))
     XCTAssertEqual(incompatibilities, 1)
     XCTAssertNil(clock.remaining)
@@ -42,13 +42,13 @@ final class MobileLivenessWatchdogTests: XCTestCase {
     var failures = 0
     let watchdog = MobileLivenessWatchdog(schedule: clock.schedule) { failures += 1 }
 
-    watchdog.beginInitialWindow()
+    watchdog.beginDocument()
     XCTAssertTrue(watchdog.protocolReady(version: 1, expectedVersion: 1))
     watchdog.setActive(false)
     clock.advance(by: 60)
     XCTAssertEqual(failures, 0)
     watchdog.setActive(true)
-    XCTAssertEqual(clock.remaining, MobileLivenessWatchdog.initialReadiness)
+    XCTAssertEqual(clock.remaining, MobileLivenessWatchdog.reactivationGrace)
     clock.advance(by: 14)
     watchdog.receivedHeartbeat()
     clock.advance(by: 14)
@@ -58,24 +58,28 @@ final class MobileLivenessWatchdogTests: XCTestCase {
     clock.advance(by: 60)
     XCTAssertEqual(failures, 0)
     watchdog.setOnPinnedOrigin(true)
-    XCTAssertEqual(clock.remaining, MobileLivenessWatchdog.initialReadiness)
+    XCTAssertEqual(clock.remaining, MobileLivenessWatchdog.reactivationGrace)
     clock.advance(by: 14)
     watchdog.receivedHeartbeat()
     clock.advance(by: 14)
     XCTAssertEqual(failures, 0)
   }
 
-  func testNewDocumentResetsCompatibilityAndRequiresReadiness() {
+  func testNewDocumentDisablesLivenessUntilReadinessIsNegotiatedAgain() {
     let clock = ManualWatchdogClock()
     var failures = 0
     let watchdog = MobileLivenessWatchdog(schedule: clock.schedule) { failures += 1 }
 
-    watchdog.beginInitialWindow()
+    watchdog.beginDocument()
     XCTAssertTrue(watchdog.protocolReady(version: 1, expectedVersion: 1))
-    watchdog.beginInitialWindow()
-    clock.advance(by: 10)
+    watchdog.beginDocument()
+    clock.advance(by: 60)
     watchdog.receivedHeartbeat()
-    clock.advance(by: 10)
+    XCTAssertEqual(failures, 0)
+    XCTAssertNil(clock.remaining)
+
+    XCTAssertTrue(watchdog.protocolReady(version: 1, expectedVersion: 1))
+    clock.advance(by: MobileLivenessWatchdog.heartbeat)
     XCTAssertEqual(failures, 1)
   }
 }

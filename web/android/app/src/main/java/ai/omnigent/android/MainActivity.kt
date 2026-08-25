@@ -271,7 +271,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         ensureNotificationPermission()
-        livenessWatchdog.beginInitialWindow()
+        livenessWatchdog.beginDocument()
         webView.loadUrl(serverUrl)
     }
 
@@ -584,7 +584,7 @@ class MainActivity : AppCompatActivity() {
             showFullScreenRecovery("This Android WebView cannot run the required secure bridge.")
             return
         }
-        livenessWatchdog.beginInitialWindow()
+        livenessWatchdog.beginDocument()
         webView.loadUrl(serverUrl)
     }
 
@@ -628,7 +628,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun onPinnedDocumentStarted() {
         compatibilityReady = false
-        livenessWatchdog.beginInitialWindow()
+        livenessWatchdog.beginDocument()
     }
 
     private fun flushPendingActivation() {
