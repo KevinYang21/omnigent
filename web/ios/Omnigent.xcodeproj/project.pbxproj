@@ -33,7 +33,7 @@
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */; };
-		B20000000000000000000009 /* NativeBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* NativeBridgeTests.swift */; };
+		B2000000000000000000000B /* NativeBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* NativeBridgeTests.swift */; };
 		B2000000000000000000000A /* MobileLivenessWatchdogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* MobileLivenessWatchdogTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
 		B20000000000000000000004 /* DeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* DeepLinkTests.swift */; };
@@ -98,7 +98,7 @@
 		A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderRedirectTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000007 /* ManagedConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedConfigurationTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceChromeScriptTests.swift; sourceTree = "<group>"; };
-		A20000000000000000000009 /* NativeBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeBridgeTests.swift; sourceTree = "<group>"; };
+		A2000000000000000000000B /* NativeBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeBridgeTests.swift; sourceTree = "<group>"; };
 		A2000000000000000000000A /* MobileLivenessWatchdogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileLivenessWatchdogTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000006 /* MockHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockHTTPServer.swift; sourceTree = "<group>"; };
 		A20000000000000000000009 /* OidcLoginManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OidcLoginManagerTests.swift; sourceTree = "<group>"; };
@@ -198,7 +198,7 @@
 				A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */,
 				A20000000000000000000007 /* ManagedConfigurationTests.swift */,
 				A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */,
-				A20000000000000000000009 /* NativeBridgeTests.swift */,
+				A2000000000000000000000B /* NativeBridgeTests.swift */,
 				A2000000000000000000000A /* MobileLivenessWatchdogTests.swift */,
 				A20000000000000000000006 /* MockHTTPServer.swift */,
 				A20000000000000000000009 /* OidcLoginManagerTests.swift */,
@@ -390,7 +390,7 @@
 				B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */,
 				B20000000000000000000007 /* ManagedConfigurationTests.swift in Sources */,
 				B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */,
-				B20000000000000000000009 /* NativeBridgeTests.swift in Sources */,
+				B2000000000000000000000B /* NativeBridgeTests.swift in Sources */,
 				B2000000000000000000000A /* MobileLivenessWatchdogTests.swift in Sources */,
 				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
 				B20000000000000000000009 /* OidcLoginManagerTests.swift in Sources */,
