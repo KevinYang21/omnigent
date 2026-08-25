@@ -28,16 +28,22 @@ _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 # where the sidebar docks as the persistent left rail.
 _DESKTOP_VIEWPORT: ViewportSize = {"width": 1024, "height": 844}
 
-# Android-shaped bridge stub carrying the server-picker trio. Runs before any
-# app script (``add_init_script``), so ``nativeApi()`` sees a native shell and
-# ``getServerPicker()`` resolves non-null — the single gate that mounts the
-# sidebar picker. ``switchServer`` / ``openServerSetup`` record their calls so
-# the test can assert the SPA handed the action to the shell.
+# Android-shaped bridge stub carrying the server-picker trio plus the
+# protocol handshake fields (version/ready/heartbeat) — without those the
+# liveness gate replaces the page with "App update required" before the
+# sidebar can mount. Runs before any app script (``add_init_script``), so
+# ``nativeApi()`` sees a native shell and ``getServerPicker()`` resolves
+# non-null — the single gate that mounts the sidebar picker.
+# ``switchServer`` / ``openServerSetup`` record their calls so the test can
+# assert the SPA handed the action to the shell.
 _PICKER_SHELL_INIT_SCRIPT = """
 window.__omnigentSwitchedTo = [];
 window.__omnigentSetupOpened = 0;
 window.omnigentNative = {
   kind: "android",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function () { return function () {}; },
