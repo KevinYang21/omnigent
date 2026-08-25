@@ -5872,3 +5872,55 @@ def test_same_stable_id_twice_in_one_batch_inserts_once(
     assert a.deduplicated is False
     assert b.deduplicated is True
     assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry batch repeating one already-persisted stable id is a pure duplicate.
+
+    Concurrent forwarders can deliver the same record twice in one batch
+    after it already persisted: every item resolves to the stored row, so
+    nothing inserts and the conversation must not look active.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="1b" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    [a, b] = conversation_store.append(conv.id, [item, item])
+    assert a.deduplicated is True
+    assert b.deduplicated is True
+    assert a.id == b.id
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == 1000
+    assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_has_item_probes_persisted_ids(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``has_item`` sees a persisted stable id, scoped to its conversation."""
+    conv = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+    stable = "2c" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    assert conversation_store.has_item(conv.id, stable) is False
+    conversation_store.append(conv.id, [item])
+    assert conversation_store.has_item(conv.id, stable) is True
+    assert conversation_store.has_item(other.id, stable) is False

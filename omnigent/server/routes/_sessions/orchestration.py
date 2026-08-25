@@ -2265,6 +2265,23 @@ async def _persist_external_conversation_item(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
+    # Skipped Kiro entries persist BEFORE the matched item so their stored
+    # positions precede it, matching the live broadcast order — unless the
+    # matched item is a duplicate re-post, in which case the skipped drains
+    # belong to LATER messages and are restored (below), not persisted.
+    skipped_persisted = False
+    if skipped_kiro_pending:
+        matched_already_persisted = item.stable_id is not None and await asyncio.to_thread(
+            conversation_store.has_item, session_id, item.stable_id
+        )
+        if not matched_already_persisted:
+            for skipped in skipped_kiro_pending:
+                await _persist_skipped_kiro_pending_input(
+                    session_id,
+                    skipped,
+                    conversation_store,
+                )
+            skipped_persisted = True
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
@@ -2277,17 +2294,22 @@ async def _persist_external_conversation_item(
         # title, and every pending entry the drain above consumed belongs
         # to a LATER user message — put them back at the front in their
         # original queue order (skipped entries preceded the match; restore
-        # prepends, so restore in reverse).
-        for entry in reversed([*skipped_kiro_pending, drained]):
+        # prepends, so restore in reverse). Skipped entries persisted above
+        # (the probe raced a concurrent retry) stay persisted.
+        restorable = [drained] if skipped_persisted else [*skipped_kiro_pending, drained]
+        for entry in reversed(restorable):
             if entry is not None:
                 pending_inputs.restore(session_id, entry)
         return persisted.id
-    for skipped in skipped_kiro_pending:
-        await _persist_skipped_kiro_pending_input(
-            session_id,
-            skipped,
-            conversation_store,
-        )
+    if not skipped_persisted:
+        # Probe said duplicate but the append inserted anyway (row vanished
+        # in between): persist the skipped drains late rather than lose them.
+        for skipped in skipped_kiro_pending:
+            await _persist_skipped_kiro_pending_input(
+                session_id,
+                skipped,
+                conversation_store,
+            )
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()
