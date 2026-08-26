@@ -69,6 +69,22 @@ window.omnigentNative = {
 };
 """
 
+_TALL_PICKER_SHELL_INIT_SCRIPT = (
+    _PICKER_SHELL_INIT_SCRIPT
+    + """
+window.omnigentNative.getServerPicker = function () {
+  return Promise.resolve({
+    currentOrigin: "http://localhost:8000",
+    managedServers: Array.from(
+      {length: 20},
+      function (_, index) { return "https://managed-" + index + ".example.com/"; },
+    ),
+    recentServers: [],
+  });
+};
+"""
+)
+
 
 def test_sidebar_picker_lists_shell_servers_and_drives_the_bridge(
     page: Page,
@@ -143,6 +159,33 @@ def test_connect_to_new_server_opens_the_shells_setup(
     page.get_by_test_id("sidebar-server-picker").click()
     page.get_by_role("menuitem", name="Connect to new server…").click()
     assert page.evaluate("() => window.__omnigentSetupOpened") == 1
+
+
+def test_tall_picker_keeps_the_viewport_collision_gutter(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A scroll-constrained menu retains its eight-pixel viewport gutter."""
+    base_url, _session_id = seeded_session
+
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.add_init_script(_TALL_PICKER_SHELL_INIT_SCRIPT)
+    page.goto(f"{base_url}/?sidebar=open")
+
+    page.get_by_test_id("sidebar-server-picker").click()
+    menu = page.get_by_role("menu")
+    expect(menu).to_be_visible()
+    trigger_box = page.get_by_test_id("sidebar-server-picker").bounding_box()
+    assert trigger_box is not None
+    available_height = menu.evaluate(
+        """(element) => parseFloat(
+          getComputedStyle(element.parentElement)
+            .getPropertyValue("--radix-popper-available-height")
+        )"""
+    )
+    # The upward popper gets the space above the trigger, less the shared 4px
+    # side offset and this picker's explicit 8px viewport collision gutter.
+    assert abs(available_height - (trigger_box["y"] - 4 - 8)) < 1
 
 
 def test_breakpoint_crossing_keeps_one_mounted_picker(

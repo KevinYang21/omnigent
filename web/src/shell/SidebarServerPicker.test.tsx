@@ -80,29 +80,49 @@ describe("SidebarServerPicker", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows managed servers before recents and switches to one", async () => {
+  it("keeps path-distinct managed servers switchable and collapses exact duplicates", async () => {
     getServerPicker.mockResolvedValue({
-      currentOrigin: "https://personal.example.com",
-      managedServers: ["https://managed.example.com/ml/omnigents"],
-      recentServers: ["https://managed.example.com/old-mount", "https://recent.example.com/"],
+      currentOrigin: "https://apps.example.com",
+      currentServerUrl: "https://apps.example.com/first",
+      managedServers: ["https://apps.example.com:443/first/", "https://apps.example.com/second"],
+      recentServers: ["https://apps.example.com:443/second/", "https://apps.example.com/third"],
     });
     renderPicker();
 
     await openMenu();
     expect(await screen.findByText("Provided by your organization")).toBeInTheDocument();
-    expect(screen.getAllByText("managed.example.com")).toHaveLength(1);
     expect(screen.getByText("Recents")).toBeInTheDocument();
-    expect(screen.getByText("recent.example.com")).toBeInTheDocument();
+    expect(screen.getAllByText("apps.example.com/first")).toHaveLength(2);
+    const second = screen.getByRole("menuitem", { name: "apps.example.com/second" });
+    expect(second).not.toHaveAttribute("data-disabled");
+    expect(screen.getByText("apps.example.com/third")).toBeInTheDocument();
+    expect(screen.getAllByRole("menuitem")).toHaveLength(4);
 
-    fireEvent.click(screen.getByText("managed.example.com"));
+    fireEvent.click(second);
     await waitFor(() =>
-      expect(switchServer).toHaveBeenCalledWith("https://managed.example.com/ml/omnigents"),
+      expect(switchServer).toHaveBeenCalledWith("https://apps.example.com/second"),
     );
+  });
+
+  it("keeps the last good menu when a live refresh times out", async () => {
+    getServerPicker
+      .mockResolvedValueOnce({
+        currentOrigin: "https://current.example.com",
+        recentServers: ["https://recent.example.com"],
+      })
+      .mockResolvedValueOnce(null);
+    renderPicker();
+
+    await openMenu();
+    await waitFor(() => expect(getServerPicker).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("recent.example.com")).toBeInTheDocument();
+    expect(screen.getByRole("menu")).toBeInTheDocument();
   });
 
   it("shows a managed current server only in the organization section", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "https://managed.example.com",
+      currentServerUrl: "https://managed.example.com/ml/omnigents",
       managedServers: ["https://managed.example.com/ml/omnigents"],
       recentServers: [],
     });
@@ -111,7 +131,7 @@ describe("SidebarServerPicker", () => {
     await openMenu();
     expect(await screen.findByText("Provided by your organization")).toBeInTheDocument();
     // Once on the sidebar row and once as the checked managed menu item.
-    expect(screen.getAllByText("managed.example.com")).toHaveLength(2);
+    expect(screen.getAllByText("managed.example.com/ml/omnigents")).toHaveLength(2);
     expect(screen.queryByText("Recents")).toBeNull();
   });
 
@@ -139,19 +159,6 @@ describe("SidebarServerPicker", () => {
     fireEvent.click(await screen.findByText("Connect to new server…"));
 
     await waitFor(() => expect(openServerSetup).toHaveBeenCalled());
-  });
-
-  it("still offers 'Connect to new server…' with no recents", async () => {
-    getServerPicker.mockResolvedValue({
-      currentOrigin: "http://localhost:8000",
-      recentServers: [],
-    });
-    renderPicker();
-
-    await openMenu();
-
-    // Only the current server is listed — but the menu is never a dead end.
-    expect(await screen.findByText("Connect to new server…")).toBeInTheDocument();
   });
 
   it("falls back to the raw string when an origin won't parse as a URL", async () => {

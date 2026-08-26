@@ -285,6 +285,8 @@ export interface ElectronUpdateBridge {
 export interface ServerPickerInfo {
   /** Origin this shell is connected to, e.g. `"http://localhost:8000"`. */
   currentOrigin: string;
+  /** Full connected server URL, including a path-based deployment mount. */
+  currentServerUrl?: string;
   /**
    * Server URLs supplied through managed app configuration. Optional because a
    * newer server-served SPA can run inside a native shell that predates MDM.

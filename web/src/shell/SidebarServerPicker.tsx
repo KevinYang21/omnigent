@@ -18,21 +18,26 @@ import {
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
-/** Short display label for a server URL — its host, e.g. "localhost:8000". */
-function hostOf(url: string): string {
+/** Compact display label that keeps path-based deployments distinguishable. */
+function serverLabel(url: string): string {
   try {
-    return new URL(url).host;
+    const parsed = new URL(url);
+    const path = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/$/, "");
+    return `${parsed.host}${path}`;
   } catch {
     return url;
   }
 }
 
-/** Origin of a server URL, for matching recents against the current origin. */
-function originOf(url: string): string | null {
+/** Browser-canonical server identity, retaining path and query. */
+function serverKey(url: string): string {
   try {
-    return new URL(url).origin;
+    const parsed = new URL(url);
+    parsed.hash = "";
+    if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/$/, "");
+    return parsed.href;
   } catch {
-    return null;
+    return `raw:${url}`;
   }
 }
 
@@ -59,6 +64,12 @@ function originOf(url: string): string | null {
 export function SidebarServerPicker() {
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);
 
+  const refresh = () => {
+    void getServerPicker().then((result) => {
+      if (result) setInfo(result);
+    });
+  };
+
   useEffect(() => {
     let cancelled = false;
     void getServerPicker().then((result) => {
@@ -71,28 +82,24 @@ export function SidebarServerPicker() {
 
   if (!info) return null;
 
+  const currentUrl = info.currentServerUrl ?? info.currentOrigin;
+  const currentKey = serverKey(currentUrl);
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
-  const managedOrigins = new Set(managed.map(originOf).filter((origin) => origin !== null));
-  const currentIsManaged = managedOrigins.has(info.currentOrigin);
+  const managedKeys = new Set(managed.map(serverKey));
+  const currentIsManaged = managedKeys.has(currentKey);
   // The current server leads its section even when settings were edited out
-  // from under us. Managed origins are not repeated under Recents.
+  // from under us. Managed servers are not repeated under Recents.
   const recentOthers = info.recentServers.filter((url) => {
-    const origin = originOf(url);
-    return origin !== info.currentOrigin && (origin === null || !managedOrigins.has(origin));
+    const key = serverKey(url);
+    return key !== currentKey && !managedKeys.has(key);
   });
-  const currentHost = hostOf(info.currentOrigin);
+  const currentLabel = serverLabel(currentUrl);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
     // list above (flex-1) gives up space instead of squashing it.
     <div className="shrink-0 px-2 pt-1 pb-2" data-testid="sidebar-server-picker-row">
-      <DropdownMenu
-        onOpenChange={(open) => {
-          // Re-read when opened so a newly applied/removed MDM profile appears
-          // without restarting the server-served SPA.
-          if (open) void getServerPicker().then(setInfo);
-        }}
-      >
+      <DropdownMenu onOpenChange={(open) => open && refresh()}>
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
@@ -109,25 +116,25 @@ export function SidebarServerPicker() {
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",
             )}
-            aria-label={`Server: ${currentHost}. Switch server`}
+            aria-label={`Server: ${currentLabel}. Switch server`}
             data-testid="sidebar-server-picker"
           >
             <ServerIcon className="ui-icon text-muted-foreground" />
-            <span className="truncate">{currentHost}</span>
+            <span className="truncate">{currentLabel}</span>
             {/* Points up: the menu opens upward from the sidebar's bottom. */}
             <ChevronUpIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
         {/* side="top" — the trigger sits at the bottom of the window, so the
             menu must grow upward rather than off-screen. */}
-        <DropdownMenuContent side="top" align="start" className="min-w-56">
+        <DropdownMenuContent side="top" align="start" collisionPadding={8} className="min-w-56">
           {managed.length > 0 ? (
             <>
               <DropdownMenuLabel className="text-muted-foreground">
                 Provided by your organization
               </DropdownMenuLabel>
               {managed.map((url) => {
-                const isCurrent = originOf(url) === info.currentOrigin;
+                const isCurrent = serverKey(url) === currentKey;
                 return (
                   <DropdownMenuItem
                     key={url}
@@ -141,7 +148,7 @@ export function SidebarServerPicker() {
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
                     <span className={cn("truncate", isCurrent && "font-medium")}>
-                      {hostOf(url)}
+                      {serverLabel(url)}
                     </span>
                   </DropdownMenuItem>
                 );
@@ -155,7 +162,7 @@ export function SidebarServerPicker() {
               {!currentIsManaged ? (
                 <DropdownMenuItem disabled className="gap-2 min-h-11 opacity-100 md:min-h-0">
                   <CheckIcon className="size-4 shrink-0" />
-                  <span className="truncate font-medium">{currentHost}</span>
+                  <span className="truncate font-medium">{currentLabel}</span>
                 </DropdownMenuItem>
               ) : null}
               {recentOthers.map((url) => (
@@ -165,7 +172,7 @@ export function SidebarServerPicker() {
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="truncate">{hostOf(url)}</span>
+                  <span className="truncate">{serverLabel(url)}</span>
                 </DropdownMenuItem>
               ))}
             </>
