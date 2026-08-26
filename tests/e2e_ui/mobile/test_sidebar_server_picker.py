@@ -51,6 +51,10 @@ window.omnigentNative = {
   getServerPicker: function () {
     return Promise.resolve({
       currentOrigin: "http://localhost:8000",
+      managedServers: [
+        "http://localhost:8000",
+        "https://managed.example.com/",
+      ],
       recentServers: [
         "https://managed.example.com/",
         "https://recent.example.com/",
@@ -99,6 +103,11 @@ def test_sidebar_picker_lists_shell_servers_and_drives_the_bridge(
     expect(menu).to_contain_text("managed.example.com")
     expect(menu).to_contain_text("recent.example.com")
     expect(menu).to_contain_text("Connect to new server…")
+
+    menu_items = menu.get_by_role("menuitem")
+    expect(menu_items).to_have_count(4)
+    item_heights = menu_items.evaluate_all("(items) => items.map((item) => item.offsetHeight)")
+    assert all(height >= 44 for height in item_heights), item_heights
 
     # Upward-opening and viewport-contained: the whole menu sits above the
     # trigger's top edge and inside the viewport.

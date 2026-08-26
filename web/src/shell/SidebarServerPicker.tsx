@@ -132,7 +132,7 @@ export function SidebarServerPicker() {
                   <DropdownMenuItem
                     key={url}
                     disabled={isCurrent}
-                    className={cn("gap-2", isCurrent && "opacity-100")}
+                    className={cn("gap-2 min-h-11 md:min-h-0", isCurrent && "opacity-100")}
                     onSelect={isCurrent ? undefined : () => void switchServer(url)}
                   >
                     {isCurrent ? (
@@ -153,7 +153,7 @@ export function SidebarServerPicker() {
               {managed.length > 0 ? <DropdownMenuSeparator /> : null}
               <DropdownMenuLabel className="text-muted-foreground">Recents</DropdownMenuLabel>
               {!currentIsManaged ? (
-                <DropdownMenuItem disabled className="gap-2 opacity-100">
+                <DropdownMenuItem disabled className="gap-2 min-h-11 opacity-100 md:min-h-0">
                   <CheckIcon className="size-4 shrink-0" />
                   <span className="truncate font-medium">{currentHost}</span>
                 </DropdownMenuItem>
@@ -161,7 +161,7 @@ export function SidebarServerPicker() {
               {recentOthers.map((url) => (
                 <DropdownMenuItem
                   key={url}
-                  className="gap-2"
+                  className="gap-2 min-h-11 md:min-h-0"
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
@@ -171,7 +171,10 @@ export function SidebarServerPicker() {
             </>
           ) : null}
           <DropdownMenuSeparator />
-          <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
+          <DropdownMenuItem
+            className="gap-2 min-h-11 md:min-h-0"
+            onSelect={() => openServerSetup()}
+          >
             <PlusIcon className="size-4 shrink-0" />
             Connect to new server…
           </DropdownMenuItem>
