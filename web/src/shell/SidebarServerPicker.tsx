@@ -84,14 +84,24 @@ export function SidebarServerPicker() {
 
   const currentUrl = info.currentServerUrl ?? info.currentOrigin;
   const currentKey = serverKey(currentUrl);
+  const matchesCurrent =
+    info.currentServerUrl === undefined
+      ? (url: string) => {
+          try {
+            return new URL(url).origin === info.currentOrigin;
+          } catch {
+            return false;
+          }
+        }
+      : (url: string) => serverKey(url) === currentKey;
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
   const managedKeys = new Set(managed.map(serverKey));
-  const currentIsManaged = managedKeys.has(currentKey);
+  const currentIsManaged = managed.some(matchesCurrent);
   // The current server leads its section even when settings were edited out
   // from under us. Managed servers are not repeated under Recents.
   const recentOthers = info.recentServers.filter((url) => {
     const key = serverKey(url);
-    return key !== currentKey && !managedKeys.has(key);
+    return !matchesCurrent(url) && !managedKeys.has(key);
   });
   const currentLabel = serverLabel(currentUrl);
 
@@ -134,7 +144,7 @@ export function SidebarServerPicker() {
                 Provided by your organization
               </DropdownMenuLabel>
               {managed.map((url) => {
-                const isCurrent = serverKey(url) === currentKey;
+                const isCurrent = matchesCurrent(url);
                 return (
                   <DropdownMenuItem
                     key={url}

@@ -80,6 +80,21 @@ describe("SidebarServerPicker", () => {
     ).toBeInTheDocument();
   });
 
+  it("collapses a path-mounted recent into the Electron current server", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://host",
+      recentServers: ["https://host/omnigent"],
+    });
+    renderPicker();
+
+    await openMenu();
+    const current = await screen.findByRole("menuitem", { name: "host" });
+    expect(current).toHaveAttribute("data-disabled");
+    expect(current.querySelector(".lucide-check")).not.toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "host/omnigent" })).toBeNull();
+    expect(screen.getAllByRole("menuitem")).toHaveLength(2);
+  });
+
   it("keeps path-distinct managed servers switchable and collapses exact duplicates", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "https://apps.example.com",
@@ -122,16 +137,18 @@ describe("SidebarServerPicker", () => {
   it("shows a managed current server only in the organization section", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "https://managed.example.com",
-      currentServerUrl: "https://managed.example.com/ml/omnigents",
       managedServers: ["https://managed.example.com/ml/omnigents"],
-      recentServers: [],
+      recentServers: ["https://managed.example.com/ml/omnigents"],
     });
     renderPicker();
 
     await openMenu();
     expect(await screen.findByText("Provided by your organization")).toBeInTheDocument();
-    // Once on the sidebar row and once as the checked managed menu item.
-    expect(screen.getAllByText("managed.example.com/ml/omnigents")).toHaveLength(2);
+    const current = screen.getByRole("menuitem", {
+      name: "managed.example.com/ml/omnigents",
+    });
+    expect(current).toHaveAttribute("data-disabled");
+    expect(current.querySelector(".lucide-check")).not.toBeNull();
     expect(screen.queryByText("Recents")).toBeNull();
   });
 
