@@ -194,6 +194,36 @@ def test_resolve_gateway_none_when_no_token(monkeypatch: pytest.MonkeyPatch) -> 
     assert resolve_databricks_gateway("oss") is None
 
 
+def test_resolve_gateway_env_default_applies(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No session model pinned -> the deployment env default steers the endpoint.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+    res = resolve_databricks_gateway("oss")
+    assert res is not None
+    assert res.model_id == "databricks-kimi-k3"
+
+
+def test_resolve_gateway_session_model_beats_env_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+    res = resolve_databricks_gateway("oss", model_id="databricks-gpt-5-5")
+    assert res is not None
+    assert res.model_id == "databricks-gpt-5-5"
+
+
+def test_resolve_gateway_env_default_ignored_when_not_gateway_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non ``databricks-*`` env value is not a routable endpoint -> catalog wins.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "kimi-k3")
+    res = resolve_databricks_gateway("oss")
+    assert res is not None
+    assert res.model_id == "catalog-databricks-claude-default"
+
+
 def test_build_mcp_block_stdio_and_http() -> None:
     from types import SimpleNamespace as N
 

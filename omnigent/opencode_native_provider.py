@@ -41,6 +41,11 @@ DATABRICKS_GATEWAY_PROVIDER_ID = "databricks-gateway"
 DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
+# Optional deployment default: a ``databricks-*`` serving-endpoint id used when a
+# session pins no compatible model. Unset falls back to the Databricks Claude
+# catalog. Set it in the runner env to steer every session at one endpoint
+# (e.g. ``databricks-kimi-k3``).
+DATABRICKS_GATEWAY_DEFAULT_MODEL_ENV_VAR = "OMNIGENT_DATABRICKS_GATEWAY_MODEL"
 
 
 @dataclass(frozen=True)
@@ -310,6 +315,10 @@ def resolve_databricks_gateway(
         return None
 
     resolved_model = _gateway_endpoint_for_model(model_id)
+    if resolved_model is None:
+        resolved_model = _gateway_endpoint_for_model(
+            os.environ.get(DATABRICKS_GATEWAY_DEFAULT_MODEL_ENV_VAR)
+        )
     if resolved_model is None:
         resolved_model = model_catalog.resolve_catalog_model(
             "databricks", family="claude"
