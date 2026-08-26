@@ -103,9 +103,7 @@ export function SidebarServerPicker() {
             className={cn(
               SIDEBAR_ROW,
               "w-full justify-start border-0 font-normal",
-              // Below md the sidebar is a touch drawer (iOS/Android shells):
-              // give the trigger the platform-minimum 44px hit target. md+
-              // keeps the compact desktop row height.
+              // Touch drawers need a 44px target while desktop stays compact.
               "min-h-11 md:min-h-0",
               "text-muted-foreground",
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
