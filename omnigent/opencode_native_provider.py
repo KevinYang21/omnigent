@@ -63,6 +63,10 @@ class OpenCodeGatewayResolution:
     base_url: str
     api_key: str
     model_id: str
+    # Every serving-endpoint the gateway can route to, so opencode's in-session
+    # model picker lists them all. ``model_id`` stays the pinned launch default.
+    # Empty falls back to just ``model_id``.
+    model_ids: tuple[str, ...] = ()
     provider_id: str = DATABRICKS_GATEWAY_PROVIDER_ID
     provider_name: str = DATABRICKS_GATEWAY_PROVIDER_NAME
 
@@ -107,7 +111,10 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
                     "baseURL": resolution.base_url,
                     "apiKey": resolution.api_key,
                 },
-                "models": {resolution.model_id: {"name": resolution.model_id}},
+                "models": {
+                    mid: {"name": mid}
+                    for mid in (resolution.model_ids or (resolution.model_id,))
+                },
             }
         },
     }
@@ -323,11 +330,47 @@ def resolve_databricks_gateway(
         resolved_model = model_catalog.resolve_catalog_model(
             "databricks", family="claude"
         ).model_id
+    # List every chat serving-endpoint so opencode's picker offers them all,
+    # with the pinned default first. Best-effort: a failure leaves just the
+    # default (dict.fromkeys de-dupes if the default is also discovered).
+    model_ids = tuple(dict.fromkeys((resolved_model, *_list_gateway_models(config))))
     return OpenCodeGatewayResolution(
         base_url=f"{host}/{_SERVING_ENDPOINTS_PATH}",
         api_key=token,
         model_id=resolved_model,
+        model_ids=model_ids,
     )
+
+
+def _list_gateway_models(config: object) -> tuple[str, ...]:
+    """
+    List the workspace's chat-capable ``databricks-*`` serving endpoints.
+
+    Reuses the already-authenticated SDK *config* so it shares the gateway's
+    auth. Best-effort: any failure (SDK absent, list denied) returns ``()`` and
+    the caller falls back to the single pinned model. Embedding/rerank endpoints
+    are dropped so the model picker only lists chat models.
+
+    :param config: A ``databricks.sdk.core.Config`` for the gateway workspace.
+    :returns: Endpoint names, e.g. ``("databricks-kimi-k3", ...)``.
+    """
+    try:
+        from databricks.sdk import WorkspaceClient
+
+        client = WorkspaceClient(config=config)
+        ids: list[str] = []
+        for endpoint in client.serving_endpoints.list():
+            name = getattr(endpoint, "name", "") or ""
+            if not name.startswith("databricks-"):
+                continue
+            task = (getattr(endpoint, "task", "") or "").lower()
+            if "embed" in task or "rerank" in task:
+                continue
+            ids.append(name)
+        return tuple(ids)
+    except Exception as exc:  # noqa: BLE001 - SDK absent / list denied / bad shape.
+        _logger.info("opencode Databricks gateway model list failed: %r", exc)
+        return ()
 
 
 def _gateway_endpoint_for_model(model_id: str | None) -> str | None:
