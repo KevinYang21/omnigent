@@ -11,8 +11,8 @@
  *
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
  *   default transcript view, Workspace panel default, and UI/code font controls.
- * - **Git** — Git behavior, e.g. the default base branch pre-filled when
- *   naming a new worktree branch in the composer.
+ * - **Git** — Git behavior: the global "always use a random worktree" default
+ *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
  * - **Account** — only when the accounts auth provider is active. Absorbs
  *   the old sidebar AccountMenu: signed-in identity, change password, and
@@ -36,14 +36,13 @@ import {
   useEffect,
   useId,
   useMemo,
-  useRef,
   useState,
 } from "react";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
-  CheckIcon,
   KeyRoundIcon,
+  Loader2Icon,
   LaptopMinimalIcon,
   LogOutIcon,
   MessagesSquareIcon,
@@ -54,13 +53,22 @@ import {
   PanelRightIcon,
   PlusIcon,
   SunIcon,
+  SquareCheckIcon,
+  SquareIcon,
   TerminalIcon,
   Trash2Icon,
   UserCogIcon,
+  XIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
+import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+import {
+  ModePreview,
+  PaletteChip,
+  PaletteSwatchPreview,
+} from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -83,13 +91,15 @@ import {
 } from "@/components/ui/dialog";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { getCurrentIsAdmin, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
   useArchiveConversation,
   useArchivedProjectNames,
+  useBulkArchiveConversations,
+  useBulkDeleteConversations,
   useConversations,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
@@ -97,6 +107,7 @@ import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
+import { ImportSessionsPanel } from "@/shell/ImportSessionsPanel";
 import {
   normalizeResolvedTheme,
   normalizeThemeMode,
@@ -152,6 +163,7 @@ import {
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
@@ -162,7 +174,6 @@ import {
   DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
-  type PaletteSwatch,
   readThemePalette,
   type ThemeSelection,
   writeThemePalette,
@@ -245,6 +256,7 @@ export function SettingsPage() {
       {section === "appearance" && <AppearanceSection />}
       {section === "git" && <GitSection />}
       {section === "shortcuts" && <ShortcutsSection />}
+      {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
       {section === "archived" && <ArchivedSection />}
       {section === "cli" && isElectronShell() && <LocalCliSection />}
@@ -308,37 +320,6 @@ const workspacePanelCards: {
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
-/**
- * Checkmark badge pinned to the top-right corner of a selected card. Shared by
- * every appearance radiogroup so "selected" reads identically everywhere.
- */
-function SelectedBadge() {
-  return (
-    <span
-      aria-hidden
-      className="absolute right-1.5 top-1.5 flex size-4 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-sm"
-    >
-      <CheckIcon className="size-3" />
-    </span>
-  );
-}
-
-/**
- * Shared card styling for the appearance radiogroups. Selected cards carry the
- * accent border + a subtle accent wash (paired with <SelectedBadge/>); the rest
- * highlight their border and lift on hover. focus-visible keeps the global
- * outline ring, so keyboard focus stays visually distinct from selection.
- */
-function themeCardClass(selected: boolean, layout?: string) {
-  return cn(
-    "relative flex flex-col rounded-lg border-2 transition-[color,background-color,border-color,box-shadow]",
-    selected
-      ? "border-primary bg-primary/5"
-      : "border-border hover:border-border-strong hover:bg-muted hover:shadow-sm",
-    layout,
-  );
-}
-
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
 function iconCardBody(Icon: typeof SunIcon, label: string) {
   return (
@@ -346,143 +327,6 @@ function iconCardBody(Icon: typeof SunIcon, label: string) {
       <Icon className="size-6 text-muted-foreground" />
       <span className="text-ui font-medium">{label}</span>
     </>
-  );
-}
-
-// Neutral light/dark window tones for the Mode preview tiles. These are about
-// light-vs-dark only (not the color theme), so they stay grayscale.
-const LIGHT_MODE_PREVIEW: PaletteSwatch = {
-  bg: "#e9ebee",
-  card: "#ffffff",
-  accent: "#aab2bd",
-  border: "#d7dbe0",
-  text: "#11171c",
-};
-const DARK_MODE_PREVIEW: PaletteSwatch = {
-  bg: "#0e1013",
-  card: "#232a33",
-  accent: "#5b6672",
-  border: "#2b333d",
-  text: "#e6edf3",
-};
-
-/**
- * Mini app-window mock for a Mode tile, reusing {@link PaletteSwatchPreview}. A
- * light or dark two-pane window; "system" shows one window split diagonally —
- * light on the near side, dark on the far — to signal "follow the OS".
- */
-function ModePreview({ variant }: { variant: ThemeMode }) {
-  if (variant === "light") return <PaletteSwatchPreview swatch={LIGHT_MODE_PREVIEW} />;
-  if (variant === "dark") return <PaletteSwatchPreview swatch={DARK_MODE_PREVIEW} />;
-  return (
-    <div className="relative h-16 w-full">
-      <PaletteSwatchPreview swatch={LIGHT_MODE_PREVIEW} />
-      <div
-        aria-hidden
-        className="absolute inset-0"
-        style={{ clipPath: "polygon(62% 0, 100% 0, 100% 100%, 38% 100%)" }}
-      >
-        <PaletteSwatchPreview swatch={DARK_MODE_PREVIEW} />
-      </div>
-    </div>
-  );
-}
-
-/** Small swatch chip (canvas + accent dot) for the color-theme dropdown. */
-function PaletteChip({ swatch }: { swatch: PaletteSwatch }) {
-  return (
-    <span
-      aria-hidden
-      className="flex size-5 shrink-0 items-center justify-center rounded-md border"
-      style={{ backgroundColor: swatch.bg, borderColor: swatch.border }}
-    >
-      <span className="size-2 rounded-full" style={{ backgroundColor: swatch.accent }} />
-    </span>
-  );
-}
-
-/** One option in a {@link CardRadioGroup}. */
-interface CardRadioOption<T extends string> {
-  value: T;
-  testId: string;
-  body: ReactNode;
-  /** Optional native tooltip (used for the palette blurbs). */
-  title?: string;
-}
-
-/**
- * Accessible card radiogroup shared by all three appearance pickers. Implements
- * the WAI-ARIA radiogroup pattern: a roving tabindex (only the selected card is
- * tabbable), arrow keys move selection within the group, and Enter/Space select
- * the focused card. `labelledBy` points at the subsection heading so the group's
- * accessible name matches its visible label.
- */
-function CardRadioGroup<T extends string>({
-  labelledBy,
-  value,
-  onSelect,
-  componentId,
-  items,
-  className,
-  cardClassName,
-}: {
-  labelledBy: string;
-  value: T;
-  onSelect: (value: T) => void;
-  // Opt-in analytics id for the whole picker. When set, a selection reports the
-  // chosen value to the host sink (see `lib/analytics.ts`). Card values are a
-  // bounded set, so the value is sent. Covers both the click and arrow-key paths.
-  componentId?: string;
-  items: readonly CardRadioOption<T>[];
-  className?: string;
-  cardClassName?: string;
-}) {
-  const { trackValueChange } = useOmnigentAnalytics();
-  const select = componentId
-    ? (next: T) => {
-        trackValueChange(componentId, "select", next, { valueHasNoPii: true });
-        onSelect(next);
-      }
-    : onSelect;
-  // Keep a handle on each card so arrow-key navigation can move focus as it
-  // moves selection (selection-follows-focus, per the radiogroup pattern).
-  const refs = useRef(new Map<T, HTMLButtonElement | null>());
-
-  return (
-    <div role="radiogroup" aria-labelledby={labelledBy} className={className}>
-      {items.map((item, index) => {
-        const selected = item.value === value;
-        return (
-          <button
-            key={item.value}
-            ref={(el) => {
-              refs.current.set(item.value, el);
-            }}
-            type="button"
-            role="radio"
-            aria-checked={selected}
-            tabIndex={selected ? 0 : -1}
-            title={item.title}
-            data-testid={item.testId}
-            onClick={() => select(item.value)}
-            onKeyDown={(event) => {
-              const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
-              const backward = event.key === "ArrowLeft" || event.key === "ArrowUp";
-              if (!forward && !backward) return;
-              event.preventDefault();
-              const nextIndex = (index + (forward ? 1 : -1) + items.length) % items.length;
-              const next = items[nextIndex].value;
-              select(next);
-              refs.current.get(next)?.focus();
-            }}
-            className={themeCardClass(selected, cardClassName)}
-          >
-            {selected && <SelectedBadge />}
-            {item.body}
-          </button>
-        );
-      })}
-    </div>
   );
 }
 
@@ -818,50 +662,6 @@ function ColorThemeControl() {
 }
 
 /**
- * Miniature "app window" preview for a palette: a canvas with a small sidebar
- * and content card, a few text lines, and an accent chip — built purely from
- * the swatch colors so each palette reads at a glance.
- */
-function PaletteSwatchPreview({ swatch }: { swatch: PaletteSwatch }) {
-  return (
-    <div
-      aria-hidden
-      className="flex h-16 w-full gap-1.5 overflow-hidden rounded-lg p-1.5"
-      style={{ backgroundColor: swatch.bg, border: `1px solid ${swatch.border}` }}
-    >
-      <div
-        className="flex w-1/3 flex-col gap-1 rounded-md p-1"
-        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
-      >
-        <div className="size-1.5 rounded-full" style={{ backgroundColor: swatch.accent }} />
-        <div
-          className="h-1 w-4/5 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.35 }}
-        />
-        <div
-          className="h-1 w-3/5 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.25 }}
-        />
-      </div>
-      <div
-        className="flex flex-1 flex-col gap-1 rounded-md p-1.5"
-        style={{ backgroundColor: swatch.card, border: `1px solid ${swatch.border}` }}
-      >
-        <div
-          className="h-1 w-3/4 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.5 }}
-        />
-        <div
-          className="h-1 w-1/2 rounded-full"
-          style={{ backgroundColor: swatch.text, opacity: 0.3 }}
-        />
-        <div className="mt-auto h-2.5 w-2/5 rounded" style={{ backgroundColor: swatch.accent }} />
-      </div>
-    </div>
-  );
-}
-
-/**
  * Opt-in filter for the new-chat harness picker: when on, harnesses that
  * aren't set up on the selected host (missing CLI / auth) are hidden instead
  * of badged. Off by default so the picker keeps surfacing harnesses to set up.
@@ -1057,9 +857,46 @@ function GitSection() {
   return (
     <Section title="Git" description="Configure how Omnigent works with Git.">
       <div className="flex flex-col gap-8">
+        <AlwaysUseWorktreeControl />
         <DefaultBaseBranchControl />
       </div>
     </Section>
+  );
+}
+
+/**
+ * Global default: start every new session in a git workspace in a fresh
+ * randomly-named worktree, regardless of which folder the composer lands in.
+ * Per-project "Random worktree" settings override this in either direction —
+ * this only decides the default for workspaces a project hasn't set a choice on.
+ */
+function AlwaysUseWorktreeControl() {
+  const [value, setValue] = useState(() => readAlwaysUseWorktree());
+  const labelId = useId();
+  const toggle = useCallback((next: boolean) => {
+    setValue(next);
+    writeAlwaysUseWorktree(next);
+  }, []);
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span id={labelId} className="text-ui font-medium">
+          Always use a random worktree
+        </span>
+        <span className="text-ui text-muted-foreground">
+          Start new sessions in a fresh randomly-named git worktree in any git workspace. A
+          project's own Random worktree setting overrides this.
+        </span>
+      </div>
+      <Switch
+        aria-labelledby={labelId}
+        checked={value}
+        onCheckedChange={toggle}
+        data-testid="settings-always-use-worktree-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.git.always_use_worktree"
+      />
+    </div>
   );
 }
 
@@ -2003,6 +1840,17 @@ function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 }
 
+function ImportSection() {
+  return (
+    <Section
+      title="Import sessions"
+      description="Pull your recent local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
+    >
+      <ImportSessionsPanel />
+    </Section>
+  );
+}
+
 function ArchivedSection() {
   // `undefined` = all projects; a name scopes the list to that project.
   const [project, setProject] = useState<string | undefined>(undefined);
@@ -2058,42 +1906,100 @@ function ArchivedSection() {
   const items =
     project && !projectNames.includes(project) ? [project, ...projectNames] : projectNames;
 
+  // ── Bulk selection ──
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
+  const toggleSelected = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const selectAll = useCallback(() => {
+    setSelectedIds(new Set(archived.map((c) => c.id)));
+  }, [archived]);
+
+  const deselectAll = useCallback(() => {
+    setSelectedIds(new Set());
+  }, []);
+
+  const exitSelectionMode = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  // Prune stale selections when archived list changes (rows deleted/unarchived).
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      const ids = new Set(archived.map((c) => c.id));
+      const next = new Set([...prev].filter((id) => ids.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [archived]);
+
   return (
     <Section
       title="Archived sessions"
       description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
     >
-      {items.length > 0 && (
-        <div className="mb-4 flex items-center gap-2">
-          <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
-            Project
-          </label>
-          <Select
-            value={projectToSelectValue(project)}
-            onValueChange={(value) => setProject(selectValueToProject(value))}
-          >
-            <SelectTrigger
-              id="archived-project-filter"
-              aria-label="Filter archived sessions by project"
-              data-testid="archived-project-filter"
-              className="w-56"
+      <div className="mb-4 flex items-center gap-2">
+        {items.length > 0 && (
+          <>
+            <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
+              Project
+            </label>
+            <Select
+              value={projectToSelectValue(project)}
+              onValueChange={(value) => setProject(selectValueToProject(value))}
             >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent position="popper" align="start">
-              <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
-              {items.map((name) => (
-                <SelectItem
-                  key={name}
-                  value={projectToSelectValue(name)}
-                  data-testid={`archived-project-option-${name}`}
-                >
-                  {name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
+              <SelectTrigger
+                id="archived-project-filter"
+                aria-label="Filter archived sessions by project"
+                data-testid="archived-project-filter"
+                className="w-56"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent position="popper" align="start">
+                <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
+                {items.map((name) => (
+                  <SelectItem
+                    key={name}
+                    value={projectToSelectValue(name)}
+                    data-testid={`archived-project-option-${name}`}
+                  >
+                    {name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </>
+        )}
+        {!selectionMode && archived.length > 0 && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-testid="archived-toggle-selection"
+            onClick={() => setSelectionMode(true)}
+          >
+            Select
+          </Button>
+        )}
+      </div>
+
+      {selectionMode && (
+        <ArchivedBulkActionBar
+          selectedIds={selectedIds}
+          allArchived={archived}
+          onSelectAll={selectAll}
+          onDeselectAll={deselectAll}
+          onExit={exitSelectionMode}
+        />
       )}
 
       {listQuery.isLoading ? (
@@ -2115,7 +2021,13 @@ function ArchivedSection() {
                   </h3>
                   <ul className="flex flex-col gap-0.5">
                     {group.conversations.map((conv) => (
-                      <ArchivedRow key={conv.id} conversation={conv} />
+                      <ArchivedRow
+                        key={conv.id}
+                        conversation={conv}
+                        selectionMode={selectionMode}
+                        isSelected={selectedIds.has(conv.id)}
+                        onToggleSelected={toggleSelected}
+                      />
                     ))}
                   </ul>
                 </div>
@@ -2157,12 +2069,177 @@ function ArchivedSection() {
 }
 
 /**
+ * Bulk action bar for the archived-sessions settings section. Modeled on the
+ * sidebar's BulkActionBar but scoped to archived rows — offers Delete and
+ * Unarchive, plus Select all / Deselect all / exit controls.
+ */
+function ArchivedBulkActionBar({
+  selectedIds,
+  allArchived,
+  onSelectAll,
+  onDeselectAll,
+  onExit,
+}: {
+  selectedIds: Set<string>;
+  allArchived: Conversation[];
+  onSelectAll: () => void;
+  onDeselectAll: () => void;
+  onExit: () => void;
+}) {
+  const bulkArchive = useBulkArchiveConversations();
+  const bulkDelete = useBulkDeleteConversations();
+  const [viewerId] = useState(() => getCurrentUserId());
+
+  const ownedSelected = useMemo(() => {
+    return allArchived.filter((c) => {
+      if (!selectedIds.has(c.id)) return false;
+      const owner = c.owner ?? null;
+      return owner === null || owner === viewerId;
+    });
+  }, [allArchived, selectedIds, viewerId]);
+
+  const count = selectedIds.size;
+  const allSelected = count > 0 && count === allArchived.length;
+  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+
+  function handleUnarchive() {
+    if (ownedSelected.length === 0) return;
+    bulkArchive.mutate(
+      { ids: ownedSelected.map((c) => c.id), archived: false },
+      { onSuccess: onDeselectAll },
+    );
+  }
+
+  function handleDelete() {
+    const ids = ownedSelected.map((c) => c.id);
+    if (ids.length === 0) return;
+    setConfirmDeleteOpen(false);
+    bulkDelete.mutate({ ids }, { onSuccess: onDeselectAll });
+  }
+
+  return (
+    <>
+      <div className="relative mb-4 flex flex-col gap-1.5 rounded-md border bg-muted/50 p-2">
+        <div className="relative flex min-h-8 items-center gap-1.5 pr-9">
+          <span className="shrink-0 whitespace-nowrap text-sm text-muted-foreground">
+            {count === 0 ? "None selected" : `${count} selected`}
+          </span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-sm"
+            onClick={allSelected ? onDeselectAll : onSelectAll}
+          >
+            {allSelected ? "Deselect all" : "Select all"}
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            size="icon-sm"
+            className="-translate-y-1/2 absolute top-1/2 right-1 shrink-0 rounded-full"
+            aria-label="Exit selection mode"
+            data-testid="archived-exit-selection"
+            onClick={onExit}
+          >
+            <XIcon className="size-3.5" />
+          </Button>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1.5 text-xs"
+            disabled={isBusy || ownedSelected.length === 0}
+            onClick={handleUnarchive}
+            data-testid="archived-bulk-unarchive"
+          >
+            {bulkArchive.isPending ? (
+              <Loader2Icon className="size-3 animate-spin" />
+            ) : (
+              <ArchiveRestoreIcon className="size-3" />
+            )}
+            Unarchive {ownedSelected.length > 0 ? ownedSelected.length : ""}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className={cn("h-7 gap-1.5 text-xs", ownedSelected.length > 0 && "text-destructive")}
+            disabled={isBusy || ownedSelected.length === 0}
+            onClick={() => setConfirmDeleteOpen(true)}
+            data-testid="archived-bulk-delete"
+          >
+            {bulkDelete.isPending ? (
+              <Loader2Icon className="size-3 animate-spin" />
+            ) : (
+              <Trash2Icon className="size-3" />
+            )}
+            Delete {ownedSelected.length > 0 ? ownedSelected.length : ""}
+          </Button>
+        </div>
+
+        {(bulkArchive.isError || bulkDelete.isError) && (
+          <p className="text-xs text-destructive" role="alert">
+            Some actions failed. Retry or dismiss.
+          </p>
+        )}
+      </div>
+
+      <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
+            <DialogDescription>
+              This will permanently delete the selected sessions and all their history. This cannot
+              be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setConfirmDeleteOpen(false)}
+              disabled={bulkDelete.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={handleDelete}
+              disabled={bulkDelete.isPending}
+            >
+              Delete {ownedSelected.length} session(s)
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+/**
  * One archived-session row. Not clickable (archived sessions aren't a
  * navigation target here); the title + timestamp read as a record, and the
  * Delete / Unarchive controls reveal on hover (always visible on touch).
+ * In selection mode, clicking the row toggles its checkbox.
  * Unarchive navigates to the restored session once the PATCH lands.
  */
-function ArchivedRow({ conversation }: { conversation: Conversation }) {
+function ArchivedRow({
+  conversation,
+  selectionMode,
+  isSelected,
+  onToggleSelected,
+}: {
+  conversation: Conversation;
+  selectionMode: boolean;
+  isSelected: boolean;
+  onToggleSelected: (id: string) => void;
+}) {
   const navigate = useNavigate();
   const archive = useArchiveConversation();
   const del = useStopAndDeleteConversation();
@@ -2173,8 +2250,22 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
   return (
     <li
       data-testid="archived-row"
-      className="group relative flex items-center gap-2 rounded-md px-3 py-2 hover:bg-muted"
+      className={cn(
+        "group relative flex items-center gap-2 rounded-md px-3 py-2 hover:bg-muted",
+        selectionMode && "cursor-pointer",
+        isSelected && "bg-muted",
+      )}
+      onClick={selectionMode ? () => onToggleSelected(conversation.id) : undefined}
     >
+      {selectionMode && (
+        <span className="flex shrink-0 items-center">
+          {isSelected ? (
+            <SquareCheckIcon className="size-4 text-primary" />
+          ) : (
+            <SquareIcon className="size-4 text-muted-foreground" />
+          )}
+        </span>
+      )}
       <div className="min-w-0 flex-1">
         <div className="truncate text-ui font-medium" title={label}>
           {label}
@@ -2183,42 +2274,43 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
           {absoluteTime(conversation.updated_at * 1000)}
         </div>
       </div>
-      {/* Actions reveal on hover (desktop) / always shown on touch. */}
-      <div className="flex shrink-0 items-center gap-1 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-sm"
-          aria-label="Delete session"
-          data-testid="delete-archived"
-          disabled={busy}
-          onClick={() => setDeleteOpen(true)}
-        >
-          <Trash2Icon className="size-4 text-destructive" />
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          // No background in light mode (ghost). Dark mode needs a fill so the
-          // button reads against the dark row — borrow the secondary tokens
-          // there only, without touching the text color.
-          className="gap-1.5 dark:bg-secondary dark:hover:bg-secondary/80"
-          data-testid="unarchive-conversation"
-          disabled={busy}
-          onClick={() =>
-            archive.mutate(
-              { id: conversation.id, archived: false },
-              // Unarchiving is how a user brings a session back into play, so
-              // land them in it — the row leaves this list either way.
-              { onSuccess: () => navigate(`/c/${conversation.id}`) },
-            )
-          }
-        >
-          <ArchiveRestoreIcon className="size-3.5" />
-          Unarchive
-        </Button>
-      </div>
+      {/* Actions reveal on hover (desktop) / always shown on touch.
+          Hidden in selection mode — bulk bar owns the actions. */}
+      {!selectionMode && (
+        <div className="flex shrink-0 items-center gap-1 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Delete session"
+            data-testid="delete-archived"
+            disabled={busy}
+            onClick={() => setDeleteOpen(true)}
+          >
+            <Trash2Icon className="size-4 text-destructive" />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            // No background in light mode (ghost). Dark mode needs a fill so the
+            // button reads against the dark row — borrow the secondary tokens
+            // there only, without touching the text color.
+            className="gap-1.5 dark:bg-secondary dark:hover:bg-secondary/80"
+            data-testid="unarchive-conversation"
+            disabled={busy}
+            onClick={() =>
+              archive.mutate(
+                { id: conversation.id, archived: false },
+                { onSuccess: () => navigate(`/c/${conversation.id}`) },
+              )
+            }
+          >
+            <ArchiveRestoreIcon className="size-3.5" />
+            Unarchive
+          </Button>
+        </div>
+      )}
 
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent>
@@ -2237,8 +2329,6 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
               variant="destructive"
               disabled={del.isPending}
               onClick={() => {
-                // Fire-and-forget: the row drops out once the conversations
-                // cache refreshes after the delete settles.
                 del.mutate({ id: conversation.id });
                 setDeleteOpen(false);
               }}
