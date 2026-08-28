@@ -1040,16 +1040,95 @@ describe("NewChatLandingScreen", () => {
       "overflow-hidden",
     );
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
+    const composer = screen.getByTestId("new-chat-landing-composer");
     const footer = screen.getByTestId("new-chat-landing-footer");
+    const composerSurface = screen.getByTestId("new-chat-landing-composer-surface");
+    const notices = screen.getByTestId("new-chat-landing-notices");
     expect(footer).toHaveClass("absolute", "bottom-2", "left-2", "right-2", "z-20");
     expect(footer).not.toHaveClass("py-1.5", "-mt-4");
-    expect(footer.parentElement).toHaveClass("gap-1");
+    expect(footer.parentElement).toBe(composerSurface);
+    expect(composerSurface).toHaveClass("relative", "gap-1");
+    expect(composerSurface).toContainElement(composer);
+    expect(composerSurface).toContainElement(footer);
+    expect(composerSurface).not.toContainElement(notices);
+    expect(notices.parentElement).toBe(composerSurface.parentElement);
     expect(screen.getByTestId("new-chat-landing-host-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-permission-chip").textContent).not.toBe("");
   });
 
-  it("shows model and effort inside the harness selector", () => {
+  it("keeps the footer anchored to the composer when a harness notice appears", () => {
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
+    ]);
+    renderLanding();
+    selectUnconfiguredAgent("a2");
+
+    const composerSurface = screen.getByTestId("new-chat-landing-composer-surface");
+    const footer = screen.getByTestId("new-chat-landing-footer");
+    const notices = screen.getByTestId("new-chat-landing-notices");
+    const warning = screen.getByTestId("new-chat-landing-harness-warning");
+    expect(composerSurface).toContainElement(footer);
+    expect(composerSurface).not.toContainElement(warning);
+    expect(notices).toContainElement(warning);
+  });
+
+  it("keeps the footer anchored to the composer when a create error appears", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "workspace already in use" }),
+      text: async () => "workspace already in use",
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveTextContent("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start a session" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    const error = await screen.findByTestId("new-chat-landing-error");
+    const composerSurface = screen.getByTestId("new-chat-landing-composer-surface");
+    const footer = screen.getByTestId("new-chat-landing-footer");
+    const notices = screen.getByTestId("new-chat-landing-notices");
+    expect(composerSurface).toContainElement(footer);
+    expect(composerSurface).not.toContainElement(error);
+    expect(notices).toContainElement(error);
+  });
+
+  it("keeps responsive host, working-directory, and worktree triggers accessibly named", () => {
+    renderLanding();
+
+    const hostTrigger = screen.getByTestId("new-chat-landing-host-chip");
+    const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
+    const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
+    expect(hostTrigger).toHaveAccessibleName("Host: This machine, Online");
+    expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
+    expect(worktreeTrigger).toHaveAccessibleName("Worktree: None");
+    expect(within(hostTrigger).getByText("This machine")).toHaveClass("hidden", "lg:block");
+    expect(within(workspaceTrigger).getByText("repo")).toHaveClass("hidden", "lg:block");
+    expect(within(worktreeTrigger).getByText("Worktree")).toHaveClass("hidden", "lg:block");
+  });
+
+  it("keeps the responsive sandbox repository trigger accessibly named", () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+
+    const repositoryTrigger = screen.getByTestId("new-chat-landing-repo-chip");
+    expect(repositoryTrigger).toHaveAccessibleName("Sandbox repository: Not selected");
+    expect(within(repositoryTrigger).getByText("Repository")).toHaveClass("hidden", "lg:block");
+    fireEvent.click(repositoryTrigger);
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/omnigent-ai/omnigent.git" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
+      target: { value: "feature" },
+    });
+    expect(repositoryTrigger).toHaveAccessibleName("Sandbox repository: omnigent#feature");
+  });
+
+  it("names Claude and Codex model and effort details in the harness trigger", () => {
     renderLanding();
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
@@ -1058,6 +1137,41 @@ describe("NewChatLandingScreen", () => {
     );
     expect(within(picker).getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent(
       "Default",
+    );
+    expect(picker).toHaveAccessibleName(
+      "Agent or harness: Claude Code, Model: Default, Effort: Default",
+    );
+
+    selectAgent("a2");
+    expect(picker).toHaveAccessibleName("Agent or harness: Codex, Model: Default (GPT-5.5)");
+  });
+
+  it("names Pi model and thinking-level details in the harness trigger", () => {
+    mockAgents([
+      {
+        id: "a_pi",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        description: null,
+        harness: "pi-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      "Agent or harness: Pi, Model: Default, Thinking level: Default",
+    );
+  });
+
+  it("names Smart Routing model and effort semantics in the harness trigger", () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      "Agent or harness: Claude Code, Model: Smart Routing, Effort: —",
     );
   });
 

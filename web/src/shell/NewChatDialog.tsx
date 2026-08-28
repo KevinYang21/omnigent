@@ -1060,6 +1060,10 @@ export function AgentHarnessPicker({
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const triggerAccessibleName = [
+    `Agent or harness: ${hasAgents ? agentLabel : "No agents"}`,
+    ...triggerDetails.map((detail) => `${detail.label}: ${detail.value}`),
+  ].join(", ");
 
   // Touch devices can't hover, so the desktop submenu flyouts ("More",
   // "Custom agents") are unreachable there. On mobile we swap the dropdown's
@@ -1240,6 +1244,7 @@ export function AgentHarnessPicker({
           size="sm"
           disabled={!hasAgents}
           data-testid="new-chat-landing-agent-select"
+          aria-label={triggerAccessibleName}
           title={triggerTooltip}
           // Drop the Button's focus-visible ring/border that otherwise shows
           // when focus returns to the trigger after a pick. `triggerClassName`
@@ -3111,7 +3116,15 @@ export function NewChatLandingScreen() {
     if (supportsModelPicker && !supportsPermissionMode) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
-      return [{ label: "Model", value: modelValue }];
+      const thinkingLevelValue = !pickedEffort
+        ? "Default"
+        : (PI_NATIVE_EFFORTS.find((effort) => effort.value === pickedEffort)?.label ?? "Default");
+      return [
+        { label: "Model", value: modelValue },
+        ...(selectedNativeHarness === "pi-native"
+          ? [{ label: "Thinking level", value: thinkingLevelValue }]
+          : []),
+      ];
     }
     if (supportsPermissionMode) {
       const modelValue = routingOn
@@ -3203,6 +3216,7 @@ export function NewChatLandingScreen() {
     cursorExecMode,
     agySkipMode,
     pickedHarness,
+    selectedNativeHarness,
   ]);
   const harnessTriggerDetails = configSummary.filter(
     (row) => row.label === "Model" || row.label === "Effort" || row.label === "Thinking level",
@@ -4387,6 +4401,7 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
+      aria-label={`Working directory: ${workspaceTrimmed || "Not selected"}`}
       className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
@@ -4411,8 +4426,8 @@ export function NewChatLandingScreen() {
           840 − 80 = 760px max on desktop. px-4 on phones (16px gutters)
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-6 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5">
+      <div className="flex w-full max-w-[840px] flex-col items-center px-4 pt-8 pb-16 md:select-none md:px-10">
+        <div className="mb-6 flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
             // icon — the default pink folder, or a chosen emoji — and name the
@@ -4440,7 +4455,10 @@ export function NewChatLandingScreen() {
             </h1>
           ) : null}
         </div>
-        <div className="relative flex w-full flex-col gap-1">
+        <div
+          className="relative flex w-full flex-col gap-1"
+          data-testid="new-chat-landing-composer-surface"
+        >
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -4920,6 +4938,11 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
+                    aria-label={`Host: ${hostLabel}${
+                      !sandboxSelected && selectedHost != null
+                        ? `, ${selectedHost.status === "online" ? "Online" : "Offline"}`
+                        : ""
+                    }`}
                     className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
@@ -5121,6 +5144,9 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
+                      aria-label={`Sandbox repository: ${
+                        sandboxRepoName ? sandboxRepoLabel : "Not selected"
+                      }`}
                       className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
@@ -5229,6 +5255,7 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
+                      aria-label={`Worktree: ${branchName.trim() || "None"}`}
                       className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
@@ -5400,7 +5427,8 @@ export function NewChatLandingScreen() {
                 AgentHarnessPicker above. The tray now holds only the
                 host / working-directory / worktree / project chips. */}
           </div>
-
+        </div>
+        <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {/* Warn (don't block) when the selected agent's harness isn't
               configured on the selected host — the host re-checks at
               launch, so submitting surfaces a specific error if it
