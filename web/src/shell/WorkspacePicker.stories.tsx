@@ -27,6 +27,7 @@ const meta = {
     hostId: workspaceStoryHost,
     initialPath: workspaceStoryProjects,
     onSelect: () => undefined,
+    onClose: () => undefined,
   },
   decorators: [
     (Story) => (
@@ -39,7 +40,7 @@ const meta = {
           ]);
         }}
       >
-        <div className="w-[440px] rounded-xl border bg-card p-2">
+        <div className="h-[640px] w-[min(720px,calc(100vw-2rem))]">
           <Story />
         </div>
       </StoryQueryRouter>
@@ -60,8 +61,8 @@ export const PopulatedWithConflict: Story = {
 
 export const TypedFilter: Story = {
   play: async ({ canvasElement }) => {
-    const input = within(canvasElement).getByTestId("workspace-picker-path-input");
+    const input = within(canvasElement).getByTestId("workspace-picker-search-input");
     await userEvent.clear(input);
-    await userEvent.type(input, `${workspaceStoryProjects}/ap`);
+    await userEvent.type(input, "ap");
   },
 };

@@ -40,6 +40,10 @@ function dir(name: string, path: string): HostFilesystemEntry {
   return { name, path, type: "directory", bytes: null, modified_at: 0 };
 }
 
+function file(name: string, path: string): HostFilesystemEntry {
+  return { name, path, type: "file", bytes: 1024, modified_at: 0 };
+}
+
 interface FakeListing {
   data?: { entries: HostFilesystemEntry[]; truncated: boolean };
   isLoading: boolean;
@@ -445,6 +449,81 @@ describe("WorkspacePicker listing filter", () => {
     expect(screen.getByText("No matching entries")).toBeTruthy();
     expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
   });
+
+  it("filters from the dedicated search field and clears it with Escape", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
+    const search = screen.getByTestId("workspace-picker-search-input") as HTMLInputElement;
+
+    fireEvent.change(search, { target: { value: "do" } });
+    expect(screen.getByTestId("workspace-picker-entry-docs")).toBeTruthy();
+    expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
+
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(search.value).toBe("");
+    expect(screen.getByTestId("workspace-picker-entry-src")).toBeTruthy();
+  });
+
+  it("clears search when navigating into a matching directory", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
+    const search = screen.getByTestId("workspace-picker-search-input") as HTMLInputElement;
+
+    fireEvent.change(search, { target: { value: "src" } });
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
+
+    expect(search.value).toBe("");
+  });
+});
+
+describe("WorkspacePicker modal actions", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [
+            dir("src", "/Users/corey/repo/src"),
+            file("README.md", "/Users/corey/repo/README.md"),
+          ],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("renders the reference action labels and commits the current folder", () => {
+    const onClose = vi.fn();
+    const onSelect = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onClose={onClose}
+        onSelect={onSelect}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Use this folder" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Use this folder" }));
+    expect(onSelect).toHaveBeenCalledWith("/Users/corey/repo");
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("keeps files disabled while directories remain navigable", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />);
+
+    expect(screen.getByTestId("workspace-picker-entry-README.md")).toBeDisabled();
+    expect(screen.getByTestId("workspace-picker-entry-src")).not.toBeDisabled();
+  });
 });
 
 describe("joinPath", () => {
@@ -641,9 +720,9 @@ describe("WorkspacePicker back-to-workspace", () => {
 });
 
 // The picker opens inside popovers and dialogs, which focus their first
-// tabbable child — the header's Up button. That focus must not reveal its
-// tooltip, or merely opening the picker throws a black label over the listing.
-describe("WorkspacePicker header tooltips", () => {
+// tabbable child — the header's Up button. Auto-focus must not add transient
+// chrome over the search and listing.
+describe("WorkspacePicker initial focus", () => {
   beforeEach(() => {
     useHostFilesystemMock.mockReset();
     useHostFilesystemMock.mockReturnValue(
@@ -659,7 +738,7 @@ describe("WorkspacePicker header tooltips", () => {
     cleanup();
   });
 
-  it("stays hidden when opening the picker focuses the Up button", async () => {
+  it("focuses Up without rendering an overlay", async () => {
     render(
       <Popover>
         <PopoverTrigger data-testid="open-picker">Working folder</PopoverTrigger>
@@ -671,8 +750,7 @@ describe("WorkspacePicker header tooltips", () => {
 
     fireEvent.click(screen.getByTestId("open-picker"));
     const up = await screen.findByTestId("workspace-picker-up");
-    // Radix's own autofocus is what used to trip the tooltip; assert it landed
-    // so the test would notice if the focus behaviour changed instead.
+    // Assert Radix autofocus still lands predictably for keyboard users.
     expect(up).toHaveFocus();
     expect(screen.queryByRole("tooltip")).toBeNull();
   });

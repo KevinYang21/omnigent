@@ -3,19 +3,20 @@ import {
   FolderIcon,
   FolderPlusIcon,
   FileIcon,
-  ArrowUpIcon,
+  ArrowLeftIcon,
+  ChevronRightIcon,
   HomeIcon,
   EyeIcon,
   EyeOffIcon,
   CheckIcon,
   XIcon,
   AlertTriangleIcon,
+  SearchIcon,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 
 /**
@@ -188,12 +189,7 @@ export function listingFilter(
 }
 
 /**
- * Icon button in the picker header, with a styled hover tooltip.
- *
- * The tooltip hangs off a wrapping span rather than the button so it still
- * appears while the button is *disabled* — that is exactly when a user is
- * most likely to hover asking "what is this, and why can't I click it?".
- * A disabled button receives no pointer events of its own.
+ * Icon button in the picker chrome.
  *
  * @param label Tooltip text, also the accessible name.
  * @param icon Rendered glyph.
@@ -215,39 +211,16 @@ function PickerIconButton({
   testId: string;
 }) {
   return (
-    // Provides its own context so the button works wherever it is rendered --
-    // the picker is mounted in dialogs and popovers, and in tests, not only
-    // under the app-root provider. Mirrors FilesPanel's hidden-files toggle.
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger
-          asChild
-          // Opening the picker focuses its first button, and Radix pops a
-          // tooltip on any focus — a label thrown over the listing nobody asked
-          // for. Only a keyboard focus ring reveals it (Radix skips its own
-          // handler once the event's default is prevented).
-          onFocus={(event) => {
-            if (!(event.target as HTMLElement).matches(":focus-visible")) {
-              event.preventDefault();
-            }
-          }}
-        >
-          <span className="shrink-0">
-            <button
-              type="button"
-              onClick={onClick}
-              disabled={disabled}
-              aria-label={label}
-              className="block rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-              data-testid={testId}
-            >
-              {icon}
-            </button>
-          </span>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">{label}</TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      className="block shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
+      data-testid={testId}
+    >
+      {icon}
+    </button>
   );
 }
 
@@ -256,7 +229,7 @@ interface WorkspacePickerProps {
   hostId: string | null;
   /**
    * Called with the current directory's absolute path when the user
-   * clicks "Select current". ``undefined`` hides that button.
+   * clicks "Use this folder". ``undefined`` hides that button.
    */
   onSelect?: (path: string) => void;
   /**
@@ -268,7 +241,7 @@ interface WorkspacePickerProps {
    */
   onNavigate?: (path: string) => void;
   /**
-   * Called when the user dismisses the picker via the ✕ button.
+   * Called when the user dismisses the picker via Cancel or the ✕ button.
    * ``undefined`` hides the button (e.g. when the picker is always
    * shown rather than toggled).
    */
@@ -300,18 +273,19 @@ interface WorkspacePickerProps {
 }
 
 /**
- * Flat-list directory picker for choosing a workspace.
+ * File-browser directory picker for choosing a workspace.
  *
- * A header (up / home / editable path / show-hidden / select / close)
- * sits above the current directory's entries; clicking a folder
- * navigates into it. The header "Select" button picks the directory
- * currently shown — kept in the always-visible header so it doesn't
- * fall below the fold on short screens. Files are grayed out —
- * workspaces must be directories.
+ * The reference-style chrome separates path navigation from listing search:
+ * a header provides up / workspace / home / typed-path / hidden / close
+ * controls, while a dedicated search row filters the current directory.
+ * Clicking a folder navigates into it; files stay visible but disabled because
+ * workspaces must be directories. Commit-style callers get the persistent
+ * Cancel / "Use this folder" footer, while live ``onNavigate`` callers retain a
+ * compact popover height and no commit actions.
  *
  * @param hostId Host whose filesystem to browse.
- * @param onSelect Fired with the current directory on "Select
- *   current". Omit to hide that button.
+ * @param onSelect Fired with the current directory on "Use this folder".
+ *   Omit to hide that button.
  * @param onClose Fired when the ✕ button is clicked.
  * @param onNavigate Fired with the current directory on every navigation,
  *   for a live-updating picker with no "Select" button.
@@ -335,6 +309,10 @@ export function WorkspacePicker({
   // The editable path value; diverges from `path` while typing and
   // snaps back on commit (Enter / blur).
   const [pathInput, setPathInput] = useState<string>("");
+  // The reference design separates file filtering from path navigation.
+  // Keep the legacy path-bar completion too, so existing keyboard flows
+  // continue to work while the dedicated search field is the primary affordance.
+  const [searchInput, setSearchInput] = useState("");
   // Resolved absolute home, derived lazily from the first listing so
   // "Select current" returns a real path even at the home view.
   const [resolvedHome, setResolvedHome] = useState<string | null>(null);
@@ -349,6 +327,7 @@ export function WorkspacePicker({
   const [newFolderName, setNewFolderName] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const createDir = useCreateHostDirectory();
+  const hasCommitActions = onSelect !== undefined || onClose !== undefined;
 
   // Reset to home when the host *changes* — a path from the old host
   // is meaningless on the new one. Compare the previous hostId rather
@@ -360,6 +339,7 @@ export function WorkspacePicker({
     prevHostId.current = hostId;
     setPath("");
     setPathInput("");
+    setSearchInput("");
     setResolvedHome(null);
     userEditedRef.current = false;
     setNewFolderName(null);
@@ -443,7 +423,8 @@ export function WorkspacePicker({
 
   // Live filter from the path-bar text (shell-style: type a fragment to
   // narrow the current directory). Null when not filtering.
-  const activeFilter = listingFilter(pathInput, currentAbsolute, resolvedHome);
+  const searchFilter = searchInput.trim();
+  const activeFilter = searchFilter || listingFilter(pathInput, currentAbsolute, resolvedHome);
   // Typing a dot-prefixed fragment reveals hidden entries even with the
   // toggle off, so ".env" can be found without flipping "Show hidden".
   const includeHidden = showHidden || (activeFilter?.startsWith(".") ?? false);
@@ -466,6 +447,7 @@ export function WorkspacePicker({
     // A click/commit supersedes any in-progress typing; let the
     // mirror effect refill the bar from the new listing.
     userEditedRef.current = false;
+    setSearchInput("");
     setPath(next);
   }
 
@@ -537,13 +519,17 @@ export function WorkspacePicker({
 
   return (
     <div
-      className="flex max-h-80 min-h-0 flex-col rounded-md border"
+      className={`flex min-h-0 flex-col overflow-hidden border border-border bg-background ${
+        hasCommitActions
+          ? "h-full min-h-80 max-h-[min(42rem,calc(100vh-6rem))] rounded-2xl shadow-xl"
+          : "max-h-80 rounded-md"
+      }`}
       data-testid="workspace-picker"
     >
-      <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
+      <div className="flex min-h-14 shrink-0 items-center gap-1 border-b px-4 py-2">
         <PickerIconButton
           label="Up one level"
-          icon={<ArrowUpIcon className="size-4" />}
+          icon={<ArrowLeftIcon className="size-5" />}
           onClick={() => parent !== null && navigateTo(parent)}
           disabled={parent === null}
           testId="workspace-picker-up"
@@ -551,7 +537,7 @@ export function WorkspacePicker({
         {workspacePath !== undefined && (
           <PickerIconButton
             label="Workspace root"
-            icon={<FolderDotIcon className="size-4" />}
+            icon={<FolderDotIcon className="size-4.5" />}
             onClick={() => navigateTo(workspacePath)}
             disabled={currentAbsolute === workspacePath}
             testId="workspace-picker-workspace"
@@ -559,7 +545,7 @@ export function WorkspacePicker({
         )}
         <PickerIconButton
           label="Home"
-          icon={<HomeIcon className="size-4" />}
+          icon={<HomeIcon className="size-4.5" />}
           onClick={() => navigateTo("")}
           testId="workspace-picker-home"
         />
@@ -581,48 +567,55 @@ export function WorkspacePicker({
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
-          className="min-w-0 flex-1 bg-transparent text-sm text-muted-foreground focus:outline-none"
+          aria-label="Current folder path"
+          className="min-w-0 flex-1 rounded-md bg-transparent px-2 py-1 text-base font-medium text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:bg-muted/60 focus:ring-2 focus:ring-ring"
           data-testid="workspace-picker-path-input"
         />
         <PickerIconButton
           label={showHidden ? "Hide hidden files" : "Show hidden files"}
-          icon={showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
+          icon={showHidden ? <EyeIcon className="size-5" /> : <EyeOffIcon className="size-5" />}
           onClick={() => setShowHidden((v) => !v)}
           testId="workspace-picker-show-hidden"
         />
-        <PickerIconButton
-          label="New folder"
-          icon={<FolderPlusIcon className="size-4" />}
-          onClick={openNewFolder}
-          disabled={!canCreateFolder}
-          testId="workspace-picker-new-folder"
-        />
-        {onSelect && (
-          <Button
-            type="button"
-            size="sm"
-            disabled={currentAbsolute === "" || currentAbsolute === null}
-            onClick={handleSelect}
-            title={`Select this folder: ${basename(currentAbsolute)}`}
-            className="shrink-0"
-            data-testid="workspace-picker-select"
-          >
-            <CheckIcon className="size-3.5" />
-            Select
-          </Button>
-        )}
         {onClose && (
           <PickerIconButton
             label="Close"
-            icon={<XIcon className="size-4" />}
+            icon={<XIcon className="size-5" />}
             onClick={onClose}
             testId="workspace-picker-close"
           />
         )}
       </div>
+      <div className="flex min-h-12 shrink-0 items-center gap-2 border-b px-4">
+        <SearchIcon className="size-5 shrink-0 text-muted-foreground" aria-hidden />
+        <input
+          type="search"
+          value={searchInput}
+          onChange={(event) => setSearchInput(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && searchInput !== "") {
+              event.preventDefault();
+              setSearchInput("");
+            }
+          }}
+          placeholder="Search folders and files"
+          aria-label="Search folders and files"
+          autoComplete="off"
+          spellCheck={false}
+          className="min-w-0 flex-1 bg-transparent text-base text-foreground outline-none placeholder:text-muted-foreground"
+          data-testid="workspace-picker-search-input"
+        />
+        <PickerIconButton
+          label="New folder"
+          icon={<FolderPlusIcon className="size-4.5" />}
+          onClick={openNewFolder}
+          disabled={!canCreateFolder}
+          testId="workspace-picker-new-folder"
+        />
+      </div>
       {newFolderName !== null && (
         <div
-          className="flex shrink-0 flex-col gap-1 border-b px-3 py-1.5"
+          className="flex shrink-0 flex-col gap-1 border-b bg-muted/30 px-4 py-2"
           data-testid="workspace-picker-new-folder-form"
         >
           <div className="flex items-center gap-2">
@@ -649,7 +642,7 @@ export function WorkspacePicker({
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
-              className="min-w-0 flex-1 bg-transparent text-sm text-foreground focus:outline-none"
+              className="min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 py-1.5 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
               data-testid="workspace-picker-new-folder-input"
             />
             <button
@@ -658,7 +651,7 @@ export function WorkspacePicker({
               onClick={() => void commitNewFolder()}
               aria-label="Create folder"
               title="Create folder"
-              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
+              className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
               data-testid="workspace-picker-new-folder-create"
             >
               {createDir.isPending ? (
@@ -672,7 +665,7 @@ export function WorkspacePicker({
               onClick={cancelNewFolder}
               aria-label="Cancel new folder"
               title="Cancel"
-              className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               data-testid="workspace-picker-new-folder-cancel"
             >
               <XIcon className="size-4" />
@@ -690,7 +683,7 @@ export function WorkspacePicker({
       )}
       {occupiedCount > 0 && (
         <div
-          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-sm text-warning"
+          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-4 py-2 text-sm text-warning"
           data-testid="workspace-picker-conflict"
         >
           <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -701,15 +694,20 @@ export function WorkspacePicker({
           </span>
         </div>
       )}
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {isLoading && <div className="px-3 py-3 text-sm text-muted-foreground">Loading…</div>}
+      <div className="min-h-0 flex-1 overflow-y-auto py-2" aria-busy={isLoading || undefined}>
+        {isLoading && (
+          <div className="flex items-center gap-2 px-5 py-3 text-sm text-muted-foreground">
+            <Spinner className="size-4" />
+            Loading…
+          </div>
+        )}
         {error !== null && error !== undefined && !isLoading && (
-          <div className="px-3 py-3 text-sm text-destructive" data-testid="workspace-picker-error">
+          <div className="px-5 py-3 text-sm text-destructive" data-testid="workspace-picker-error">
             {error instanceof Error ? error.message : "Failed to load directory"}
           </div>
         )}
         {!isLoading && error === null && entries.length === 0 && (
-          <div className="px-3 py-3 text-sm text-muted-foreground">
+          <div className="px-5 py-3 text-sm text-muted-foreground">
             {activeFilter !== null ? "No matching entries" : "(empty directory)"}
           </div>
         )}
@@ -727,27 +725,60 @@ export function WorkspacePicker({
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => isDir && navigateTo(entry.path)}
               className={
-                "flex w-full items-center gap-2 border-b px-3 py-2 text-left text-sm last:border-b-0 " +
+                "flex min-h-11 w-full items-center gap-2.5 px-5 py-2 text-left text-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring " +
                 (isDir
-                  ? "hover:bg-accent hover:text-accent-foreground cursor-pointer"
-                  : "text-muted-foreground cursor-not-allowed")
+                  ? "cursor-pointer text-foreground hover:bg-muted"
+                  : "cursor-not-allowed text-muted-foreground opacity-55")
               }
               data-testid={`workspace-picker-entry-${entry.name}`}
             >
-              {isDir ? <FolderIcon className="size-4" /> : <FileIcon className="size-4" />}
+              {isDir ? (
+                <FolderIcon className="size-5 shrink-0 text-muted-foreground" />
+              ) : (
+                <FileIcon className="size-5 shrink-0" />
+              )}
               <span className="flex-1 truncate">{entry.name}</span>
+              {isDir && <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />}
             </button>
           );
         })}
         {data?.truncated && (
           <div
-            className="px-3 py-2 text-sm text-muted-foreground"
+            className="px-5 py-2 text-sm text-muted-foreground"
             data-testid="workspace-picker-truncated"
           >
             Too many entries to list fully — type a path above to jump directly.
           </div>
         )}
       </div>
+      {hasCommitActions && (
+        <div className="flex min-h-16 shrink-0 items-center justify-end gap-2 border-t px-5 py-3">
+          {onClose && (
+            <Button
+              type="button"
+              variant="outline"
+              size="lg"
+              onClick={onClose}
+              data-testid="workspace-picker-cancel"
+            >
+              Cancel
+            </Button>
+          )}
+          {onSelect && (
+            <Button
+              type="button"
+              size="lg"
+              disabled={currentAbsolute === "" || currentAbsolute === null}
+              onClick={handleSelect}
+              title={`Use this folder: ${basename(currentAbsolute)}`}
+              className="shrink-0 px-4"
+              data-testid="workspace-picker-select"
+            >
+              Use this folder
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
