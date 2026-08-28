@@ -1041,9 +1041,24 @@ describe("NewChatLandingScreen", () => {
     );
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
     const footer = screen.getByTestId("new-chat-landing-footer");
-    expect(footer).toHaveClass("py-1.5", "pr-4", "pl-2");
-    expect(footer).not.toHaveClass("-mt-4");
+    expect(footer).toHaveClass("absolute", "bottom-2", "left-2", "right-2", "z-20");
+    expect(footer).not.toHaveClass("py-1.5", "-mt-4");
     expect(footer.parentElement).toHaveClass("gap-1");
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-permission-chip").textContent).not.toBe("");
+  });
+
+  it("shows model and effort inside the harness selector", () => {
+    renderLanding();
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
+      "Default",
+    );
+    expect(within(picker).getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent(
+      "Default",
+    );
   });
 
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {

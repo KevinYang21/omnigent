@@ -25,6 +25,7 @@ import {
   PaperclipIcon,
   PlusIcon,
   SettingsIcon,
+  ShieldIcon,
   ShuffleIcon,
   TriangleAlertIcon,
   XIcon,
@@ -950,6 +951,8 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
   );
 }
 
+const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
+
 /**
  * Unified two-level agent/harness picker for the landing composer.
  *
@@ -993,6 +996,7 @@ export function AgentHarnessPicker({
   triggerClassName,
   triggerLabelClassName,
   triggerTooltip,
+  triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
   autoHarnessAvailable = false,
   autoHarnessActive = false,
   onSelectAutoHarness,
@@ -1037,6 +1041,8 @@ export function AgentHarnessPicker({
   /** Hover text explaining the current pick, when the label alone doesn't say
    *  what runs (e.g. "Auto"). Omitted → no tooltip, as before. */
   triggerTooltip?: string;
+  /** Model / effort values rendered as segments inside the harness trigger. */
+  triggerDetails?: readonly { label: string; value: string }[];
   /** Whether the top-level Smart Routing row is offered (routing enabled and
    *  both native CLIs ready). Defaults off, so an embedder that doesn't wire
    *  routing never shows it. */
@@ -1249,6 +1255,18 @@ export function AgentHarnessPicker({
           >
             {hasAgents ? agentLabel : "No agents"}
           </span>
+          {triggerDetails.map((detail) => (
+            <span
+              key={detail.label}
+              className="hidden min-w-0 items-center gap-1 xl:inline-flex"
+              data-testid={`new-chat-landing-agent-${detail.label.toLowerCase()}-value`}
+            >
+              <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
+              <span className="max-w-28 truncate text-sm text-muted-foreground">
+                {detail.value}
+              </span>
+            </span>
+          ))}
           <ChevronDownIcon className="size-3.5 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
@@ -3186,6 +3204,12 @@ export function NewChatLandingScreen() {
     agySkipMode,
     pickedHarness,
   ]);
+  const harnessTriggerDetails = configSummary.filter(
+    (row) => row.label === "Model" || row.label === "Effort" || row.label === "Thinking level",
+  );
+  const permissionConfigRow = configSummary.find(
+    (row) => row.label === "Permissions" || row.label === "Approval" || row.label === "Mode",
+  );
   // Reset per-agent-instance run-config that must not carry across an agent
   // change. The DANGEROUS Codex bypass re-opts-in per context (matching the
   // store's fork / agent-switch behavior; CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
@@ -4370,7 +4394,7 @@ export function NewChatLandingScreen() {
       {/* Label collapses to icon-only on narrow viewports (mobile). Capped
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
-      <span className="hidden max-w-40 truncate text-sm sm:block">{workspaceLabel}</span>
+      <span className="hidden max-w-40 truncate text-sm lg:block">{workspaceLabel}</span>
       <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
     </button>
   );
@@ -4431,7 +4455,7 @@ export function NewChatLandingScreen() {
             // dark:bg-card-solid stays opaque so dark glass --card doesn't show
             // through. Drag-over keeps its separate inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card pb-10 dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -4737,13 +4761,14 @@ export function NewChatLandingScreen() {
                     triggerTooltip={
                       smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
                     }
+                    triggerDetails={harnessTriggerDetails}
                     autoHarnessAvailable={smartRoutingHarnessAvailable}
                     autoHarnessActive={smartRoutingHarnessSelected}
                     onSelectAutoHarness={handleSelectSmartRoutingHarness}
                     // Match the gear's touch-target height so both halves fill
                     // the shared pill; pr-2 equals the gear icon's own centering
                     // inset (8px) so the divider sits evenly between them.
-                    triggerClassName="h-9 pr-2 md:h-8"
+                    triggerClassName="h-9 max-w-[22rem] pr-2 md:h-8"
                   />
                   {/* Gear — opens the selected agent's run-config modal, behind
                     a hairline divider. Both are hidden when the selected agent
@@ -4872,13 +4897,15 @@ export function NewChatLandingScreen() {
               </div>
             </div>
           </form>
-          {/* Footer tray (host / cwd / worktree). Sits below the composer with
-              symmetric vertical padding and no overlap. */}
+          {/* Environment / permissions / workspace live in the composer's
+              bottom row. The controls remain outside the form so their menus
+              cannot accidentally submit it, but are positioned into the open
+              dedicated row inside the composer surface. */}
           <div
-            className="relative z-0 flex w-full items-center rounded-b-2xl py-1.5 pr-4 pl-2"
+            className="absolute right-2 bottom-2 left-2 z-20 flex h-8 min-w-0 items-center overflow-hidden"
             data-testid="new-chat-landing-footer"
           >
-            <div className="flex flex-wrap items-center gap-1">
+            <div className="flex min-w-0 items-center gap-0.5 overflow-hidden">
               {/* Host chip */}
               <DropdownMenu
                 onOpenChange={(open) => {
@@ -4906,7 +4933,7 @@ export function NewChatLandingScreen() {
                     ) : (
                       <MonitorIcon className="ui-icon" />
                     )}
-                    <span className="hidden max-w-32 truncate text-sm sm:block">{hostLabel}</span>
+                    <span className="hidden max-w-32 truncate text-sm lg:block">{hostLabel}</span>
                     <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </DropdownMenuTrigger>
@@ -5068,6 +5095,22 @@ export function NewChatLandingScreen() {
                 </DropdownMenuContent>
               </DropdownMenu>
 
+              {selectedAgent && permissionConfigRow && (
+                <button
+                  type="button"
+                  className="flex h-8 min-w-0 cursor-pointer items-center gap-1 rounded-lg px-2 text-sm font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
+                  onClick={() => setConfigOpen(true)}
+                  aria-label={`Configure ${permissionConfigRow.label.toLowerCase()}`}
+                  data-testid="new-chat-landing-permission-chip"
+                >
+                  <ShieldIcon className="ui-icon shrink-0" />
+                  <span className="hidden max-w-28 truncate text-sm lg:block">
+                    {permissionConfigRow.value}
+                  </span>
+                  <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                </button>
+              )}
+
               {/* Sandbox repository chip — the sandbox counterpart of the
                 working-directory chip. There is no filesystem to browse
                 before the sandbox exists, so the workspace is specified as
@@ -5082,7 +5125,7 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
-                      <span className="hidden max-w-40 truncate text-sm sm:block">
+                      <span className="hidden max-w-40 truncate text-sm lg:block">
                         {sandboxRepoLabel}
                       </span>
                       <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
@@ -5190,7 +5233,7 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
-                      <span className="hidden max-w-32 truncate text-sm sm:block">
+                      <span className="hidden max-w-32 truncate text-sm lg:block">
                         {worktreeLabel}
                       </span>
                       <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
