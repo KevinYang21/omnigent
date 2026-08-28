@@ -5496,7 +5496,7 @@ export function NewChatLandingScreen() {
           )}
         </div>
         {hasNoSessions ? (
-          <div className="flex flex-col items-center gap-2">
+          <div className="mt-5 flex flex-col items-center gap-2">
             <Button
               variant="outline"
               loading={quickImporting}

@@ -110,6 +110,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // The composer's project chip lists projects via useProjects; stub it to an
 // empty list so it doesn't fire its own authenticatedFetch (which would skew
 // the create-POST call-count / call-order assertions below).
+const { useConversationsMock } = vi.hoisted(() => ({ useConversationsMock: vi.fn() }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
   // Empty projects list → no ?project= name resolves to an id, so the project
@@ -117,7 +118,7 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   useProjects: () => ({ data: [] }),
   // The landing reads useConversations for hasNoSessions; stub it so it doesn't
   // fire an authenticatedFetch that skews create-POST call assertions.
-  useConversations: () => ({ data: undefined }),
+  useConversations: useConversationsMock,
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -699,6 +700,8 @@ function mockAgents(agents: AvailableAgent[]) {
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
+  useConversationsMock.mockReset();
+  useConversationsMock.mockReturnValue({ data: undefined });
   useHostModelOptionsMock.mockReset();
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
@@ -1057,7 +1060,19 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-permission-chip").textContent).not.toBe("");
   });
 
+  it("separates zero-session quick import from an empty notice slot", () => {
+    useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
+    renderLanding();
+
+    const notices = screen.getByTestId("new-chat-landing-notices");
+    const quickImportActions = screen.getByTestId("landing-quick-import").parentElement;
+    expect(notices).toHaveClass("mt-1");
+    expect(quickImportActions).toHaveClass("mt-5");
+    expect(notices.nextElementSibling).toBe(quickImportActions);
+  });
+
   it("keeps the footer anchored to the composer when a harness notice appears", () => {
+    useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
     mockHosts([
       { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
     ]);
@@ -1071,6 +1086,9 @@ describe("NewChatLandingScreen", () => {
     expect(composerSurface).toContainElement(footer);
     expect(composerSurface).not.toContainElement(warning);
     expect(notices).toContainElement(warning);
+    const quickImportActions = screen.getByTestId("landing-quick-import").parentElement;
+    expect(quickImportActions).toHaveClass("mt-5");
+    expect(notices.nextElementSibling).toBe(quickImportActions);
   });
 
   it("keeps the footer anchored to the composer when a create error appears", async () => {
