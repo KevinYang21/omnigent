@@ -17,6 +17,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 
@@ -212,16 +213,32 @@ function PickerIconButton({
   testId: string;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      aria-label={label}
-      className="block shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
-      data-testid={testId}
-    >
-      {icon}
-    </button>
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger
+          asChild
+          onFocus={(event) => {
+            if (!(event.target as HTMLElement).matches(":focus-visible")) {
+              event.preventDefault();
+            }
+          }}
+        >
+          <span className="shrink-0">
+            <button
+              type="button"
+              onClick={onClick}
+              disabled={disabled}
+              aria-label={label}
+              className="block rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
+              data-testid={testId}
+            >
+              {icon}
+            </button>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{label}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 

@@ -1120,7 +1120,7 @@ export function AgentHarnessPicker({
       const details = triggerDetails.map((detail) => detail.value).join(" ");
       const configLabel = (
         <span
-          className="ml-auto flex max-w-32 shrink-0 items-center gap-1 truncate text-sm text-muted-foreground"
+          className="flex max-w-32 shrink-0 items-center gap-1 truncate text-sm text-muted-foreground"
           data-testid={`new-chat-landing-agent-config-${agent.id}`}
         >
           {details}
@@ -1140,6 +1140,7 @@ export function AgentHarnessPicker({
             className="items-center data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
           >
             {renderRowInner(agent, true)}
+            {renderBadge(agent)}
             {configLabel}
             <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
           </DropdownMenuItem>
@@ -1153,6 +1154,7 @@ export function AgentHarnessPicker({
             className="cursor-pointer items-center data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
           >
             {renderRowInner(agent, true)}
+            {renderBadge(agent)}
             {configLabel}
           </DropdownMenuSubTrigger>
           <DropdownMenuSubContent
