@@ -4970,11 +4970,11 @@ export function NewChatLandingScreen() {
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
             <div
-              className="flex items-center justify-between px-2 pb-2"
+              className="flex min-w-0 items-center gap-0.5 px-2 pb-2"
               data-testid="new-chat-landing-actions"
             >
-              {/* Attach + dictate — left side, mirroring the in-session composer. */}
-              <div className="flex items-center gap-0.5">
+              {/* Attachment starts the ordered composer action row. */}
+              <div className="flex shrink-0 items-center gap-0.5">
                 <Button
                   type="button"
                   size="icon"
@@ -4994,141 +4994,10 @@ export function NewChatLandingScreen() {
                   <span className="sr-only">Attach files</span>
                 </Button>
               </div>
-              <div className="flex items-center gap-0.5 md:gap-2">
-                <div className="flex items-center rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
-                  {/* One trigger combines the harness glyph with model / effort;
-                    the selected entry's submenu owns run configuration. */}
-                  <AgentHarnessPicker
-                    agentEntries={agentEntries}
-                    harnessEntries={harnessEntries}
-                    effectiveAgentId={effectiveAgentId}
-                    agentLabel={agentLabel}
-                    hasAgents={agentList.length > 0}
-                    host={harnessWarningHost}
-                    onSelectAgent={handleSelectAgent}
-                    pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
-                    pendingAgentId={PENDING_AGENT_ID}
-                    onSelectPending={handleSelectPending}
-                    onCreateCustomAgent={() => setCreateAgentOpen(true)}
-                    sandboxSelected={sandboxSelected}
-                    triggerTooltip={
-                      smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
-                    }
-                    triggerDetails={harnessTriggerDetails}
-                    triggerIcon={
-                      SelectedAgentIcon ? (
-                        <SelectedAgentIcon
-                          className="size-4 shrink-0 text-foreground"
-                          data-testid="new-chat-landing-agent-icon"
-                        />
-                      ) : null
-                    }
-                    selectedConfigContent={selectedConfigContent}
-                    autoHarnessAvailable={smartRoutingHarnessAvailable}
-                    autoHarnessActive={smartRoutingHarnessSelected}
-                    onSelectAutoHarness={handleSelectSmartRoutingHarness}
-                    // Match the gear's touch-target height so both halves fill
-                    // the shared pill; pr-2 equals the gear icon's own centering
-                    // inset (8px) so the divider sits evenly between them.
-                    contentClassName="w-[17.25rem] min-w-0"
-                    triggerClassName="h-9 max-w-[10rem] pr-2 sm:max-w-[14rem] md:h-8 md:max-w-[17rem]"
-                  />
-                </div>
-                {selectedAgent && selectedAgentHasKnobs && (
-                  <HarnessConfigModal
-                    open={configOpen}
-                    onOpenChange={setConfigOpen}
-                    agent={selectedAgent}
-                    brainHarnessLabels={brainHarnessLabels}
-                    host={harnessWarningHost}
-                    hideUnconfigured={hideUnconfiguredHarnesses}
-                    smartRoutingEligible={smartRoutingEligible}
-                    permissionMode={permissionMode}
-                    approvalMode={approvalMode}
-                    cursorExecMode={cursorExecMode}
-                    agySkipMode={agySkipMode}
-                    bypassSandbox={bypassSandbox}
-                    pickedModel={pickedModel}
-                    claudeModelOptions={claudeModelOptions}
-                    claudeModelsLoading={
-                      !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
-                    }
-                    claudeModelsError={
-                      !sandboxSelected ? (hostClaudeModelsError?.message ?? null) : null
-                    }
-                    codexModelOptions={codexModelOptions}
-                    codexModelsLoading={
-                      !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
-                    }
-                    codexModelsError={
-                      !sandboxSelected ? (hostCodexModelsError?.message ?? null) : null
-                    }
-                    piModelOptions={piModelOptions}
-                    piModelsLoading={
-                      !sandboxSelected && selectedHostId !== null && hostPiModelsLoading
-                    }
-                    pickedEffort={pickedEffort}
-                    pickedHarness={pickedHarness}
-                    costControlMode={costControlMode}
-                    setPermissionMode={setPermissionMode}
-                    setApprovalMode={setApprovalMode}
-                    setCursorExecMode={setCursorExecMode}
-                    setAgySkipMode={setAgySkipMode}
-                    setBypassSandbox={setBypassSandbox}
-                    setPickedModel={setPickedModel}
-                    setPickedEffort={setPickedEffort}
-                    setPickedHarness={handleSetPickedHarness}
-                    setCostControlMode={setCostControlMode}
-                  />
-                )}
-                <ComposerMicButton
-                  enableHotkey
-                  disabled={creating}
-                  onVoiceStart={() => {
-                    voiceSnapshotRef.current = message;
-                  }}
-                  onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
-                  onTranscript={dictation.appendFinal}
-                  onInterim={dictation.replaceInterim}
-                />
-                {/* Routing is not a standalone composer toggle — it folds into
-                  the gear modal's Model dropdown as an "Smart Routing"
-                  option (see HarnessConfigModal). */}
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span className="inline-flex">
-                        <Button
-                          type="submit"
-                          size="icon"
-                          disabled={!canSubmit}
-                          aria-label={creating ? "Starting session" : "Start session"}
-                          aria-busy={creating}
-                          data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
-                        >
-                          {creating ? (
-                            <Loader2Icon className="size-4 animate-spin" />
-                          ) : (
-                            <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
-                          )}
-                        </Button>
-                      </span>
-                    </TooltipTrigger>
-                    {submitDisabledReason != null && (
-                      <TooltipContent>{submitDisabledReason}</TooltipContent>
-                    )}
-                  </Tooltip>
-                </TooltipProvider>
-              </div>
-            </div>
-            {/* Compact host and permission controls continue after attach in
-                the same visual action row. */}
-            <div
-              className="pointer-events-none absolute right-44 bottom-2 left-10 z-20 flex h-8 min-w-0 items-center overflow-hidden sm:right-56 md:right-64"
-              data-testid="new-chat-landing-left-controls"
-            >
-              <div className="pointer-events-auto flex min-w-0 items-center gap-0.5 overflow-hidden">
+              <div
+                className="flex min-w-0 shrink-0 items-center gap-0.5 overflow-hidden"
+                data-testid="new-chat-landing-left-controls"
+              >
                 {/* Host chip */}
                 <DropdownMenu
                   onOpenChange={(open) => {
@@ -5620,8 +5489,130 @@ export function NewChatLandingScreen() {
                 is shown in the hero heading instead of a tray chip; filing on
                 create still uses `selectedProject`. */}
               </div>
-              {/* Harness/model/effort, voice, and submit remain in the right
-                  action cluster above. */}
+              <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-0.5 md:gap-2">
+                <div className="flex min-w-0 flex-1 items-center justify-end rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
+                  {/* One trigger combines the harness glyph with model / effort;
+                    the selected entry's submenu owns run configuration. */}
+                  <AgentHarnessPicker
+                    agentEntries={agentEntries}
+                    harnessEntries={harnessEntries}
+                    effectiveAgentId={effectiveAgentId}
+                    agentLabel={agentLabel}
+                    hasAgents={agentList.length > 0}
+                    host={harnessWarningHost}
+                    onSelectAgent={handleSelectAgent}
+                    pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
+                    pendingAgentId={PENDING_AGENT_ID}
+                    onSelectPending={handleSelectPending}
+                    onCreateCustomAgent={() => setCreateAgentOpen(true)}
+                    sandboxSelected={sandboxSelected}
+                    triggerTooltip={
+                      smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
+                    }
+                    triggerDetails={harnessTriggerDetails}
+                    triggerIcon={
+                      SelectedAgentIcon ? (
+                        <SelectedAgentIcon
+                          className="size-4 shrink-0 text-foreground"
+                          data-testid="new-chat-landing-agent-icon"
+                        />
+                      ) : null
+                    }
+                    selectedConfigContent={selectedConfigContent}
+                    autoHarnessAvailable={smartRoutingHarnessAvailable}
+                    autoHarnessActive={smartRoutingHarnessSelected}
+                    onSelectAutoHarness={handleSelectSmartRoutingHarness}
+                    contentClassName="w-[17.25rem] min-w-0"
+                    triggerClassName="h-9 min-w-0 w-full max-w-[10rem] pr-2 sm:max-w-[14rem] md:h-8 md:max-w-[17rem]"
+                  />
+                </div>
+                {selectedAgent && selectedAgentHasKnobs && (
+                  <HarnessConfigModal
+                    open={configOpen}
+                    onOpenChange={setConfigOpen}
+                    agent={selectedAgent}
+                    brainHarnessLabels={brainHarnessLabels}
+                    host={harnessWarningHost}
+                    hideUnconfigured={hideUnconfiguredHarnesses}
+                    smartRoutingEligible={smartRoutingEligible}
+                    permissionMode={permissionMode}
+                    approvalMode={approvalMode}
+                    cursorExecMode={cursorExecMode}
+                    agySkipMode={agySkipMode}
+                    bypassSandbox={bypassSandbox}
+                    pickedModel={pickedModel}
+                    claudeModelOptions={claudeModelOptions}
+                    claudeModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
+                    }
+                    claudeModelsError={
+                      !sandboxSelected ? (hostClaudeModelsError?.message ?? null) : null
+                    }
+                    codexModelOptions={codexModelOptions}
+                    codexModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
+                    }
+                    codexModelsError={
+                      !sandboxSelected ? (hostCodexModelsError?.message ?? null) : null
+                    }
+                    piModelOptions={piModelOptions}
+                    piModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostPiModelsLoading
+                    }
+                    pickedEffort={pickedEffort}
+                    pickedHarness={pickedHarness}
+                    costControlMode={costControlMode}
+                    setPermissionMode={setPermissionMode}
+                    setApprovalMode={setApprovalMode}
+                    setCursorExecMode={setCursorExecMode}
+                    setAgySkipMode={setAgySkipMode}
+                    setBypassSandbox={setBypassSandbox}
+                    setPickedModel={setPickedModel}
+                    setPickedEffort={setPickedEffort}
+                    setPickedHarness={handleSetPickedHarness}
+                    setCostControlMode={setCostControlMode}
+                  />
+                )}
+                <ComposerMicButton
+                  enableHotkey
+                  disabled={creating}
+                  onVoiceStart={() => {
+                    voiceSnapshotRef.current = message;
+                  }}
+                  onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                  onTranscript={dictation.appendFinal}
+                  onInterim={dictation.replaceInterim}
+                />
+                {/* Routing is not a standalone composer toggle — it folds into
+                  the gear modal's Model dropdown as an "Smart Routing"
+                  option (see HarnessConfigModal). */}
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="inline-flex shrink-0">
+                        <Button
+                          type="submit"
+                          size="icon"
+                          disabled={!canSubmit}
+                          aria-label={creating ? "Starting session" : "Start session"}
+                          aria-busy={creating}
+                          data-testid="new-chat-landing-submit"
+                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
+                        >
+                          {creating ? (
+                            <Loader2Icon className="size-4 animate-spin" />
+                          ) : (
+                            <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
+                          )}
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    {submitDisabledReason != null && (
+                      <TooltipContent>{submitDisabledReason}</TooltipContent>
+                    )}
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
             </div>
           </form>
           <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>

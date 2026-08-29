@@ -965,6 +965,7 @@ describe("NewChatLandingScreen", () => {
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    vi.unstubAllGlobals();
   });
 
   it("renders the inline composer with the prompt headline", () => {
@@ -1028,6 +1029,18 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("renders the reference two-layer composer with one in-form control row", () => {
+    vi.stubGlobal(
+      "SpeechRecognition",
+      class {
+        continuous = false;
+        interimResults = false;
+        lang = "";
+        start = vi.fn();
+        stop = vi.fn();
+        addEventListener = vi.fn();
+        removeEventListener = vi.fn();
+      },
+    );
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
@@ -1057,16 +1070,28 @@ describe("NewChatLandingScreen", () => {
     expect(workspace).toHaveClass("h-8", "mx-4");
     expect(composer).toHaveClass("min-h-[105px]");
     expect(composer).toContainElement(actions);
-    expect(actions).toContainElement(screen.getByTestId("new-chat-landing-attach"));
+    const attach = screen.getByTestId("new-chat-landing-attach");
+    const hostChip = screen.getByTestId("new-chat-landing-host-chip");
+    const permission = screen.getByTestId("new-chat-landing-permission-chip");
+    const harness = screen.getByTestId("new-chat-landing-agent-select");
+    const voice = screen.getByRole("button", { name: "Voice dictation" });
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    const orderedControls = [attach, hostChip, permission, harness, voice, submit];
+    for (const control of orderedControls) expect(actions).toContainElement(control);
+    for (const [index, control] of orderedControls.entries()) {
+      const nextControl = orderedControls[index + 1];
+      if (nextControl) {
+        expect(control.compareDocumentPosition(nextControl)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      }
+    }
+    expect(harness).toHaveClass("min-w-0", "w-full");
     expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveClass("size-[18px]");
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
-    expect(leftControls).toHaveClass("absolute", "bottom-2", "left-10");
-    expect(leftControls).toContainElement(screen.getByTestId("new-chat-landing-host-chip"));
-    expect(leftControls).toContainElement(screen.getByTestId("new-chat-landing-permission-chip"));
+    expect(leftControls).not.toHaveClass("absolute");
+    expect(leftControls).toContainElement(hostChip);
+    expect(leftControls).toContainElement(permission);
     expect(screen.queryByTestId("new-chat-landing-footer")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).not.toBeVisible();
-    expect(actions).toContainElement(screen.getByTestId("new-chat-landing-agent-select"));
-    expect(actions).toContainElement(screen.getByTestId("new-chat-landing-submit"));
     expect(composerSurface).toContainElement(composer);
     expect(composerSurface).not.toContainElement(notices);
     expect(notices.parentElement).toBe(composerSurface.parentElement);
