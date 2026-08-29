@@ -1770,8 +1770,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       const { message, code } = describeSendFailure(err);
       const retryableFailure = isSafeInitialPromptRetry(err);
+      const persistedFailure = isPersistedRunnerFailure(err);
       const suppressFailure = opts?.retryPending === true && retryableFailure;
-      result = retryableFailure ? "retryable_failure" : "terminal_failure";
+      result = persistedFailure
+        ? "settled"
+        : retryableFailure
+          ? "retryable_failure"
+          : "terminal_failure";
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -1781,6 +1786,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (
         !suppressFailure &&
+        !persistedFailure &&
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
@@ -1796,9 +1802,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
       const failGet = (): ChatState =>
         postedSessionId === null ? get() : (setterForState(postedSessionId) ?? get());
-      // Roll back the optimistic bubble — no server idle will fire.
+      // A post-persistence forwarding failure has a durable server item even
+      // though the POST failed. Keep its optimistic bubble until snapshot
+      // reconciliation; restoring the same text would invite a duplicate.
       failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        pendingUserMessages: persistedFailure
+          ? s.pendingUserMessages.map((p) => (p.tempId === tempId ? { ...p, posted: true } : p))
+          : s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
       if (!alreadyStreaming) {
         if (suppressFailure) {
@@ -1931,8 +1941,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const retryableFailure = isSafeInitialPromptRetry(err);
+      const persistedFailure = isPersistedRunnerFailure(err);
       const suppressFailure = opts?.retryPending === true && retryableFailure;
-      result = retryableFailure ? "retryable_failure" : "terminal_failure";
+      result = persistedFailure
+        ? "settled"
+        : retryableFailure
+          ? "retryable_failure"
+          : "terminal_failure";
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
       // forever. A throw from session setup itself (`postedSessionId` never
@@ -1940,14 +1955,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // the landing composer's own failure. Mirrors `send`'s catch.
       const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
       const draftSessionId = postedSessionId ?? submitConversationId;
-      if (!suppressFailure && draftSessionId !== null) {
+      if (!suppressFailure && !persistedFailure && draftSessionId !== null) {
         setterFor(draftSessionId)({
           failedSendDraft: { conversationId: draftSessionId, text: commandText, files: [] },
         });
       }
-      // Roll back the optimistic echo — no receipt will reconcile it.
+      // Keep an echo the server says it persisted; snapshots reconcile it.
       failSet((s) => ({
-        pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        pendingUserMessages: persistedFailure
+          ? s.pendingUserMessages.map((p) => (p.tempId === tempId ? { ...p, posted: true } : p))
+          : s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
       if (!alreadyStreaming) {
         if (!suppressFailure) finalizeActive(failSet, "failed", message, null);
@@ -6197,6 +6214,16 @@ function isSafeInitialPromptRetry(err: unknown): boolean {
     err.status === 503 &&
     err.code === RUNNER_UNAVAILABLE_CODE &&
     err.message === "No runner bound for session"
+  );
+}
+
+/** The server persisted this input before its runner forward failed. */
+function isPersistedRunnerFailure(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status === 503 &&
+    err.code === RUNNER_UNAVAILABLE_CODE &&
+    err.message.startsWith("Runner is unreachable; message was persisted")
   );
 }
 

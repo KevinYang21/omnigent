@@ -2275,7 +2275,7 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.blocks.filter((block) => block.type === "error")).toHaveLength(1);
   });
 
-  it("does not retry runner-unavailable failures emitted after persistence", async () => {
+  it("settles post-persistence runner failures without restoring a duplicate draft", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -2304,11 +2304,10 @@ describe("chatStore — send (first-send ordering)", () => {
       .send("do this once", "agent_xyz", [], { retryPending: true });
 
     const state = useChatStore.getState();
-    expect(result).toBe("terminal_failure");
-    expect(state.failedSendDraft).toMatchObject({
-      conversationId: "conv_existing",
-      text: "do this once",
-    });
+    expect(result).toBe("settled");
+    expect(state.failedSendDraft).toBeNull();
+    expect(state.pendingUserMessages).toHaveLength(1);
+    expect(state.pendingUserMessages[0]?.posted).toBe(true);
     expect(state.blocks.filter((block) => block.type === "error")).toMatchObject([
       {
         message: "Runner is unreachable; message was persisted but could not be delivered.",

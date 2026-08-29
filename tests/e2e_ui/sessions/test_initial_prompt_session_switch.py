@@ -670,6 +670,8 @@ async def _drive_persisted_runner_failure(base_url: str, session_id: str) -> Non
             )
             user_texts = await _canonical_user_texts(base_url, session_id)
             assert user_texts.count(_AMBIGUOUS_PROMPT) == 1, user_texts
+            composer = page.get_by_label("Message the agent")
+            await expect(composer).to_have_value("")
             await _save_optional_screenshot(page, "initial-prompt-accepted-no-retry")
         finally:
             await browser.close()
