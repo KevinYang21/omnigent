@@ -950,6 +950,10 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
   );
 }
 
+function visibleModelLabel(label: string): string {
+  return label.replaceAll("`", "");
+}
+
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 
 /**
@@ -1116,7 +1120,7 @@ export function AgentHarnessPicker({
       const details = triggerDetails.map((detail) => detail.value).join(" ");
       const configLabel = (
         <span
-          className="ml-auto flex shrink-0 items-center gap-1 text-sm text-muted-foreground"
+          className="ml-auto flex max-w-32 shrink-0 items-center gap-1 truncate text-sm text-muted-foreground"
           data-testid={`new-chat-landing-agent-config-${agent.id}`}
         >
           {details}
@@ -1151,7 +1155,11 @@ export function AgentHarnessPicker({
             {renderRowInner(agent, true)}
             {configLabel}
           </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto">
+          <DropdownMenuSubContent
+            sideOffset={4}
+            collisionPadding={12}
+            className="max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.625rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto [&_[role=menuitem]]:min-h-6 [&_[role=menuitem]]:py-0.5"
+          >
             {selectedConfigContent}
           </DropdownMenuSubContent>
         </DropdownMenuSub>
@@ -1310,7 +1318,7 @@ export function AgentHarnessPicker({
           {triggerDetails.map((detail) => (
             <span
               key={detail.label}
-              className="hidden min-w-0 items-center gap-1 xl:inline-flex"
+              className="hidden min-w-0 items-center gap-1 lg:inline-flex"
               data-testid={`new-chat-landing-agent-${detail.label.toLowerCase()}-value`}
             >
               <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
@@ -1717,11 +1725,19 @@ function HarnessConfigModal({
   const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const claudeModelSelectOptions = useMemo(
-    () => claudeModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
+    () =>
+      claudeModelOptions.map((m) => ({
+        id: m.id,
+        label: visibleModelLabel(nativeModelLabel(m)),
+      })),
     [claudeModelOptions],
   );
   const codexModelSelectOptions = useMemo(
-    () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
+    () =>
+      codexModelOptions.map((m) => ({
+        id: m.id,
+        label: visibleModelLabel(nativeModelLabel(m)),
+      })),
     [codexModelOptions],
   );
   const onModelChange = (value: string) => {
@@ -1887,7 +1903,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={claudeModelSelectOptions}
-                  defaultLabel={defaultModelLabel(claudeModelOptions)}
+                  defaultLabel={visibleModelLabel(defaultModelLabel(claudeModelOptions))}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                   componentId="new_chat.config.model"
                 >
@@ -1960,7 +1976,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={codexModelSelectOptions}
-                  defaultLabel={defaultModelLabel(codexModelOptions)}
+                  defaultLabel={visibleModelLabel(defaultModelLabel(codexModelOptions))}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                   componentId="new_chat.config.model"
                 >
@@ -3191,10 +3207,12 @@ export function NewChatLandingScreen() {
       ];
     }
     if (supportsPermissionMode) {
-      const modelValue = routingOn
-        ? SMART_ROUTING_LABEL
-        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
-          defaultModelLabel(claudeModelOptions));
+      const modelValue = visibleModelLabel(
+        routingOn
+          ? SMART_ROUTING_LABEL
+          : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
+              defaultModelLabel(claudeModelOptions)),
+      );
       // Routing picks the model + effort per turn, so mirror the modal's frozen
       // Effort row: an em-dash when routing is on, else the picked level.
       const effortValue = routingOn
@@ -3234,9 +3252,11 @@ export function NewChatLandingScreen() {
           : [
               {
                 label: "Model",
-                value: pickedCodexRow
-                  ? nativeModelLabel(pickedCodexRow)
-                  : defaultModelLabel(codexModelOptions),
+                value: visibleModelLabel(
+                  pickedCodexRow
+                    ? nativeModelLabel(pickedCodexRow)
+                    : defaultModelLabel(codexModelOptions),
+                ),
               },
             ];
       return [...modelRows, { label: "Approval", value: approvalValue }];
@@ -3345,7 +3365,7 @@ export function NewChatLandingScreen() {
               data-testid={`new-chat-landing-agent-model-${option.id}`}
               onSelect={() => selectPickerModel(option.id)}
             >
-              {nativeModelLabel(option)}
+              {visibleModelLabel(nativeModelLabel(option))}
             </DropdownMenuItem>
           ))}
         </div>
@@ -4581,7 +4601,7 @@ export function NewChatLandingScreen() {
     <button
       type="button"
       aria-label={`Working directory: ${workspaceTrimmed || "Not selected"}`}
-      className="relative z-0 mx-4 -mb-px flex h-10 w-[calc(100%-2rem)] cursor-pointer items-center gap-2 rounded-t-2xl border border-border bg-muted/70 px-4 text-sm font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      className="relative z-0 mx-4 -mb-px flex h-8 w-[calc(100%-2rem)] cursor-pointer items-center gap-2 rounded-t-2xl border border-border bg-muted/70 px-3 text-sm font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderIcon className="ui-icon" />
@@ -4602,7 +4622,7 @@ export function NewChatLandingScreen() {
           800 − 80 = 720px max on desktop. px-4 on phones (16px gutters)
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-16 md:select-none md:px-10">
+      <div className="flex w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-16 md:select-none md:px-2">
         <div className="mb-6 flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
@@ -4641,18 +4661,18 @@ export function NewChatLandingScreen() {
               <PopoverContent
                 align="start"
                 sideOffset={4}
-                className="w-[min(36rem,calc(100vw-2rem))] p-2"
+                className="w-[31rem] max-w-[calc(100vw-2rem)] gap-1 p-1.5"
               >
                 {recent.length > 0 && (
                   <>
-                    <div className="px-2 py-1 text-sm font-medium text-muted-foreground">
+                    <div className="px-2 py-0.5 text-xs font-medium text-muted-foreground">
                       Recents
                     </div>
                     {recent.map((path, index) => (
                       <button
                         key={path}
                         type="button"
-                        className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-muted"
+                        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted"
                         onClick={() => {
                           setWorkspace(path);
                           setWorkspacePopoverOpen(false);
@@ -4668,7 +4688,7 @@ export function NewChatLandingScreen() {
                 )}
                 <button
                   type="button"
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-muted"
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted"
                   onClick={() => {
                     setWorkspacePopoverOpen(false);
                     setWorkspacePickerOpen(true);
@@ -4695,7 +4715,7 @@ export function NewChatLandingScreen() {
             // dark:bg-card-solid stays opaque so dark glass --card doesn't show
             // through. Drag-over keeps its separate inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+              "relative z-10 flex min-h-[105px] w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -4999,7 +5019,8 @@ export function NewChatLandingScreen() {
                     // Match the gear's touch-target height so both halves fill
                     // the shared pill; pr-2 equals the gear icon's own centering
                     // inset (8px) so the divider sits evenly between them.
-                    triggerClassName="h-9 max-w-[22rem] pr-2 md:h-8"
+                    contentClassName="w-[17.25rem] min-w-0"
+                    triggerClassName="h-9 max-w-[17rem] pr-2 md:h-8"
                   />
                 </div>
                 {selectedAgent && selectedAgentHasKnobs && (
@@ -5093,7 +5114,7 @@ export function NewChatLandingScreen() {
             {/* Environment, permissions, and worktree controls share the same
               lower row as attach, harness, microphone, and submit. */}
             <div
-              className="pointer-events-none absolute right-28 bottom-2 left-10 z-20 flex h-8 min-w-0 items-center overflow-hidden sm:right-48 md:right-64"
+              className="pointer-events-none absolute right-28 bottom-2 left-10 z-20 flex h-8 min-w-0 items-center overflow-hidden sm:right-48 md:right-72 lg:right-80"
               data-testid="new-chat-landing-footer"
             >
               <div className="pointer-events-auto flex min-w-0 items-center gap-0.5 overflow-hidden">
@@ -5298,7 +5319,7 @@ export function NewChatLandingScreen() {
                     <DropdownMenuTrigger asChild>
                       <button
                         type="button"
-                        className="flex h-8 min-w-0 cursor-pointer items-center gap-1 rounded-lg px-2 text-sm font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
+                        className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg px-2 text-sm font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
                         aria-label={`${permissionConfigRow.label}: ${permissionConfigRow.value}`}
                         data-testid="new-chat-landing-permission-chip"
                       >
@@ -5311,7 +5332,7 @@ export function NewChatLandingScreen() {
                     </DropdownMenuTrigger>
                     <DropdownMenuContent
                       align="start"
-                      className="min-w-64"
+                      className="w-[13.75rem] min-w-0"
                       data-testid="new-chat-landing-permission-menu"
                     >
                       <PickerSectionHeader>{permissionConfigRow.label}</PickerSectionHeader>
@@ -5412,11 +5433,11 @@ export function NewChatLandingScreen() {
                       <button
                         type="button"
                         aria-label={`Worktree: ${branchName.trim() || "None"}`}
-                        className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                        className="flex h-6 min-w-0 max-w-40 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                         data-testid="new-chat-landing-branch-chip"
                       >
                         <GitBranchIcon className="ui-icon" />
-                        <span className="hidden max-w-32 truncate text-sm lg:block">
+                        <span className="hidden min-w-0 max-w-32 truncate text-sm lg:block">
                           {worktreeLabel}
                         </span>
                         <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
@@ -5585,7 +5606,7 @@ export function NewChatLandingScreen() {
             </div>
           </form>
           <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
-            <DialogContent className="max-w-[min(64rem,calc(100vw-2rem))] border-0 bg-transparent p-0 shadow-none">
+            <DialogContent className="max-w-[min(64rem,calc(100vw-2rem))] border-0 bg-transparent p-0 shadow-none sm:max-w-[min(64rem,calc(100vw-2rem))]">
               <DialogHeader className="sr-only">
                 <DialogTitle>Select working directory</DialogTitle>
                 <DialogDescription>Choose a folder for the new session.</DialogDescription>

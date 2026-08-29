@@ -1050,15 +1050,20 @@ describe("NewChatLandingScreen", () => {
     const notices = screen.getByTestId("new-chat-landing-notices");
     const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
     const actions = screen.getByTestId("new-chat-landing-actions");
+    const landingContent = screen.getByTestId("new-chat-landing").firstElementChild;
 
+    expect(landingContent).toHaveClass("max-w-[800px]", "md:px-2");
     expect(composerSurface.firstElementChild).toBe(workspace);
     expect(workspace.nextElementSibling).toBe(composer);
+    expect(workspace).toHaveClass("h-8", "mx-4");
+    expect(composer).toHaveClass("min-h-[105px]");
     expect(footer.parentElement).toBe(composer);
     expect(footer).toHaveClass("absolute", "bottom-2", "left-10");
     expect(composer).toContainElement(actions);
     expect(actions).toContainElement(screen.getByTestId("new-chat-landing-attach"));
     expect(footer).toContainElement(screen.getByTestId("new-chat-landing-host-chip"));
     expect(footer).toContainElement(screen.getByTestId("new-chat-landing-permission-chip"));
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveClass("min-w-0", "max-w-40");
     expect(actions).toContainElement(screen.getByTestId("new-chat-landing-agent-select"));
     expect(actions).toContainElement(screen.getByTestId("new-chat-landing-submit"));
     expect(composerSurface).toContainElement(composer);
@@ -1073,11 +1078,26 @@ describe("NewChatLandingScreen", () => {
     expect(picker).toHaveTextContent("Claude Code");
     expect(picker).toHaveTextContent("Default");
     expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass("lg:inline-flex");
+    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass("lg:inline-flex");
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).not.toHaveClass(
+      "xl:inline-flex",
+    );
 
     fireEvent.pointerDown(picker, { button: 0 });
+    const [rootMenu] = screen.getAllByRole("menu");
+    expect(rootMenu).toHaveClass("w-[17.25rem]", "min-w-0");
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
+    const menus = screen.getAllByRole("menu");
+    expect(menus.at(-1)).toHaveClass(
+      "w-[13.625rem]",
+      "min-w-0",
+      "[&_[role=menuitem]]:min-h-6",
+      "[&_[role=menuitem]]:py-0.5",
+    );
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Opus 4.8");
     expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("Sonnet 4.6");
+    expect(screen.getByTestId("new-chat-landing-agent-models").textContent).not.toContain("`");
     expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("High");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-sonnet"));
@@ -1088,11 +1108,12 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     const permission = screen.getByTestId("new-chat-landing-permission-chip");
+    expect(permission).toHaveClass("shrink-0");
     fireEvent.pointerDown(permission, { button: 0 });
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.getByTestId("new-chat-landing-permission-menu")).toHaveTextContent(
-      "Bypass permissions",
-    );
+    const permissionMenu = screen.getByTestId("new-chat-landing-permission-menu");
+    expect(permissionMenu).toHaveClass("w-[13.75rem]", "min-w-0");
+    expect(permissionMenu).toHaveTextContent("Bypass permissions");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-permission-option-acceptEdits"));
     expect(permission).toHaveTextContent("Accept edits");
@@ -1108,8 +1129,11 @@ describe("NewChatLandingScreen", () => {
     const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
     fireEvent.pointerDown(workspace, { button: 0 });
     fireEvent.click(workspace);
+    const recentsMenu = screen.getByRole("dialog");
+    expect(recentsMenu).toHaveClass("w-[31rem]", "p-1.5");
     const firstRecent = screen.getByTestId("new-chat-landing-workspace-recent-0");
     const secondRecent = screen.getByTestId("new-chat-landing-workspace-recent-1");
+    expect(firstRecent).toHaveClass("py-1.5");
     expect(firstRecent).toHaveTextContent("/Users/corey/repo");
     expect(secondRecent).toHaveTextContent("/Users/corey/other");
     expect(
@@ -1123,7 +1147,11 @@ describe("NewChatLandingScreen", () => {
     fireEvent.pointerDown(workspace, { button: 0 });
     fireEvent.click(workspace);
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
-    expect(screen.getByTestId("workspace-picker")).toBeTruthy();
+    const workspacePicker = screen.getByTestId("workspace-picker");
+    expect(workspacePicker).toBeTruthy();
+    expect(workspacePicker.closest('[role="dialog"]')).toHaveClass(
+      "sm:max-w-[min(64rem,calc(100vw-2rem))]",
+    );
     expect(screen.getByTestId("workspace-picker-select")).toBeTruthy();
     expect(screen.getByTestId("workspace-picker-cancel")).toBeTruthy();
   });
