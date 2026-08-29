@@ -1386,8 +1386,8 @@ describe("dispatchInitialPrompt", () => {
   // agent receives literal "/review-pr 123" text and the skill never runs
   // (the original bug).
   it("posts a matched skill invocation as a slash_command, not a plain message", () => {
-    const send = vi.fn().mockResolvedValue(true);
-    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+    const send = vi.fn().mockResolvedValue("settled");
+    const sendSlashCommand = vi.fn().mockResolvedValue("settled");
     void dispatchInitialPrompt(
       {
         text: "/review-pr 123 focus on auth",
@@ -1412,8 +1412,8 @@ describe("dispatchInitialPrompt", () => {
   });
 
   it("posts plain text (no matched skill) as a regular message", () => {
-    const send = vi.fn().mockResolvedValue(true);
-    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+    const send = vi.fn().mockResolvedValue("settled");
+    const sendSlashCommand = vi.fn().mockResolvedValue("settled");
     void dispatchInitialPrompt(
       { text: "read the README", skill: null },
       "ag_abc123",
@@ -1427,8 +1427,8 @@ describe("dispatchInitialPrompt", () => {
   });
 
   it("carries landing attachments through the plain-message path", () => {
-    const send = vi.fn().mockResolvedValue(true);
-    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+    const send = vi.fn().mockResolvedValue("settled");
+    const sendSlashCommand = vi.fn().mockResolvedValue("settled");
     const file = new File(["x"], "diagram.png", { type: "image/png" });
     void dispatchInitialPrompt(
       { text: "what is this?", skill: null, files: [file] },
@@ -1458,12 +1458,12 @@ describe("deliverInitialPrompt", () => {
     // registers and the POST settles.
     const send = vi
       .fn()
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(false)
-      .mockResolvedValueOnce(false)
-      .mockResolvedValue(true);
-    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+      .mockResolvedValueOnce("retryable_failure")
+      .mockResolvedValueOnce("retryable_failure")
+      .mockResolvedValueOnce("retryable_failure")
+      .mockResolvedValueOnce("retryable_failure")
+      .mockResolvedValue("settled");
+    const sendSlashCommand = vi.fn().mockResolvedValue("settled");
 
     const outcome = await deliverInitialPrompt({
       prompt,
@@ -1483,8 +1483,8 @@ describe("deliverInitialPrompt", () => {
     // The retry loop is strictly sequential: the next attempt only starts
     // after the previous resolved as NOT settled. A late success therefore
     // has nothing to race — two user messages would be worse than the bug.
-    const send = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
-    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+    const send = vi.fn().mockResolvedValueOnce("retryable_failure").mockResolvedValue("settled");
+    const sendSlashCommand = vi.fn().mockResolvedValue("settled");
 
     await deliverInitialPrompt({
       prompt,
@@ -1502,8 +1502,8 @@ describe("deliverInitialPrompt", () => {
     // Intermediate failures are silent (the retry is about to resolve
     // them); the final attempt lets the store paint the error so the user
     // never ends up on a silent, empty composer.
-    const send = vi.fn().mockResolvedValue(false);
-    const sendSlashCommand = vi.fn().mockResolvedValue(false);
+    const send = vi.fn().mockResolvedValue("retryable_failure");
+    const sendSlashCommand = vi.fn().mockResolvedValue("retryable_failure");
 
     const outcome = await deliverInitialPrompt({
       prompt,
@@ -1521,11 +1521,30 @@ describe("deliverInitialPrompt", () => {
     expect(retryFlags).toEqual([true, true, false]);
   });
 
+  it("never retries a terminal or ambiguously accepted failure", async () => {
+    const send = vi.fn().mockResolvedValue("terminal_failure");
+    const sendSlashCommand = vi.fn().mockResolvedValue("settled");
+    const sleepSpy = vi.fn().mockResolvedValue(undefined);
+
+    const outcome = await deliverInitialPrompt({
+      prompt,
+      agentId: "ag_abc123",
+      send,
+      sendSlashCommand,
+      retryDelaysMs: [1, 1, 1],
+      sleep: sleepSpy,
+    });
+
+    expect(outcome).toBe("failed");
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(sleepSpy).not.toHaveBeenCalled();
+  });
+
   it("makes the first attempt immediately, adding no latency to a fast start", async () => {
     // The common case (~6s runner start, absorbed by the server's hold)
     // must behave exactly as before: one attempt, no backoff wait.
-    const send = vi.fn().mockResolvedValue(true);
-    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+    const send = vi.fn().mockResolvedValue("settled");
+    const sendSlashCommand = vi.fn().mockResolvedValue("settled");
     const sleepSpy = vi.fn().mockResolvedValue(undefined);
 
     const outcome = await deliverInitialPrompt({
@@ -1545,8 +1564,8 @@ describe("deliverInitialPrompt", () => {
     // Cancellation is honoured only BETWEEN attempts — an in-flight
     // dispatch must report its outcome first, or the caller couldn't tell
     // "nothing landed" from "it landed after we stopped watching".
-    const send = vi.fn().mockResolvedValue(false);
-    const sendSlashCommand = vi.fn().mockResolvedValue(false);
+    const send = vi.fn().mockResolvedValue("retryable_failure");
+    const sendSlashCommand = vi.fn().mockResolvedValue("retryable_failure");
 
     const outcome = await deliverInitialPrompt({
       prompt,
@@ -1563,8 +1582,11 @@ describe("deliverInitialPrompt", () => {
   });
 
   it("retries a skill invocation on the slash_command path too", async () => {
-    const send = vi.fn().mockResolvedValue(true);
-    const sendSlashCommand = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const send = vi.fn().mockResolvedValue("settled");
+    const sendSlashCommand = vi
+      .fn()
+      .mockResolvedValueOnce("retryable_failure")
+      .mockResolvedValue("settled");
 
     const outcome = await deliverInitialPrompt({
       prompt: { text: "/review-pr 123", skill: { name: "review-pr", args: "123" } },

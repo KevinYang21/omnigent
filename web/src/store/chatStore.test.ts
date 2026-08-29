@@ -2197,9 +2197,10 @@ describe("chatStore — send (first-send ordering)", () => {
       return defaultFetchHandler(input, init);
     });
 
-    await useChatStore.getState().send("hi", "agent_xyz");
+    const result = await useChatStore.getState().send("hi", "agent_xyz");
 
     const state = useChatStore.getState();
+    expect(result).toBe("retryable_failure");
     // Optimistic bubble rolled back, turn settled to idle.
     expect(state.pendingUserMessages).toEqual([]);
     expect(state.status).toBe("idle");
@@ -2214,6 +2215,106 @@ describe("chatStore — send (first-send ordering)", () => {
       message: "The runner didn't come online in time. Please try again.",
       code: "",
     });
+  });
+
+  it("keeps only a retryable runner-unavailable attempt silent and draft-free", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      blocks: [],
+      failedSendDraft: null,
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: "No runner bound for session" } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const result = await useChatStore
+      .getState()
+      .send("hi", "agent_xyz", [], { retryPending: true });
+
+    const state = useChatStore.getState();
+    expect(result).toBe("retryable_failure");
+    expect(state.blocks.filter((block) => block.type === "error")).toEqual([]);
+    expect(state.failedSendDraft).toBeNull();
+  });
+
+  it("surfaces an ambiguous failure even when a caller requested retries", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      blocks: [],
+      failedSendDraft: null,
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return Promise.reject(new TypeError("response lost after send"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const result = await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { retryPending: true });
+
+    const state = useChatStore.getState();
+    expect(result).toBe("terminal_failure");
+    expect(state.failedSendDraft).toMatchObject({
+      conversationId: "conv_existing",
+      text: "do this once",
+    });
+    expect(state.blocks.filter((block) => block.type === "error")).toHaveLength(1);
+  });
+
+  it("does not retry runner-unavailable failures emitted after persistence", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "idle",
+      blocks: [],
+      failedSendDraft: null,
+    });
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          {
+            error: {
+              code: "runner_unavailable",
+              message: "Runner is unreachable; message was persisted but could not be delivered.",
+            },
+          },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const result = await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { retryPending: true });
+
+    const state = useChatStore.getState();
+    expect(result).toBe("terminal_failure");
+    expect(state.failedSendDraft).toMatchObject({
+      conversationId: "conv_existing",
+      text: "do this once",
+    });
+    expect(state.blocks.filter((block) => block.type === "error")).toMatchObject([
+      {
+        message: "Runner is unreachable; message was persisted but could not be delivered.",
+        code: "runner_unavailable",
+      },
+    ]);
   });
 
   it("carries a non-runner send failure's own message into the error block", async () => {
@@ -2237,9 +2338,10 @@ describe("chatStore — send (first-send ordering)", () => {
       return defaultFetchHandler(input, init);
     });
 
-    await useChatStore.getState().send("hi", "agent_xyz");
+    const result = await useChatStore.getState().send("hi", "agent_xyz");
 
     const errorBlocks = useChatStore.getState().blocks.filter((b) => b.type === "error");
+    expect(result).toBe("terminal_failure");
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0]).toMatchObject({
       type: "error",

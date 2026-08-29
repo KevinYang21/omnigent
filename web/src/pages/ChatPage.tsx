@@ -112,6 +112,7 @@ import {
   type PendingInitialPrompt,
   type PendingUserMessage,
   type QueuedMessage,
+  type SendAttemptResult,
   type SendOptions,
   useChatStore,
 } from "@/store/chatStore";
@@ -683,6 +684,16 @@ function truncateTitle(raw: string, max = 60): string {
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
 
+interface InitialPromptDeliveryEntry {
+  promise: Promise<"delivered" | "cancelled" | "failed">;
+  cancel: () => void;
+}
+
+// ChatPage can unmount while a retry is sleeping. Share the one active loop
+// across component instances so a remount observes it instead of replaying the
+// same prompt concurrently.
+const initialPromptDeliveries = new Map<string, InitialPromptDeliveryEntry>();
+
 /**
  * Single component that drives the chat surface. Streaming + history
  * state lives in `useChatStore` (a Zustand store at module scope), so
@@ -718,12 +729,6 @@ export function ChatPage() {
   // because it is set synchronously before the first dispatch, it is what
   // stops a retrying delivery from being started twice for one session.
   const initialPromptSentForConvRef = useRef<string | null>(null);
-  // Conversation id of the delivery loop that is currently alive (including
-  // while it waits out a backoff), or null. Distinct from the guard above,
-  // which stays latched after a loop finishes: this one is what tells a
-  // re-arm whether a loop is already on the job, so returning to a session
-  // mid-backoff can never start a second one.
-  const initialPromptLoopRef = useRef<string | null>(null);
   // True while the first message is still being delivered (including the
   // waits between retries, when nothing else in the UI would show activity
   // — the runner is offline, so the liveness-derived shimmer is suppressed).
@@ -789,13 +794,14 @@ export function ChatPage() {
   useEffect(() => {
     if (!urlConvId) {
       setInitialPrompt(null);
+      setDeliveringInitialPrompt(false);
       return;
     }
     const prompt = peekPendingInitialPrompt(urlConvId);
-    // Still pending with no loop on the job means a previous delivery
-    // attempt for this session stopped when the user navigated away.
-    // Re-arm the once-guard so arriving here again resumes it.
-    if (prompt !== null && initialPromptLoopRef.current === null) {
+    const deliveryInFlight = initialPromptDeliveries.has(urlConvId);
+    setDeliveringInitialPrompt(prompt !== null && deliveryInFlight);
+    // Still pending with no loop on the job means a previous delivery stopped.
+    if (prompt !== null && !deliveryInFlight) {
       initialPromptSentForConvRef.current = null;
     }
     setInitialPrompt(prompt === null ? null : { conversationId: urlConvId, prompt });
@@ -940,11 +946,16 @@ export function ChatPage() {
   // ever running for the same session — while still resetting for the next
   // conversation, since ChatPage stays mounted across `/c/:a` → `/c/:b`.
   useEffect(() => {
+    const existingDelivery =
+      urlConvId === undefined ? undefined : initialPromptDeliveries.get(urlConvId);
     if (
       !shouldSendInitialPrompt({
         initialPrompt: initialPrompt?.prompt.text ?? null,
         promptConversationId: initialPrompt?.conversationId ?? null,
-        sentForConversationId: initialPromptSentForConvRef.current,
+        // A remounted observer must attach to the existing loop even though
+        // this component already marked the conversation as started.
+        sentForConversationId:
+          existingDelivery === undefined ? initialPromptSentForConvRef.current : null,
         conversationId: urlConvId,
         loadingConversation,
         agentId,
@@ -959,33 +970,60 @@ export function ChatPage() {
     const convId = urlConvId;
     const prompt = initialPrompt.prompt;
     initialPromptSentForConvRef.current = convId;
-    initialPromptLoopRef.current = convId;
     setDeliveringInitialPrompt(true);
-    void (async () => {
+    let ownsDelivery = false;
+    let delivery = existingDelivery;
+    if (delivery === undefined) {
+      ownsDelivery = true;
+      let cancelled = false;
       const { send, sendSlashCommand } = useChatStore.getState();
-      const outcome = await deliverInitialPrompt({
+      const promise = deliverInitialPrompt({
         prompt,
         agentId,
         send,
         sendSlashCommand,
-        // `send` pins whatever session the store is on at call time, so a
-        // retry must stop once the user is elsewhere — otherwise the first
-        // message would land in the session they switched to. Read live (not
-        // via an effect cleanup) so a benign re-render can't kill the loop.
-        isCancelled: () => activeConvIdRef.current !== convId,
+        // `send` pins the active store session, so leaving this component or
+        // switching chats cancels before another attempt can target elsewhere.
+        isCancelled: () => cancelled || activeConvIdRef.current !== convId,
+      }).then((outcome) => {
+        if (outcome !== "cancelled") {
+          clearPendingInitialPrompt(convId);
+          if (outcome === "failed") stashUndeliveredPrompt(convId, prompt.text);
+        }
+        return outcome;
       });
-      initialPromptLoopRef.current = null;
+      const entry: InitialPromptDeliveryEntry = {
+        promise: promise.finally(() => {
+          if (initialPromptDeliveries.get(convId) === entry) {
+            initialPromptDeliveries.delete(convId);
+          }
+        }),
+        cancel: () => {
+          cancelled = true;
+        },
+      };
+      initialPromptDeliveries.set(convId, entry);
+      delivery = entry;
+    }
+
+    let observerCancelled = false;
+    void delivery.promise.then((outcome) => {
+      if (observerCancelled) return;
       setDeliveringInitialPrompt(false);
-      // Cancelled: nothing landed and nothing was dropped — the prompt
-      // stays stashed, and re-opening this session resumes delivery.
-      if (outcome === "cancelled") return;
-      // Delivered, or given up on after the final attempt surfaced the
-      // error block. Either way the prompt must not be replayed; on
-      // failure the text stays recoverable from the session's composer
-      // draft and its ArrowUp prompt history.
-      clearPendingInitialPrompt(convId);
-      if (outcome === "failed") stashUndeliveredPrompt(convId, prompt.text);
-    })();
+      if (outcome === "cancelled") {
+        const pending = peekPendingInitialPrompt(convId);
+        if (pending !== null && activeConvIdRef.current === convId) {
+          initialPromptSentForConvRef.current = null;
+          setInitialPrompt({ conversationId: convId, prompt: pending });
+        }
+        return;
+      }
+      setInitialPrompt((current) => (current?.conversationId === convId ? null : current));
+    });
+    return () => {
+      observerCancelled = true;
+      if (ownsDelivery) delivery.cancel();
+    };
   }, [initialPrompt, urlConvId, loadingConversation, agentId]);
 
   // Open state owned here (not inside MainAgentSurface) so the dialog
@@ -1397,7 +1435,7 @@ export function ChatPage() {
       runnerOnline={runnerOnline}
       liveness={liveness}
       agentsError={agentsError}
-      disabled={!agentId || agentsError !== null}
+      disabled={!agentId || agentsError !== null || deliveringInitialPrompt}
       onSend={onSend}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
@@ -5833,20 +5871,25 @@ export function shouldSendResumePrompt(params: {
  * @param opts Forwarded to the store action; ``retryPending`` marks an
  *   attempt the caller will retry, so the store keeps quiet about the
  *   failure.
- * @returns Whether the POST settled on the server.
+ * @returns Whether the POST settled, can be retried safely, or is terminal.
  */
 export function dispatchInitialPrompt(
   prompt: PendingInitialPrompt,
   agentId: string,
-  send: (text: string, agentId: string, files: File[], opts?: SendOptions) => Promise<boolean>,
+  send: (
+    text: string,
+    agentId: string,
+    files: File[],
+    opts?: SendOptions,
+  ) => Promise<SendAttemptResult>,
   sendSlashCommand: (
     name: string,
     args: string,
     agentId: string,
     opts?: SendOptions,
-  ) => Promise<boolean>,
+  ) => Promise<SendAttemptResult>,
   opts?: SendOptions,
-): Promise<boolean> {
+): Promise<SendAttemptResult> {
   return prompt.skill
     ? sendSlashCommand(prompt.skill.name, prompt.skill.args, agentId, opts)
     : send(prompt.text, agentId, prompt.files ?? [], opts);
@@ -5889,13 +5932,18 @@ export const INITIAL_PROMPT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_00
 export async function deliverInitialPrompt(params: {
   prompt: PendingInitialPrompt;
   agentId: string;
-  send: (text: string, agentId: string, files: File[], opts?: SendOptions) => Promise<boolean>;
+  send: (
+    text: string,
+    agentId: string,
+    files: File[],
+    opts?: SendOptions,
+  ) => Promise<SendAttemptResult>;
   sendSlashCommand: (
     name: string,
     args: string,
     agentId: string,
     opts?: SendOptions,
-  ) => Promise<boolean>;
+  ) => Promise<SendAttemptResult>;
   isCancelled?: () => boolean;
   retryDelaysMs?: number[];
   sleep?: (ms: number) => Promise<void>;
@@ -5916,7 +5964,7 @@ export async function deliverInitialPrompt(params: {
     // be an unexpected one, and treating it as "not settled" keeps the loop
     // (and the caller's bookkeeping) alive rather than stranding the prompt.
     // eslint-disable-next-line no-await-in-loop
-    const settled = await dispatchInitialPrompt(
+    const result = await dispatchInitialPrompt(
       params.prompt,
       params.agentId,
       params.send,
@@ -5924,8 +5972,9 @@ export async function deliverInitialPrompt(params: {
       // Only the final attempt lets the store paint the failure: an error
       // block per attempt would stack failures the next attempt resolves.
       { retryPending: !isFinal },
-    ).catch(() => false);
-    if (settled) return "delivered";
+    ).catch((): SendAttemptResult => "terminal_failure");
+    if (result === "settled") return "delivered";
+    if (result === "terminal_failure") return "failed";
     if (isFinal) return "failed";
     if (params.isCancelled?.() === true) return "cancelled";
     // eslint-disable-next-line no-await-in-loop
@@ -5948,9 +5997,8 @@ export async function deliverInitialPrompt(params: {
  * @param text The undelivered message text.
  */
 function stashUndeliveredPrompt(conversationId: string, text: string): void {
-  if (!text || sessionDrafts.get(conversationId)?.text) return;
-  sessionDrafts.set(conversationId, { text, files: [] });
-  saveDraftsToStorage(sessionDrafts);
+  if (!text || getSessionDraft(conversationId)?.text) return;
+  setSessionDraft(conversationId, { text, files: [] });
 }
 
 /**
