@@ -7,7 +7,7 @@
 //      but a late-arriving listing (home resolving) must NOT clobber
 //      what the user is typing.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -24,6 +24,7 @@ import {
   useHostFilesystem,
   type HostFilesystemEntry,
 } from "@/hooks/useHostFilesystem";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -32,9 +33,18 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // is open, so the default is harmless for the other suites.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
+vi.mock("@/hooks/useHostWorktrees", () => ({
+  useHostWorktrees: vi.fn(() => ({
+    data: [],
+    isFetching: false,
+    isPlaceholderData: false,
+    error: null,
+  })),
+}));
 
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useCreateHostDirectoryMock = vi.mocked(useCreateHostDirectory);
+const useHostWorktreesMock = vi.mocked(useHostWorktrees);
 
 function dir(name: string, path: string): HostFilesystemEntry {
   return { name, path, type: "directory", bytes: null, modified_at: 0 };
@@ -47,14 +57,24 @@ function file(name: string, path: string): HostFilesystemEntry {
 interface FakeListing {
   data?: { entries: HostFilesystemEntry[]; truncated: boolean };
   isLoading: boolean;
+  isFetching?: boolean;
   isPlaceholderData: boolean;
-  error?: null;
+  error?: Error | null;
 }
 
 /** Cast a minimal query result to the hook's return type. */
 function result(value: FakeListing): ReturnType<typeof useHostFilesystem> {
   return value as unknown as ReturnType<typeof useHostFilesystem>;
 }
+
+beforeEach(() => {
+  useHostWorktreesMock.mockReturnValue({
+    data: [],
+    isFetching: false,
+    isPlaceholderData: false,
+    error: null,
+  } as unknown as ReturnType<typeof useHostWorktrees>);
+});
 
 describe("parentOf", () => {
   it("returns null at the home view (empty path)", () => {
@@ -524,6 +544,122 @@ describe("WorkspacePicker modal actions", () => {
     expect(screen.getByTestId("workspace-picker-entry-README.md")).toBeDisabled();
     expect(screen.getByTestId("workspace-picker-entry-src")).not.toBeDisabled();
   });
+
+  it("renders breadcrumb chrome and linked worktrees in the full modal", () => {
+    useHostWorktreesMock.mockReturnValue({
+      data: [
+        {
+          path: "/Users/corey/repo",
+          branch: "main",
+          is_main: true,
+          detached: false,
+        },
+        {
+          path: "/Users/corey/worktrees/feature-layout",
+          branch: "feature/layout",
+          is_main: false,
+          detached: false,
+        },
+      ],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    const onNavigate = vi.fn();
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onNavigate={onNavigate}
+      />,
+    );
+
+    expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toContain("repo");
+    expect(screen.getByRole("complementary", { name: "Worktrees" })).toBeInTheDocument();
+    expect(screen.getByText("feature/layout")).toBeInTheDocument();
+    expect(screen.queryByText("main")).toBeNull();
+
+    fireEvent.click(
+      screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
+    );
+    expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/worktrees/feature-layout");
+  });
+
+  it("keeps compact callers single-pane and uses viewport-safe modal height", () => {
+    const { rerender } = render(
+      <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onNavigate={vi.fn()} />,
+    );
+
+    expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
+    expect(screen.getByTestId("workspace-picker").className).toContain("max-h-80");
+
+    rerender(
+      <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />,
+    );
+    const modalClass = screen.getByTestId("workspace-picker").className;
+    expect(modalClass).toContain("calc(100dvh-6rem)");
+    expect(modalClass).not.toContain("min-h-80");
+  });
+});
+
+describe("WorkspacePicker navigation status", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("replaces stale placeholder rows with a busy loading state", () => {
+    useHostFilesystemMock.mockImplementation((_hostId, queryPath) => {
+      if (queryPath === "/repo/src") {
+        return result({
+          data: {
+            entries: [dir("src", "/repo/src"), dir("docs", "/repo/docs")],
+            truncated: false,
+          },
+          isLoading: false,
+          isFetching: true,
+          isPlaceholderData: true,
+          error: null,
+        });
+      }
+      return result({
+        data: {
+          entries: [dir("src", "/repo/src"), dir("docs", "/repo/docs")],
+          truncated: false,
+        },
+        isLoading: false,
+        isFetching: false,
+        isPlaceholderData: false,
+        error: null,
+      });
+    });
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/repo" />);
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
+
+    expect(screen.getByTestId("workspace-picker-listing")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Loading folder…")).toBeInTheDocument();
+    expect(screen.queryByTestId("workspace-picker-entry-docs")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-new-folder")).toBeDisabled();
+  });
+
+  it("announces directory listing errors", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: undefined,
+        isLoading: false,
+        isFetching: false,
+        isPlaceholderData: false,
+        error: new Error("directory is unavailable"),
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/missing" />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("directory is unavailable");
+    expect(screen.getByRole("alert")).toHaveAttribute("aria-live", "assertive");
+  });
 });
 
 describe("joinPath", () => {
@@ -577,7 +713,14 @@ describe("WorkspacePicker new folder", () => {
       isPending: false,
     } as unknown as ReturnType<typeof useCreateHostDirectory>);
 
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/projects" />);
+    const onNavigate = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/projects"
+        onNavigate={onNavigate}
+      />,
+    );
 
     fireEvent.click(screen.getByTestId("workspace-picker-new-folder"));
     fireEvent.change(screen.getByTestId("workspace-picker-new-folder-input"), {
@@ -585,7 +728,9 @@ describe("WorkspacePicker new folder", () => {
     });
     fireEvent.click(screen.getByTestId("workspace-picker-new-folder-create"));
 
-    await Promise.resolve();
+    await waitFor(() => {
+      expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/projects/fresh");
+    });
     expect(mutateAsync).toHaveBeenCalledWith({
       hostId: "host_1",
       path: "/Users/corey/projects/fresh",
@@ -610,9 +755,9 @@ describe("WorkspacePicker new folder", () => {
 
     // Let the rejected mutation settle and the error state render.
     await screen.findByTestId("workspace-picker-new-folder-error");
-    expect(screen.getByTestId("workspace-picker-new-folder-error").textContent).toContain(
-      "already exists",
-    );
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("already exists");
+    expect(alert).toHaveAttribute("aria-live", "assertive");
   });
 
   it("disables the New folder button until an absolute directory resolves", () => {

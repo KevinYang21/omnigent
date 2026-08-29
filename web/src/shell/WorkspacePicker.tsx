@@ -5,19 +5,20 @@ import {
   FileIcon,
   ArrowLeftIcon,
   ChevronRightIcon,
-  HomeIcon,
   EyeIcon,
   EyeOffIcon,
   CheckIcon,
   XIcon,
   AlertTriangleIcon,
   SearchIcon,
+  GitBranchIcon,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 
 /**
  * Join a directory path and a new child name into an absolute path.
@@ -309,6 +310,8 @@ export function WorkspacePicker({
   // The editable path value; diverges from `path` while typing and
   // snaps back on commit (Enter / blur).
   const [pathInput, setPathInput] = useState<string>("");
+  const [pathEditing, setPathEditing] = useState(false);
+  const pathInputRef = useRef<HTMLInputElement>(null);
   // The reference design separates file filtering from path navigation.
   // Keep the legacy path-bar completion too, so existing keyboard flows
   // continue to work while the dedicated search field is the primary affordance.
@@ -346,7 +349,8 @@ export function WorkspacePicker({
     setCreateError(null);
   }, [hostId]);
 
-  const { data, isLoading, error, isPlaceholderData } = useHostFilesystem(hostId, path);
+  const { data, isLoading, isFetching, error, isPlaceholderData } = useHostFilesystem(hostId, path);
+  const navigationPending = Boolean(isLoading || isFetching || isPlaceholderData);
 
   // Resolve the host's home dir independently of where the picker is
   // browsing, so a typed "~"-relative path can be expanded even when the
@@ -392,6 +396,20 @@ export function WorkspacePicker({
   // resolved it to, falling back to the raw path until the listing
   // arrives (so the breadcrumb stays put rather than flashing empty).
   const currentAbsolute = path.startsWith("/") ? path : (listedAbsolute ?? path);
+  const worktreeRepoPath =
+    hasCommitActions && currentAbsolute.startsWith("/") && !navigationPending
+      ? currentAbsolute
+      : null;
+  const {
+    data: hostWorktrees,
+    isFetching: worktreesFetching,
+    isPlaceholderData: worktreesPlaceholder,
+    error: worktreesError,
+  } = useHostWorktrees(hostId, worktreeRepoPath);
+  const worktreesPending = Boolean(worktreesFetching || worktreesPlaceholder);
+  const linkedWorktrees = worktreesPending
+    ? []
+    : (hostWorktrees ?? []).filter((worktree) => !worktree.is_main);
 
   // Other live agents working in the directory currently shown. Only a
   // resolved absolute path can match a stored workspace; the home view ("")
@@ -443,12 +461,43 @@ export function WorkspacePicker({
       return a.name.localeCompare(b.name);
     });
 
+  const breadcrumbItems = (() => {
+    if (currentAbsolute === "") {
+      return [{ label: "~", path: "" }];
+    }
+    if (currentAbsolute === "/") {
+      return [{ label: "/", path: "/" }];
+    }
+    if (
+      resolvedHome !== null &&
+      (currentAbsolute === resolvedHome || currentAbsolute.startsWith(`${resolvedHome}/`))
+    ) {
+      const relativeParts = currentAbsolute.slice(resolvedHome.length).split("/").filter(Boolean);
+      return [
+        { label: basename(resolvedHome), path: resolvedHome },
+        ...relativeParts.map((label, index) => ({
+          label,
+          path: `${resolvedHome}/${relativeParts.slice(0, index + 1).join("/")}`,
+        })),
+      ];
+    }
+    const parts = currentAbsolute.split("/").filter(Boolean);
+    return [
+      { label: "/", path: "/" },
+      ...parts.map((label, index) => ({
+        label,
+        path: `/${parts.slice(0, index + 1).join("/")}`,
+      })),
+    ];
+  })();
+
   function navigateTo(next: string) {
     // A click/commit supersedes any in-progress typing; let the
     // mirror effect refill the bar from the new listing.
     userEditedRef.current = false;
     setSearchInput("");
     setPath(next);
+    setPathEditing(false);
   }
 
   function commitPathInput() {
@@ -468,7 +517,7 @@ export function WorkspacePicker({
   }
 
   function handleSelect() {
-    if (currentAbsolute === "" || currentAbsolute === null) {
+    if (currentAbsolute === "" || currentAbsolute === null || navigationPending || error) {
       return;
     }
     onSelect?.(currentAbsolute);
@@ -483,10 +532,10 @@ export function WorkspacePicker({
   // disabled until we know what home resolves to.
   const createBaseDir = currentAbsolute.startsWith("/")
     ? currentAbsolute
-    : path === "" && !isLoading && !isPlaceholderData
+    : path === "" && !navigationPending
       ? "~"
       : null;
-  const canCreateFolder = hostId !== null && createBaseDir !== null;
+  const canCreateFolder = hostId !== null && createBaseDir !== null && !navigationPending && !error;
 
   function openNewFolder() {
     setCreateError(null);
@@ -521,7 +570,7 @@ export function WorkspacePicker({
     <div
       className={`flex min-h-0 flex-col overflow-hidden border border-border bg-background ${
         hasCommitActions
-          ? "h-full min-h-80 max-h-[min(42rem,calc(100vh-6rem))] rounded-2xl shadow-xl"
+          ? "h-[min(35rem,calc(100dvh-6rem))] max-h-full rounded-2xl shadow-xl"
           : "max-h-80 rounded-md"
       }`}
       data-testid="workspace-picker"
@@ -543,34 +592,78 @@ export function WorkspacePicker({
             testId="workspace-picker-workspace"
           />
         )}
-        <PickerIconButton
-          label="Home"
-          icon={<HomeIcon className="size-4.5" />}
-          onClick={() => navigateTo("")}
-          testId="workspace-picker-home"
-        />
-        <input
-          type="text"
-          value={pathInput}
-          onChange={(e) => {
-            userEditedRef.current = true;
-            setPathInput(e.target.value);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
+        <div className="min-w-0 flex-1 px-2" data-testid="workspace-picker-breadcrumbs">
+          {!pathEditing && (
+            <div className="flex min-w-0 items-center gap-1 overflow-hidden text-base font-medium">
+              {breadcrumbItems.map((item, index) => {
+                const isLast = index === breadcrumbItems.length - 1;
+                return (
+                  <div key={item.path || "home"} className="flex min-w-0 items-center gap-1">
+                    {index > 0 && (
+                      <span className="shrink-0 text-muted-foreground" aria-hidden>
+                        /
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className={`truncate rounded px-1 py-0.5 text-left outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring ${
+                        isLast ? "text-foreground" : "text-muted-foreground"
+                      }`}
+                      onClick={() => {
+                        if (isLast) {
+                          setPathEditing(true);
+                          requestAnimationFrame(() => pathInputRef.current?.focus());
+                        } else {
+                          navigateTo(item.path);
+                        }
+                      }}
+                      data-testid={index === 0 ? "workspace-picker-home" : undefined}
+                    >
+                      {item.label}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <input
+            ref={pathInputRef}
+            type="text"
+            value={pathInput}
+            onFocus={() => setPathEditing(true)}
+            onChange={(e) => {
+              userEditedRef.current = true;
+              setPathInput(e.target.value);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                commitPathInput();
+                setPathEditing(false);
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                userEditedRef.current = false;
+                setPathInput(currentAbsolute);
+                setPathEditing(false);
+                e.currentTarget.blur();
+              }
+            }}
+            onBlur={() => {
               commitPathInput();
-            }
-          }}
-          onBlur={commitPathInput}
-          placeholder="~"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          aria-label="Current folder path"
-          className="min-w-0 flex-1 rounded-md bg-transparent px-2 py-1 text-base font-medium text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:bg-muted/60 focus:ring-2 focus:ring-ring"
-          data-testid="workspace-picker-path-input"
-        />
+              setPathEditing(false);
+            }}
+            placeholder="~"
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            aria-label="Current folder path"
+            tabIndex={pathEditing ? 0 : -1}
+            className={`min-w-0 w-full rounded-md bg-muted/60 px-2 py-1 text-base font-medium text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:ring-2 focus:ring-ring ${
+              pathEditing ? "block" : "sr-only"
+            }`}
+            data-testid="workspace-picker-path-input"
+          />
+        </div>
         <PickerIconButton
           label={showHidden ? "Hide hidden files" : "Show hidden files"}
           icon={showHidden ? <EyeIcon className="size-5" /> : <EyeOffIcon className="size-5" />}
@@ -586,169 +679,243 @@ export function WorkspacePicker({
           />
         )}
       </div>
-      <div className="flex min-h-12 shrink-0 items-center gap-2 border-b px-4">
-        <SearchIcon className="size-5 shrink-0 text-muted-foreground" aria-hidden />
-        <input
-          type="search"
-          value={searchInput}
-          onChange={(event) => setSearchInput(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Escape" && searchInput !== "") {
-              event.preventDefault();
-              setSearchInput("");
-            }
-          }}
-          placeholder="Search folders and files"
-          aria-label="Search folders and files"
-          autoComplete="off"
-          spellCheck={false}
-          className="min-w-0 flex-1 bg-transparent text-base text-foreground outline-none placeholder:text-muted-foreground"
-          data-testid="workspace-picker-search-input"
-        />
-        <PickerIconButton
-          label="New folder"
-          icon={<FolderPlusIcon className="size-4.5" />}
-          onClick={openNewFolder}
-          disabled={!canCreateFolder}
-          testId="workspace-picker-new-folder"
-        />
-      </div>
-      {newFolderName !== null && (
-        <div
-          className="flex shrink-0 flex-col gap-1 border-b bg-muted/30 px-4 py-2"
-          data-testid="workspace-picker-new-folder-form"
-        >
-          <div className="flex items-center gap-2">
-            <FolderPlusIcon className="size-4 shrink-0 text-muted-foreground" />
+      <div
+        className={
+          hasCommitActions
+            ? "grid min-h-0 flex-1 grid-cols-[minmax(0,1.05fr)_minmax(16rem,0.95fr)]"
+            : "flex min-h-0 flex-1 flex-col"
+        }
+      >
+        <div className="flex min-h-0 min-w-0 flex-col">
+          <div className="flex min-h-12 shrink-0 items-center gap-2 border-b px-4">
+            <SearchIcon className="size-5 shrink-0 text-muted-foreground" aria-hidden />
             <input
-              type="text"
-              // Focus belongs on the field the user just opened; the picker is already a focus trap.
-              autoFocus
-              value={newFolderName}
-              onChange={(e) => {
-                setNewFolderName(e.target.value);
-                if (createError !== null) setCreateError(null);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  void commitNewFolder();
-                } else if (e.key === "Escape") {
-                  e.preventDefault();
-                  cancelNewFolder();
+              type="search"
+              value={searchInput}
+              onChange={(event) => setSearchInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" && searchInput !== "") {
+                  event.preventDefault();
+                  setSearchInput("");
                 }
               }}
-              placeholder="New folder name"
+              placeholder="Search folders and files"
+              aria-label="Search folders and files"
+              autoComplete="off"
               spellCheck={false}
-              autoCapitalize="off"
-              autoCorrect="off"
-              className="min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 py-1.5 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              data-testid="workspace-picker-new-folder-input"
+              className="min-w-0 flex-1 bg-transparent text-base text-foreground outline-none placeholder:text-muted-foreground"
+              data-testid="workspace-picker-search-input"
             />
-            <button
-              type="button"
-              disabled={newFolderName.trim() === "" || createDir.isPending}
-              onClick={() => void commitNewFolder()}
-              aria-label="Create folder"
-              title="Create folder"
-              className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
-              data-testid="workspace-picker-new-folder-create"
-            >
-              {createDir.isPending ? (
-                <Spinner className="size-4" />
-              ) : (
-                <CheckIcon className="size-4" />
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={cancelNewFolder}
-              aria-label="Cancel new folder"
-              title="Cancel"
-              className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              data-testid="workspace-picker-new-folder-cancel"
-            >
-              <XIcon className="size-4" />
-            </button>
+            <PickerIconButton
+              label="New folder"
+              icon={<FolderPlusIcon className="size-4.5" />}
+              onClick={openNewFolder}
+              disabled={!canCreateFolder}
+              testId="workspace-picker-new-folder"
+            />
           </div>
-          {createError !== null && (
-            <span
-              className="text-sm text-destructive"
-              data-testid="workspace-picker-new-folder-error"
+          {newFolderName !== null && (
+            <div
+              className="flex shrink-0 flex-col gap-1 border-b bg-muted/30 px-4 py-2"
+              data-testid="workspace-picker-new-folder-form"
             >
-              {createError}
-            </span>
+              <div className="flex items-center gap-2">
+                <FolderPlusIcon className="size-4 shrink-0 text-muted-foreground" />
+                <input
+                  type="text"
+                  // Focus belongs on the field the user just opened; the picker is already a focus trap.
+                  autoFocus
+                  value={newFolderName}
+                  onChange={(e) => {
+                    setNewFolderName(e.target.value);
+                    if (createError !== null) setCreateError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void commitNewFolder();
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      cancelNewFolder();
+                    }
+                  }}
+                  placeholder="New folder name"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  className="min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 py-1.5 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  data-testid="workspace-picker-new-folder-input"
+                />
+                <button
+                  type="button"
+                  disabled={newFolderName.trim() === "" || createDir.isPending}
+                  onClick={() => void commitNewFolder()}
+                  aria-label="Create folder"
+                  title="Create folder"
+                  className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
+                  data-testid="workspace-picker-new-folder-create"
+                >
+                  {createDir.isPending ? (
+                    <Spinner className="size-4" />
+                  ) : (
+                    <CheckIcon className="size-4" />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelNewFolder}
+                  aria-label="Cancel new folder"
+                  title="Cancel"
+                  className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  data-testid="workspace-picker-new-folder-cancel"
+                >
+                  <XIcon className="size-4" />
+                </button>
+              </div>
+              {createError !== null && (
+                <span
+                  className="text-sm text-destructive"
+                  role="alert"
+                  aria-live="assertive"
+                  data-testid="workspace-picker-new-folder-error"
+                >
+                  {createError}
+                </span>
+              )}
+            </div>
           )}
-        </div>
-      )}
-      {occupiedCount > 0 && (
-        <div
-          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-4 py-2 text-sm text-warning"
-          data-testid="workspace-picker-conflict"
-        >
-          <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
-          <span>
-            {occupiedCount === 1 ? "1 other agent is" : `${occupiedCount} other agents are`} working
-            in this directory. Write operations may conflict — name a git branch to work in an
-            isolated copy.
-          </span>
-        </div>
-      )}
-      <div className="min-h-0 flex-1 overflow-y-auto py-2" aria-busy={isLoading || undefined}>
-        {isLoading && (
-          <div className="flex items-center gap-2 px-5 py-3 text-sm text-muted-foreground">
-            <Spinner className="size-4" />
-            Loading…
-          </div>
-        )}
-        {error !== null && error !== undefined && !isLoading && (
-          <div className="px-5 py-3 text-sm text-destructive" data-testid="workspace-picker-error">
-            {error instanceof Error ? error.message : "Failed to load directory"}
-          </div>
-        )}
-        {!isLoading && error === null && entries.length === 0 && (
-          <div className="px-5 py-3 text-sm text-muted-foreground">
-            {activeFilter !== null ? "No matching entries" : "(empty directory)"}
-          </div>
-        )}
-        {entries.map((entry) => {
-          const isDir = entry.type === "directory";
-          return (
-            <button
-              key={entry.path}
-              type="button"
-              disabled={!isDir}
-              // preventDefault keeps focus on the path input so a click while
-              // a filter is typed doesn't blur → commit → re-sort the list out
-              // from under the click. onClick still does the navigation (and
-              // fires for keyboard activation, where mousedown doesn't).
-              onMouseDown={(e) => e.preventDefault()}
-              onClick={() => isDir && navigateTo(entry.path)}
-              className={
-                "flex min-h-11 w-full items-center gap-2.5 px-5 py-2 text-left text-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring " +
-                (isDir
-                  ? "cursor-pointer text-foreground hover:bg-muted"
-                  : "cursor-not-allowed text-muted-foreground opacity-55")
-              }
-              data-testid={`workspace-picker-entry-${entry.name}`}
+          {occupiedCount > 0 && (
+            <div
+              className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-4 py-2 text-sm text-warning"
+              data-testid="workspace-picker-conflict"
             >
-              {isDir ? (
-                <FolderIcon className="size-5 shrink-0 text-muted-foreground" />
-              ) : (
-                <FileIcon className="size-5 shrink-0" />
-              )}
-              <span className="flex-1 truncate">{entry.name}</span>
-              {isDir && <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />}
-            </button>
-          );
-        })}
-        {data?.truncated && (
+              <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+              <span>
+                {occupiedCount === 1 ? "1 other agent is" : `${occupiedCount} other agents are`}{" "}
+                working in this directory. Write operations may conflict — name a git branch to work
+                in an isolated copy.
+              </span>
+            </div>
+          )}
           <div
-            className="px-5 py-2 text-sm text-muted-foreground"
-            data-testid="workspace-picker-truncated"
+            className="min-h-0 flex-1 overflow-y-auto py-2"
+            aria-busy={navigationPending || undefined}
+            data-testid="workspace-picker-listing"
           >
-            Too many entries to list fully — type a path above to jump directly.
+            {navigationPending && (
+              <div className="flex items-center gap-2 px-5 py-3 text-sm text-muted-foreground">
+                <Spinner className="size-4" />
+                Loading folder…
+              </div>
+            )}
+            {error !== null && error !== undefined && !navigationPending && (
+              <div
+                className="px-5 py-3 text-sm text-destructive"
+                role="alert"
+                aria-live="assertive"
+                data-testid="workspace-picker-error"
+              >
+                {error instanceof Error ? error.message : "Failed to load directory"}
+              </div>
+            )}
+            {!navigationPending && error === null && entries.length === 0 && (
+              <div className="px-5 py-3 text-sm text-muted-foreground">
+                {activeFilter !== null ? "No matching entries" : "(empty directory)"}
+              </div>
+            )}
+            {!navigationPending &&
+              entries.map((entry) => {
+                const isDir = entry.type === "directory";
+                return (
+                  <button
+                    key={entry.path}
+                    type="button"
+                    disabled={!isDir}
+                    // preventDefault keeps focus on the path input so a click while
+                    // a filter is typed doesn't blur → commit → re-sort the list out
+                    // from under the click. onClick still does the navigation (and
+                    // fires for keyboard activation, where mousedown doesn't).
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => isDir && navigateTo(entry.path)}
+                    className={
+                      "flex min-h-11 w-full items-center gap-2.5 px-5 py-2 text-left text-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring " +
+                      (isDir
+                        ? "cursor-pointer text-foreground hover:bg-muted"
+                        : "cursor-not-allowed text-muted-foreground opacity-55")
+                    }
+                    data-testid={`workspace-picker-entry-${entry.name}`}
+                  >
+                    {isDir ? (
+                      <FolderIcon className="size-5 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <FileIcon className="size-5 shrink-0" />
+                    )}
+                    <span className="flex-1 truncate">{entry.name}</span>
+                    {isDir && (
+                      <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
+                    )}
+                  </button>
+                );
+              })}
+            {!navigationPending && data?.truncated && (
+              <div
+                className="px-5 py-2 text-sm text-muted-foreground"
+                data-testid="workspace-picker-truncated"
+              >
+                Too many entries to list fully — type a path above to jump directly.
+              </div>
+            )}
           </div>
+        </div>
+        {hasCommitActions && (
+          <aside
+            className="flex min-h-0 min-w-0 flex-col border-l bg-muted/10"
+            aria-label="Worktrees"
+            data-testid="workspace-picker-worktrees"
+          >
+            <div className="flex min-h-12 shrink-0 items-center border-b px-4 text-base font-medium">
+              Worktrees
+            </div>
+            <div
+              className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3"
+              aria-busy={worktreesPending || undefined}
+            >
+              {worktreesPending && (
+                <div className="flex items-center gap-2 px-1 py-2 text-sm text-muted-foreground">
+                  <Spinner className="size-4" />
+                  Loading worktrees…
+                </div>
+              )}
+              {!worktreesPending && worktreesError && (
+                <div className="px-1 py-2 text-sm text-muted-foreground">
+                  Worktrees are unavailable for this folder.
+                </div>
+              )}
+              {!worktreesPending && !worktreesError && linkedWorktrees.length === 0 && (
+                <div className="px-1 py-2 text-sm text-muted-foreground">
+                  No linked worktrees for this repository.
+                </div>
+              )}
+              {linkedWorktrees.map((worktree) => (
+                <button
+                  key={worktree.path}
+                  type="button"
+                  onClick={() => navigateTo(worktree.path)}
+                  className="w-full rounded-xl border border-border bg-background px-4 py-3 text-left shadow-xs transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  data-testid={`workspace-picker-worktree-${worktree.path}`}
+                >
+                  <div className="flex min-w-0 items-center gap-2 text-base font-medium text-foreground">
+                    <GitBranchIcon className="size-4 shrink-0 text-muted-foreground" />
+                    <span className="truncate">{worktree.branch ?? "Detached HEAD"}</span>
+                  </div>
+                  <div className="mt-2 flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
+                    <FolderIcon className="size-4 shrink-0" />
+                    <span className="truncate">{worktree.path}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </aside>
         )}
       </div>
       {hasCommitActions && (
@@ -768,7 +935,12 @@ export function WorkspacePicker({
             <Button
               type="button"
               size="lg"
-              disabled={currentAbsolute === "" || currentAbsolute === null}
+              disabled={
+                currentAbsolute === "" ||
+                currentAbsolute === null ||
+                navigationPending ||
+                Boolean(error)
+              }
               onClick={handleSelect}
               title={`Use this folder: ${basename(currentAbsolute)}`}
               className="shrink-0 px-4"
