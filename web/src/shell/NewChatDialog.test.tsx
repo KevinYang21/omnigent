@@ -1045,7 +1045,6 @@ describe("NewChatLandingScreen", () => {
       "overflow-hidden",
     );
     const composer = screen.getByTestId("new-chat-landing-composer");
-    const footer = screen.getByTestId("new-chat-landing-footer");
     const composerSurface = screen.getByTestId("new-chat-landing-composer-surface");
     const notices = screen.getByTestId("new-chat-landing-notices");
     const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
@@ -1057,13 +1056,15 @@ describe("NewChatLandingScreen", () => {
     expect(workspace.nextElementSibling).toBe(composer);
     expect(workspace).toHaveClass("h-8", "mx-4");
     expect(composer).toHaveClass("min-h-[105px]");
-    expect(footer.parentElement).toBe(composer);
-    expect(footer).toHaveClass("absolute", "bottom-2", "left-10");
     expect(composer).toContainElement(actions);
     expect(actions).toContainElement(screen.getByTestId("new-chat-landing-attach"));
-    expect(footer).toContainElement(screen.getByTestId("new-chat-landing-host-chip"));
-    expect(footer).toContainElement(screen.getByTestId("new-chat-landing-permission-chip"));
-    expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveClass("min-w-0", "max-w-40");
+    expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveClass("size-[18px]");
+    const leftControls = screen.getByTestId("new-chat-landing-left-controls");
+    expect(leftControls).toHaveClass("absolute", "bottom-2", "left-10");
+    expect(leftControls).toContainElement(screen.getByTestId("new-chat-landing-host-chip"));
+    expect(leftControls).toContainElement(screen.getByTestId("new-chat-landing-permission-chip"));
+    expect(screen.queryByTestId("new-chat-landing-footer")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).not.toBeVisible();
     expect(actions).toContainElement(screen.getByTestId("new-chat-landing-agent-select"));
     expect(actions).toContainElement(screen.getByTestId("new-chat-landing-submit"));
     expect(composerSurface).toContainElement(composer);
@@ -1075,14 +1076,13 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
-    expect(picker).toHaveTextContent("Claude Code");
-    expect(picker).toHaveTextContent("Default");
-    expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
-    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass("lg:inline-flex");
-    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass("lg:inline-flex");
-    expect(screen.getByTestId("new-chat-landing-agent-model-value")).not.toHaveClass(
-      "xl:inline-flex",
+    expect(picker).not.toHaveTextContent("Claude Code");
+    expect(screen.getByTestId("new-chat-landing-agent-config-value")).toHaveTextContent(
+      "Default Default",
     );
+    expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-model-value")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
 
     fireEvent.pointerDown(picker, { button: 0 });
     const [rootMenu] = screen.getAllByRole("menu");
@@ -1101,7 +1101,9 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-efforts")).toHaveTextContent("High");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-sonnet"));
-    expect(picker).toHaveTextContent("Sonnet 4.6");
+    expect(screen.getByTestId("new-chat-landing-agent-config-value")).toHaveTextContent(
+      "Sonnet 4.6 Default",
+    );
   });
 
   it("opens permission modes from a compact anchored composer menu", () => {
@@ -1176,7 +1178,7 @@ describe("NewChatLandingScreen", () => {
     selectUnconfiguredAgent("a2");
 
     const composerSurface = screen.getByTestId("new-chat-landing-composer-surface");
-    const footer = screen.getByTestId("new-chat-landing-footer");
+    const footer = screen.getByTestId("new-chat-landing-left-controls");
     const notices = screen.getByTestId("new-chat-landing-notices");
     const warning = screen.getByTestId("new-chat-landing-harness-warning");
     expect(composerSurface).toContainElement(footer);
@@ -1205,25 +1207,27 @@ describe("NewChatLandingScreen", () => {
 
     const error = await screen.findByTestId("new-chat-landing-error");
     const composerSurface = screen.getByTestId("new-chat-landing-composer-surface");
-    const footer = screen.getByTestId("new-chat-landing-footer");
+    const footer = screen.getByTestId("new-chat-landing-left-controls");
     const notices = screen.getByTestId("new-chat-landing-notices");
     expect(composerSurface).toContainElement(footer);
     expect(composerSurface).not.toContainElement(error);
     expect(notices).toContainElement(error);
   });
 
-  it("keeps responsive host, working-directory, and worktree triggers accessibly named", () => {
+  it("keeps compact host and working-directory controls accessibly named", () => {
     renderLanding();
 
     const hostTrigger = screen.getByTestId("new-chat-landing-host-chip");
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
-    const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
     expect(hostTrigger).toHaveAccessibleName("Host: This machine, Online");
     expect(workspaceTrigger).toHaveAccessibleName("Working directory: /Users/corey/repo");
-    expect(worktreeTrigger).toHaveAccessibleName("Worktree: None");
-    expect(within(hostTrigger).getByText("This machine")).toHaveClass("hidden", "lg:block");
+    expect(within(hostTrigger).getByText("This machine")).toHaveClass("sr-only");
+    expect(within(hostTrigger).getByTestId("new-chat-landing-host-status")).toHaveClass(
+      "bg-success",
+    );
+    expect(within(hostTrigger).getByTestId("new-chat-landing-host-icon")).toBeTruthy();
     expect(within(workspaceTrigger).getByText("repo")).toHaveClass("truncate");
-    expect(within(worktreeTrigger).getByText("Worktree")).toHaveClass("hidden", "lg:block");
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).not.toBeVisible();
   });
 
   it("keeps the responsive sandbox repository trigger accessibly named", () => {
@@ -1246,18 +1250,13 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
-    expect(within(picker).getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent(
-      "Default",
+    expect(within(picker).getByTestId("new-chat-landing-agent-config-value")).toHaveTextContent(
+      "Default Default",
     );
-    expect(within(picker).getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent(
-      "Default",
-    );
-    expect(picker).toHaveAccessibleName(
-      "Agent or harness: Claude Code, Model: Default, Effort: Default",
-    );
+    expect(picker).toHaveAccessibleName("Claude Code, Default Default");
 
     selectAgent("a2");
-    expect(picker).toHaveAccessibleName("Agent or harness: Codex, Model: Default (GPT-5.5)");
+    expect(picker).toHaveAccessibleName("Codex, GPT-5.5");
   });
 
   it("names Pi model and thinking-level details in the harness trigger", () => {
@@ -1274,7 +1273,7 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
-      "Agent or harness: Pi, Model: Default, Thinking level: Default",
+      "Pi, Default Default",
     );
   });
 
@@ -1285,7 +1284,7 @@ describe("NewChatLandingScreen", () => {
     saveConfig();
 
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
-      "Agent or harness: Claude Code, Model: Smart Routing, Effort: —",
+      "Claude Code, Smart Routing —",
     );
   });
 
@@ -1946,39 +1945,21 @@ describe("NewChatLandingScreen", () => {
     expect(banner.textContent).toContain("1 other agent is");
   });
 
-  it("keeps footer chip labels compact, muted and truncated", async () => {
-    // Land with `?project=` so the branch chip (worktree) renders alongside the
-    // others for the truncate-cap assertions.
+  it("keeps workspace, host, and permission controls compact", async () => {
     renderLanding({}, "/?project=docs");
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
-    // The host / working-directory / worktree chips each clamp their label to a
-    // fixed max width and `truncate` it, so a long value (a deep working-directory
-    // path, a long branch name) is ellipsized rather than growing the chip and
-    // pushing the tray onto a second row. Dropping `truncate` or the `max-w-*`
-    // cap would regress the single-row layout this guards.
-    const label = (testid: string) => screen.getByTestId(testid).querySelector("span.truncate");
-
-    for (const testid of [
-      "new-chat-landing-workspace-chip",
-      "new-chat-landing-host-chip",
-      "new-chat-landing-branch-chip",
-    ]) {
-      expect(screen.getByTestId(testid)).toHaveClass("text-sm", "text-muted-foreground");
-      expect(label(testid)).toHaveClass("text-sm");
-      expect(label(testid)).not.toHaveClass("text-foreground");
-    }
-    expect(label("new-chat-landing-workspace-chip")).toHaveClass("min-w-0", "flex-1");
-    expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-32");
-    expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
-    expect(
-      screen.getByTestId("new-chat-landing-host-chip").querySelector(".bg-success"),
-    ).not.toBeNull();
-    expect(
-      screen.getByTestId("new-chat-landing-host-chip").querySelector(".lucide-monitor"),
-    ).toBeNull();
-    expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveTextContent("Worktree");
+    const workspaceLabel = screen
+      .getByTestId("new-chat-landing-workspace-chip")
+      .querySelector("span.truncate");
+    expect(workspaceLabel).toHaveClass("min-w-0", "flex-1", "text-sm");
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveClass("h-8", "px-1.5");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveClass(
+      "h-8",
+      "bg-muted/70",
+    );
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).not.toBeVisible();
   });
 
   it("opens the setup dialog and installs an installable harness from it", () => {
@@ -2557,7 +2538,7 @@ describe("NewChatLandingScreen", () => {
       ),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).not.toBeVisible();
     expect(screen.queryByTestId("new-chat-landing-repo-chip")).toBeNull();
     // And back: selecting the sandbox clears the host pick and swaps the
     // chips again. The auto-select effect must not override this either.
@@ -3499,7 +3480,9 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
     // Clicking a2 (Codex) commits the pick — the trigger reflects it.
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Codex");
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      "Codex, GPT-5.5",
+    );
   });
 
   it("opens the selected agent's config modal from the gear icon", () => {
@@ -4615,7 +4598,9 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
       "Smart Routing",
     );
     selectAgent("a2");
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Codex");
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      "Codex, GPT-5.5",
+    );
   });
 
   it("sends harness_override 'auto' with the routing message and routing on", async () => {
@@ -4709,7 +4694,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
       // Exactly what an empty store would have given: the default harness pick.
       const chip = screen.getByTestId("new-chat-landing-agent-select");
       expect(chip.textContent).not.toContain("Smart Routing");
-      expect(chip.textContent).toContain("Claude Code");
+      expect(chip).toHaveAccessibleName("Claude Code, Default Default");
       // Silent: the user did nothing this visit to lose routing, and the row
       // the notice would talk about isn't in the picker either.
       expect(screen.queryByTestId("new-chat-landing-smart-routing-dropped")).toBeNull();
@@ -4839,8 +4824,8 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({});
 
     remountLanding({ smart_routing_enabled: true });
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Claude Code",
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      "Claude Code, Default Default",
     );
   });
 

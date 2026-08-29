@@ -22,9 +22,8 @@ import {
   FileTextIcon,
   FolderIcon,
   ImageIcon,
-  PaperclipIcon,
+  HandIcon,
   PlusIcon,
-  ShieldIcon,
   ShuffleIcon,
   TriangleAlertIcon,
   XIcon,
@@ -46,6 +45,7 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { iconForAgent } from "@/components/AgentCard";
 import {
   Command,
   CommandEmpty,
@@ -938,8 +938,8 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
  * The home-page ("/") landing composer.
  *
  * Owns session creation end-to-end: the textarea is the first message and the
- * configuration chips (host, working directory, git worktree) plus the agent
- * picker supply every required parameter. Hitting send POSTs /v1/sessions and
+ * workspace shell plus the compact host, permission, and agent controls supply
+ * every required parameter. Hitting send POSTs /v1/sessions and
  * navigates to the new session — there is no modal.
  */
 /** Group / section header inside the picker dropdown (plain div, so Radix
@@ -952,6 +952,11 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
 
 function visibleModelLabel(label: string): string {
   return label.replaceAll("`", "");
+}
+
+function compactHarnessTriggerValue(value: string): string {
+  const defaultModel = /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
+  return defaultModel.replace(/ \([^()]*context[^()]*\)$/i, "");
 }
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
@@ -1000,6 +1005,7 @@ export function AgentHarnessPicker({
   triggerLabelClassName,
   triggerTooltip,
   triggerDetails = EMPTY_HARNESS_TRIGGER_DETAILS,
+  triggerIcon,
   selectedConfigContent,
   autoHarnessAvailable = false,
   autoHarnessActive = false,
@@ -1045,8 +1051,10 @@ export function AgentHarnessPicker({
   /** Hover text explaining the current pick, when the label alone doesn't say
    *  what runs (e.g. "Auto"). Omitted → no tooltip, as before. */
   triggerTooltip?: string;
-  /** Model / effort values rendered as segments inside the harness trigger. */
+  /** Model / effort values joined inside the harness trigger. */
   triggerDetails?: readonly { label: string; value: string }[];
+  /** Harness glyph rendered before the joined model / effort label. */
+  triggerIcon?: ReactNode;
   /** Integrated configuration menu for the currently selected entry. */
   selectedConfigContent?: ReactNode;
   /** Whether the top-level Smart Routing row is offered (routing enabled and
@@ -1066,10 +1074,12 @@ export function AgentHarnessPicker({
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const triggerAccessibleName = [
-    `Agent or harness: ${hasAgents ? agentLabel : "No agents"}`,
-    ...triggerDetails.map((detail) => `${detail.label}: ${detail.value}`),
-  ].join(", ");
+  const triggerDetailText = triggerDetails
+    .map((detail) => compactHarnessTriggerValue(detail.value))
+    .join(" ");
+  const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerDetailText]
+    .filter(Boolean)
+    .join(", ");
 
   // Touch devices can't hover, so the desktop submenu flyouts ("More",
   // "Custom agents") are unreachable there. On mobile we swap the dropdown's
@@ -1085,8 +1095,7 @@ export function AgentHarnessPicker({
   }, [open]);
 
   // The agent name + optional short blurb, with the full spec description on
-  // hover. Run-config knobs now live in the gear-icon config modal, not here —
-  // this picker only selects the agent / harness.
+  // hover. Run-config knobs live in the selected entry's integrated submenu.
   const renderRowInner = (agent: AvailableAgent, withTooltip: boolean) => {
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
     const inner = (
@@ -1312,23 +1321,13 @@ export function AgentHarnessPicker({
             triggerClassName,
           )}
         >
+          {triggerIcon}
           <span
             className={cn("max-w-[12rem] truncate text-ui text-foreground", triggerLabelClassName)}
+            data-testid="new-chat-landing-agent-config-value"
           >
-            {hasAgents ? agentLabel : "No agents"}
+            {triggerDetailText || (hasAgents ? agentLabel : "No agents")}
           </span>
-          {triggerDetails.map((detail) => (
-            <span
-              key={detail.label}
-              className="hidden min-w-0 items-center gap-1 lg:inline-flex"
-              data-testid={`new-chat-landing-agent-${detail.label.toLowerCase()}-value`}
-            >
-              <span aria-hidden className="h-4 w-px shrink-0 bg-border" />
-              <span className="max-w-28 truncate text-sm text-muted-foreground">
-                {detail.value}
-              </span>
-            </span>
-          ))}
           <ChevronDownIcon className="size-3.5 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
@@ -4086,6 +4085,7 @@ export function NewChatLandingScreen() {
       : configuredAgentUnavailable
         ? "Agent unavailable"
         : "Select agent";
+  const SelectedAgentIcon = selectedAgent ? iconForAgent(selectedAgent) : null;
 
   // Wrap the harness setter so every explicit pick is persisted to
   // localStorage. The caller can pass an explicit `agentId` for the
@@ -4986,17 +4986,18 @@ export function NewChatLandingScreen() {
                   data-testid="new-chat-landing-attach"
                   componentId="new_chat.attach_files"
                 >
-                  <PaperclipIcon className="size-4" data-icon-size="16" />
+                  <PlusIcon
+                    className="size-[18px]"
+                    data-icon-size="18"
+                    data-testid="new-chat-landing-attach-icon"
+                  />
                   <span className="sr-only">Attach files</span>
                 </Button>
               </div>
               <div className="flex items-center gap-0.5 md:gap-2">
                 <div className="flex items-center rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
-                  {/* Agent / harness picker — selects the agent or harness only.
-                    Its run-config knobs (model / effort / permission mode for
-                    Claude Code, approval mode for Codex/OpenCode, exec mode for
-                    Cursor, brain-harness override for bundle agents) live in the
-                    gear-icon config modal beside it. */}
+                  {/* One trigger combines the harness glyph with model / effort;
+                    the selected entry's submenu owns run configuration. */}
                   <AgentHarnessPicker
                     agentEntries={agentEntries}
                     harnessEntries={harnessEntries}
@@ -5014,6 +5015,14 @@ export function NewChatLandingScreen() {
                       smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
                     }
                     triggerDetails={harnessTriggerDetails}
+                    triggerIcon={
+                      SelectedAgentIcon ? (
+                        <SelectedAgentIcon
+                          className="size-4 shrink-0 text-foreground"
+                          data-testid="new-chat-landing-agent-icon"
+                        />
+                      ) : null
+                    }
                     selectedConfigContent={selectedConfigContent}
                     autoHarnessAvailable={smartRoutingHarnessAvailable}
                     autoHarnessActive={smartRoutingHarnessSelected}
@@ -5022,7 +5031,7 @@ export function NewChatLandingScreen() {
                     // the shared pill; pr-2 equals the gear icon's own centering
                     // inset (8px) so the divider sits evenly between them.
                     contentClassName="w-[17.25rem] min-w-0"
-                    triggerClassName="h-9 max-w-[17rem] pr-2 md:h-8"
+                    triggerClassName="h-9 max-w-[10rem] pr-2 sm:max-w-[14rem] md:h-8 md:max-w-[17rem]"
                   />
                 </div>
                 {selectedAgent && selectedAgentHasKnobs && (
@@ -5113,11 +5122,11 @@ export function NewChatLandingScreen() {
                 </TooltipProvider>
               </div>
             </div>
-            {/* Environment, permissions, and worktree controls share the same
-              lower row as attach, harness, microphone, and submit. */}
+            {/* Compact host and permission controls continue after attach in
+                the same visual action row. */}
             <div
-              className="pointer-events-none absolute right-28 bottom-2 left-10 z-20 flex h-8 min-w-0 items-center overflow-hidden sm:right-48 md:right-72 lg:right-80"
-              data-testid="new-chat-landing-footer"
+              className="pointer-events-none absolute right-44 bottom-2 left-10 z-20 flex h-8 min-w-0 items-center overflow-hidden sm:right-56 md:right-64"
+              data-testid="new-chat-landing-left-controls"
             >
               <div className="pointer-events-auto flex min-w-0 items-center gap-0.5 overflow-hidden">
                 {/* Host chip */}
@@ -5139,21 +5148,30 @@ export function NewChatLandingScreen() {
                           ? `, ${selectedHost.status === "online" ? "Online" : "Offline"}`
                           : ""
                       }`}
-                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg px-1.5 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground dark:hover:bg-muted/50"
                       data-testid="new-chat-landing-host-chip"
                     >
-                      {selectedHost?.status === "online" && !sandboxSelected ? (
-                        <>
-                          <span aria-hidden className="size-2 shrink-0 rounded-full bg-success" />
-                          <span className="sr-only">Online</span>
-                        </>
-                      ) : isCloudHost ? (
-                        <MonitorCloudIcon className="ui-icon" />
+                      <span
+                        aria-hidden
+                        className={`size-2 shrink-0 rounded-full ${
+                          selectedHost?.status === "online" && !sandboxSelected
+                            ? "bg-success"
+                            : "bg-muted-foreground/40"
+                        }`}
+                        data-testid="new-chat-landing-host-status"
+                      />
+                      {isCloudHost ? (
+                        <MonitorCloudIcon
+                          className="size-[18px] shrink-0"
+                          data-testid="new-chat-landing-host-icon"
+                        />
                       ) : (
-                        <MonitorIcon className="ui-icon" />
+                        <MonitorIcon
+                          className="size-[18px] shrink-0"
+                          data-testid="new-chat-landing-host-icon"
+                        />
                       )}
-                      <span className="hidden max-w-32 truncate text-sm lg:block">{hostLabel}</span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                      <span className="sr-only">{hostLabel}</span>
                     </button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="start" className="min-w-52">
@@ -5321,11 +5339,11 @@ export function NewChatLandingScreen() {
                     <DropdownMenuTrigger asChild>
                       <button
                         type="button"
-                        className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg px-2 text-sm font-normal text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
+                        className="flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg bg-muted/70 px-2 text-sm font-normal text-foreground transition-colors hover:bg-muted dark:bg-muted/50 dark:hover:bg-muted/70"
                         aria-label={`${permissionConfigRow.label}: ${permissionConfigRow.value}`}
                         data-testid="new-chat-landing-permission-chip"
                       >
-                        <ShieldIcon className="ui-icon shrink-0" />
+                        <HandIcon className="size-4 shrink-0" />
                         <span className="hidden max-w-28 truncate text-sm sm:block">
                           {permissionConfigRow.value}
                         </span>
@@ -5434,6 +5452,7 @@ export function NewChatLandingScreen() {
                     <PopoverTrigger asChild>
                       <button
                         type="button"
+                        hidden
                         aria-label={`Worktree: ${branchName.trim() || "None"}`}
                         className="flex h-6 min-w-0 max-w-40 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                         data-testid="new-chat-landing-branch-chip"
@@ -5601,10 +5620,8 @@ export function NewChatLandingScreen() {
                 is shown in the hero heading instead of a tray chip; filing on
                 create still uses `selectedProject`. */}
               </div>
-              {/* The agent / harness picker moved out of the tray and into the
-                composer's right action cluster (next to Send) — see
-                AgentHarnessPicker above. The tray now holds only the
-                host / working-directory / worktree / project chips. */}
+              {/* Harness/model/effort, voice, and submit remain in the right
+                  action cluster above. */}
             </div>
           </form>
           <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
