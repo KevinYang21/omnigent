@@ -19,11 +19,13 @@ network), and assert:
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -112,14 +114,20 @@ def _run_osv_step(tmp_path: Path) -> tuple[subprocess.CompletedProcess[str], Pat
 
     # GitHub runs `run:` blocks with `bash -e`; working-directory is the PR
     # head checkout, which for this test is the repo root itself.
-    proc = subprocess.run(
-        ["bash", "-e", "-c", _osv_step_body()],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
+    # The step body hard-codes /tmp output paths, so serialize replays with an
+    # inter-process lock — xdist workers running two of these tests
+    # concurrently would otherwise clobber each other's requirement files.
+    lock_path = Path(tempfile.gettempdir()) / "osv-step-replay.lock"
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        proc = subprocess.run(
+            ["bash", "-e", "-c", _osv_step_body()],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
     return proc, capture
 
 
