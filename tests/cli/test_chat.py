@@ -273,7 +273,7 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
             del path
             http_calls["count"] += 1
             if http_calls["count"] < 3:
-                raise __import__("httpx").ConnectError("not ready")
+                raise httpx.ConnectError("not ready")
             return _Resp(200)
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
