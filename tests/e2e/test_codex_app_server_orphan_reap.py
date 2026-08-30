@@ -154,16 +154,20 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _find_codex_app_server_pids() -> list[int]:
+def _find_codex_app_server_pids(workspace: Path) -> list[int]:
     """
-    Find live ``codex app-server`` processes by their crash-teardown tag.
+    Find THIS session's live ``codex app-server`` process(es).
 
     Every host-spawned codex-native app-server embeds a unique
-    ``omnigent_crash_teardown_tag=...`` marker in its command line, so
-    scanning /proc for it finds exactly the processes this feature owns.
+    ``omnigent_crash_teardown_tag=...`` marker in its command line and runs
+    with the session workspace as its cwd. Matching both keys the scan to
+    exactly this test's session, so a parallel opt-in run (which uses its
+    own tmp workspace) can never be picked up — or killed — by this test.
 
-    :returns: PIDs of live tagged codex app-server processes.
+    :param workspace: The session workspace the app-server was launched in.
+    :returns: PIDs of this session's live tagged app-server processes.
     """
+    resolved_workspace = workspace.resolve()
     pids: list[int] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -175,9 +179,10 @@ def _find_codex_app_server_pids() -> list[int]:
                 .replace(b"\x00", b" ")
                 .decode("utf-8", errors="replace")
             )
+            cwd = Path(os.readlink(entry / "cwd")).resolve()
         except OSError:
             continue
-        if _TAG_ARG_PREFIX in cmdline and "app-server" in cmdline:
+        if _TAG_ARG_PREFIX in cmdline and "app-server" in cmdline and cwd == resolved_workspace:
             pids.append(int(entry.name))
     return pids
 
@@ -277,7 +282,6 @@ def test_unclean_runner_death_reaps_codex_app_server(
 
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        baseline = set(_find_codex_app_server_pids())
 
         create = http_client.post(
             "/v1/sessions",
@@ -296,10 +300,11 @@ def test_unclean_runner_death_reaps_codex_app_server(
             timeout=120.0,
         )
 
-        # Identify this session's app-server by its crash-teardown tag.
+        # Identify this session's app-server by tag + workspace cwd, so a
+        # parallel run's app-server can never be matched (or killed) here.
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
-            app_server_pids = [pid for pid in _find_codex_app_server_pids() if pid not in baseline]
+            app_server_pids = _find_codex_app_server_pids(workspace)
             if app_server_pids:
                 break
             time.sleep(POLL_INTERVAL_S)

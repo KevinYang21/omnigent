@@ -227,7 +227,11 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     registry write defers the signal to a later pass. Escalation SIGKILLs
     exactly the identity-verified recorded members. On subreaper hosts
     this path is the fallback tier — the host's adopted-orphan reaper
-    owns whole-tree draining the moment the runner dies.
+    owns whole-tree draining the moment the runner dies. Without a
+    subreaper (e.g. macOS) a child forked AFTER the member snapshot has
+    no provable owner once the recorded members exit, so it is retained
+    and logged rather than guessed at — killing an unverifiable pgid
+    could hit a recycled group's strangers.
 
     :param registry_path: Test override for the registry file path.
     :returns: Number of process groups signaled this pass.
