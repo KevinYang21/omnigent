@@ -221,7 +221,8 @@ def test_session_row_swipe_shows_affordance(
 
         page.wait_for_timeout(400)
         moved = page.evaluate(
-            "() => { cancelAnimationFrame(window.__swipeProbe.raf); return window.__swipeProbe.moved; }"
+            "() => { cancelAnimationFrame(window.__swipeProbe.raf);"
+            " return window.__swipeProbe.moved; }"
         )
         assert moved or archive_requests, (
             "horizontal swipe on the session row produced no swipe response: the row "
