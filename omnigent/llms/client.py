@@ -114,16 +114,12 @@ async def _stream_with_reasoning_effort_fallback(
         timeout=timeout,
     )
     assert not isinstance(retry_chunks, dict)
-    recorded = False
     async for chunk in retry_chunks:
-        if not recorded:
-            # The stripped retry opened cleanly (a stream-open 400 would
-            # have raised before the first chunk), so the rejection is
-            # real — learn it. A retry that fails learns nothing, so a
-            # 400 that merely looked like a param rejection self-corrects.
-            record_reasoning_effort_rejection(provider, model)
-            recorded = True
         yield chunk
+    # The stripped retry streamed to completion, so the rejection is
+    # real — learn it. A retry that fails learns nothing, so a 400 that
+    # merely looked like a param rejection self-corrects.
+    record_reasoning_effort_rejection(provider, model)
 
 
 class _ResponsesNamespace:

@@ -1198,6 +1198,11 @@ async def test_streaming_param_rejection_strips_and_retries(
     assert captured[0].get("reasoning_effort") == "low"
     assert "reasoning_effort" not in captured[1]
 
+    # The completed stripped retry learned the rejection.
+    from omnigent.llms.reasoning_effort_support import accepts_reasoning_effort
+
+    assert not accepts_reasoning_effort("xai", "grok-new")
+
 
 @pytest.mark.asyncio
 async def test_streaming_mid_stream_failure_not_retried(

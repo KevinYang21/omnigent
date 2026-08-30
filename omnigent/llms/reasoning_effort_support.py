@@ -55,15 +55,31 @@ def accepts_reasoning_effort(provider: str, model: str) -> bool:
     return key not in _SEED_REJECTIONS and key not in _learned_rejections
 
 
+# Capability-rejection phrasings. A bare "support" is not enough: a
+# *value*-validation 400 ("reasoning_effort must be one of the supported
+# values: ...") also mentions support, and stripping the param there
+# would mask the caller's error and durably disable a supported
+# capability (the stripped retry succeeds, so the learn-after-retry
+# guard cannot catch it).
+_CAPABILITY_REJECTION_PHRASES = ("not supported", "does not support", "unsupported")
+
+# Phrasings that mark a *value* rejection even when a capability phrase
+# also appears (e.g. "Unsupported value 'xhigh' for reasoning_effort").
+_VALUE_REJECTION_PHRASES = ("value", "must be one of")
+
+
 def is_reasoning_effort_rejection(exc: Exception) -> bool:
     """Detect a provider 400 that rejects the ``reasoning_effort`` param.
 
-    Observed bodies name the parameter and say it is unsupported:
-    ``"Argument not supported on this model: reasoning_effort"`` and
-    ``"Model ... does not support parameter reasoningEffort"``. Both
-    the snake_case and camelCase spellings are matched, and the body
-    must also mention support so an unrelated 400 that merely echoes
-    the request is not treated as a capability rejection.
+    Observed bodies name the parameter and say the *parameter* is
+    unsupported: ``"Argument not supported on this model:
+    reasoning_effort"`` and ``"Model ... does not support parameter
+    reasoningEffort"``. Both the snake_case and camelCase spellings are
+    matched, and the body must carry a capability-rejection phrase
+    ("not supported" / "does not support" / "unsupported") so neither
+    an unrelated 400 that merely echoes the request nor a *value*
+    rejection ("must be one of the supported values") triggers the
+    fallback.
 
     :param exc: The exception raised by the provider call.
     :returns: ``True`` when the fallback should strip and retry.
@@ -76,9 +92,11 @@ def is_reasoning_effort_rejection(exc: Exception) -> bool:
         body = exc.response.text.lower()
     except Exception:  # an unreadable body is not a param rejection
         return False
-    return "reasoning_effort" in body.replace("reasoningeffort", "reasoning_effort") and (
-        "support" in body
-    )
+    if "reasoning_effort" not in body.replace("reasoningeffort", "reasoning_effort"):
+        return False
+    if any(phrase in body for phrase in _VALUE_REJECTION_PHRASES):
+        return False
+    return any(phrase in body for phrase in _CAPABILITY_REJECTION_PHRASES)
 
 
 def record_reasoning_effort_rejection(provider: str, model: str) -> None:

@@ -104,6 +104,14 @@ def test_param_rejection_bodies_detected(body: str) -> None:
         (400, '{"error": "messages: field required"}'),
         # 400 that echoes the param without a support complaint.
         (400, '{"error": "invalid value for reasoning_effort: bogus"}'),
+        # Value rejection — the *effort value* is wrong, not the
+        # capability; stripping would mask the caller's error and the
+        # successful stripped retry would durably disable the param.
+        (400, '{"error": "reasoning_effort must be one of the supported values: low, high"}'),
+        (400, '{"error": "Unsupported value \'xhigh\' for reasoning_effort."}'),
+        # Body that echoes the param and mentions support of something
+        # else without a capability-rejection phrase.
+        (400, '{"error": "reasoning_effort requires a supporting beta header"}'),
         # Right body, wrong status — not a capability rejection.
         (503, '{"error": "Argument not supported on this model: reasoning_effort"}'),
     ],
