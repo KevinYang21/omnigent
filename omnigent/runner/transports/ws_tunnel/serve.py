@@ -83,7 +83,8 @@ _MAX_RECONNECT_DELAY_S = 10.0
 # escalate to the 10 s cap here leaves a multi-second dead tail
 # between "server finally ready" and "runner notices", which under
 # load is the difference between a boot fitting its launch budget
-# and starving past it.
+# and starving past it. The cap applies pre-jitter: ±50% jitter can
+# stretch an individual boot-phase sleep to ~3 s.
 _MAX_INITIAL_CONNECT_DELAY_S = 2.0
 _RECONNECT_JITTER_FRACTION = 0.5
 _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}

@@ -72,6 +72,11 @@ _PROMPT_READY_BUDGET_S = 60.0
 _CONCURRENT_BOOTS = 4
 _BURNERS_PER_CORE = 3
 
+# Burner child: peg one core, but self-exit if this test process is
+# SIGKILL'd (reparenting changes getppid), so burners never outlive a
+# hard-killed run.
+_BURNER_SRC = "import os\np = os.getppid()\nwhile os.getppid() == p:\n    pass\n"
+
 
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences before substring search."""
@@ -125,6 +130,18 @@ def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
     }
     for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE", "CLAUDECODE", "CODEX", "DATABRICKS_TOKEN"):
         env.pop(k, None)
+    # A REPL spawned from inside a hosted Omnigent runner inherits that
+    # runner's identity/tunnel env, which silently rewires the fresh boot
+    # this test must perform. Strip every runner-scoped ambient so the
+    # boot is hermetic wherever the test runs.
+    runner_ambients = {
+        "OMNIGENT",
+        "OMNIGENT_USER_ID",
+        "OMNIGENT_PROCESS_LOG_FILE",
+        "RUNNER_SERVER_URL",
+    }
+    for k in [k for k in env if k.startswith("OMNIGENT_RUNNER") or k in runner_ambients]:
+        env.pop(k, None)
     return env
 
 
@@ -155,11 +172,17 @@ def test_repl_boot_reaches_prompt_ready_under_full_shard_load(
     load (or the CLI aborts its own boot first with ``Server failed
     to start``), while the identical boot takes ~12s unloaded.
     """
+    if os.environ.get("PYTEST_XDIST_WORKER_COUNT", "1") != "1":
+        pytest.skip(
+            "pegs every core with CPU burners; run standalone (see module "
+            "docstring), not inside a parallel xdist shard where it would "
+            "starve co-located workers"
+        )
     reset_mock_llm(mock_llm_server_url)
 
     ncpu = os.cpu_count() or 2
     burners = [
-        subprocess.Popen([sys.executable, "-c", "while True: pass"])
+        subprocess.Popen([sys.executable, "-c", _BURNER_SRC])
         for _ in range(ncpu * _BURNERS_PER_CORE)
     ]
     children: list[Any] = []
