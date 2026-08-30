@@ -7228,8 +7228,16 @@ def _default_compaction_llm_config(spec: AgentSpec) -> LLMConfig | None:
     if family is not None:
         try:
             model = _catalog_default_model(family)
-        except OmnigentError:
-            pass
+        except Exception:
+            # Any tier-1 failure (unknown family, no compatible catalog entry,
+            # or a transient discovery error) falls through to the server-level
+            # llm: safety net rather than surfacing as a 500.
+            _logger.debug(
+                "catalog default model resolution failed for family %r; "
+                "falling back to the server-level llm config",
+                family,
+                exc_info=True,
+            )
         else:
             return LLMConfig(model=model, connection=spec.executor.connection)
     server_llm = get_caps().llm

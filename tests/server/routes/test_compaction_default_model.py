@@ -70,6 +70,38 @@ def test_executor_type_spelling_maps_to_family(monkeypatch: pytest.MonkeyPatch) 
     assert cfg.model == "gpt-default"
 
 
+def test_family_default_resolves_for_anthropic_sdk_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An anthropic-family harness gets the anthropic catalog default —
+    the resolution is family-generic, not openai-specific."""
+    _patch_catalog(monkeypatch, {"anthropic": "claude-default"})
+    _patch_server_llm(monkeypatch, None)
+
+    cfg = _default_compaction_llm_config(_spec("claude_sdk"))
+
+    assert cfg is not None
+    assert cfg.model == "claude-default"
+
+
+def test_server_llm_fallback_on_transient_catalog_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-OmnigentError catalog failure (e.g. a transient discovery
+    error) still falls through to the server ``llm:`` tier, not a 500."""
+
+    def _boom(family: str) -> str:
+        raise RuntimeError("catalog discovery blew up")
+
+    monkeypatch.setattr("omnigent.runtime.workflow._catalog_default_model", _boom)
+    server_llm = LLMConfig(model="server-model")
+    _patch_server_llm(monkeypatch, server_llm)
+
+    cfg = _default_compaction_llm_config(_spec("openai-agents"))
+
+    assert cfg is server_llm
+
+
 def test_server_llm_fallback_when_catalog_has_no_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
