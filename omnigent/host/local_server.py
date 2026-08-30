@@ -659,7 +659,8 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     db_uri = os.environ.get("OMNIGENT_DATABASE_URI") or f"sqlite:///{db_path}"
     if db_uri.startswith(("postgres://", "postgresql://")):
         # Canonicalize to the psycopg 3 dialect like the Docker entrypoint
-        # does. Imported lazily: db.utils pulls SQLAlchemy onto the CLI path.
+        # does; an explicit +psycopg2 dialect is respected as user intent.
+        # Imported lazily: db.utils pulls SQLAlchemy onto the CLI path.
         from omnigent.db.utils import normalize_database_url
 
         db_uri = normalize_database_url(db_uri)
