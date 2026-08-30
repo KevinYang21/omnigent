@@ -154,15 +154,48 @@ def test_workspace_validation_accepts_windows_drive_paths() -> None:
     A bare ``workspace.startswith('/')`` check rejects every Windows
     workspace (e.g. ``D:\\myproject``) with HTTP 400
     "workspace must be an absolute path starting with /".
+
+    Drives the real ``validate_workspace`` entry point (not a re-derived
+    expression) with an empty host registry: an absolute Windows path must get
+    PAST the absoluteness check (failing later on the offline host), while a
+    relative path must be rejected by the absoluteness check itself.
     """
-    from omnigent.server.routes._workspace_validation import _is_windows_absolute_path
+    import asyncio
+
+    from omnigent.server.routes._workspace_validation import (
+        WorkspaceValidationError,
+        validate_workspace,
+    )
+
+    class _EmptyRegistry:
+        def get(self, host_id: str) -> None:
+            return None
+
+    def _rejection(workspace: str) -> str:
+        try:
+            asyncio.run(
+                validate_workspace(
+                    host_registry=_EmptyRegistry(),
+                    host_id="host_missing",
+                    workspace=workspace,
+                    spec_cwd=None,
+                )
+            )
+        except WorkspaceValidationError as exc:
+            return str(exc)
+        return ""
 
     for workspace in ("D:\\myproject", "C:\\Users\\dev\\proj", "C:/Users/dev/proj"):
-        accepted = workspace.startswith("/") or _is_windows_absolute_path(workspace)
-        assert accepted, f"absolute Windows workspace rejected: {workspace!r}"
+        message = _rejection(workspace)
+        assert "absolute path" not in message, (
+            f"absolute Windows workspace rejected as non-absolute: {workspace!r}: {message}"
+        )
+        assert "offline" in message, f"expected the offline-host failure, got: {message!r}"
     for workspace in ("myproject", "relative\\path"):
-        accepted = workspace.startswith("/") or _is_windows_absolute_path(workspace)
-        assert not accepted, f"relative workspace accepted: {workspace!r}"
+        message = _rejection(workspace)
+        assert "absolute path" in message, (
+            f"relative workspace passed the absoluteness check: {workspace!r}: {message!r}"
+        )
 
 
 def test_host_daemon_env_preserves_pythonutf8(
