@@ -970,6 +970,21 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
         for tier in ("opus", "sonnet", "haiku", "fable"):
             servable = families.get(tier)
             if servable:
+                # Warn, not info: the session pinned no model, so this pick is
+                # a substitution the user never made — and the precedence
+                # prefers the most expensive family the workspace serves.
+                # Without a WARNING the divergence is only visible in gateway
+                # billing (cursor's _resolve_model warns in the equivalent
+                # silently-not-honored situation).
+                logger.warning(
+                    "claude-sdk: no model pinned for this session; resolved %r "
+                    "from the %r workspace catalog (%s precedence). Pin a model "
+                    "in the agent spec or dispatch to control which endpoint "
+                    "is billed.",
+                    servable,
+                    profile or "DEFAULT",
+                    " > ".join(("opus", "sonnet", "haiku", "fable")),
+                )
                 return servable
     except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
         logger.warning(
@@ -978,7 +993,14 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
             profile,
             exc_info=True,
         )
-    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    resolved = model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    logger.warning(
+        "claude-sdk: no model pinned for this session; resolved %r from the "
+        "bundled catalog. Pin a model in the agent spec or dispatch to "
+        "control which endpoint is billed.",
+        resolved,
+    )
+    return resolved
 
 
 def _resolve_gateway_env(

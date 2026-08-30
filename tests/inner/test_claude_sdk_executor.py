@@ -762,6 +762,69 @@ class TestConstructor(unittest.TestCase):
 
         _run(_t())
 
+    def test_databricks_profile_model_substitution_warns(self):
+        """An unpinned session's silent model pick must emit a WARNING.
+
+        The resolver walks an opus-first precedence, so a session that pins
+        no model is routed to the most expensive endpoint the workspace
+        serves — acceptable only when observable. The WARNING must name the
+        substituted model id, so "UI shows one model, billing shows Opus"
+        is explainable from the logs.
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+        with (
+            patch(
+                "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                return_value=SimpleNamespace(
+                    host="https://example.cloud.databricks.com", token="dapi_test_token"
+                ),
+            ),
+            patch(
+                "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                return_value=SimpleNamespace(
+                    families={
+                        "sonnet": "system.ai.claude-sonnet-5",
+                        "opus": "system.ai.claude-opus-5",
+                    }
+                ),
+            ),
+            self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+        ):
+            resolved = _resolve_databricks_claude_model("repro")
+
+        self.assertEqual(resolved, "system.ai.claude-opus-5")
+        self.assertTrue(
+            any("system.ai.claude-opus-5" in message for message in logs.output),
+            f"no WARNING names the substituted model: {logs.output}",
+        )
+
+    def test_databricks_catalog_fallback_substitution_warns(self):
+        """The bundled-catalog fallback is also a substitution; it must warn."""
+        from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+        with (
+            patch(
+                "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                side_effect=RuntimeError("live listing unavailable"),
+            ),
+            patch(
+                "omnigent.model_catalog.resolve_catalog_model",
+                return_value=SimpleNamespace(model_id="databricks-claude-default"),
+            ),
+            self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+        ):
+            resolved = _resolve_databricks_claude_model("repro")
+
+        self.assertEqual(resolved, "databricks-claude-default")
+        self.assertTrue(
+            any(
+                "databricks-claude-default" in message and "bundled catalog" in message
+                for message in logs.output
+            ),
+            f"no WARNING names the catalog-fallback model: {logs.output}",
+        )
+
     def test_neutral_gateway_no_model_does_not_inject_databricks_default(self):
         """Neutral gateway (base URL supplied directly) + no model → ``None``.
 
