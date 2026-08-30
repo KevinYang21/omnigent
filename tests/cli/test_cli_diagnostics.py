@@ -539,54 +539,54 @@ def test_prune_old_logs_survives_file_vanishing_mid_sort(
     assert len(surviving) == cli_diagnostics.MAX_LOG_FILES  # newest kept, oldest pruned
 
 
-def test_suppresses_setup_hint_for_import_errors() -> None:
+def test_suppresses_recovery_hint_for_import_errors() -> None:
     """
     A missing dependency (ImportError / ModuleNotFoundError) is never fixed by
-    the model-credential wizard, so the setup hint must be withheld.
+    stopping stale hosts, so the recovery hint must be withheld.
     """
-    assert cli_diagnostics.suppresses_setup_hint(ImportError("no module")) is True
+    assert cli_diagnostics.suppresses_recovery_hint(ImportError("no module")) is True
     assert (
-        cli_diagnostics.suppresses_setup_hint(
+        cli_diagnostics.suppresses_recovery_hint(
             ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
         )
         is True
     )
 
 
-def test_suppresses_setup_hint_honors_marker_attribute() -> None:
+def test_suppresses_recovery_hint_honors_marker_attribute() -> None:
     """
-    Any exception may opt out of the setup hint by carrying the marker
+    Any exception may opt out of the recovery hint by carrying the marker
     attribute — this keeps ``cli_diagnostics`` decoupled from the modules that
     raise server-startup / dependency errors.
     """
 
     class _Marked(Exception):
-        omnigent_suppress_setup_hint = True
+        omnigent_suppress_recovery_hint = True
 
-    assert getattr(_Marked, cli_diagnostics.SUPPRESS_SETUP_HINT_ATTR) is True
-    assert cli_diagnostics.suppresses_setup_hint(_Marked()) is True
+    assert getattr(_Marked, cli_diagnostics.SUPPRESS_RECOVERY_HINT_ATTR) is True
+    assert cli_diagnostics.suppresses_recovery_hint(_Marked()) is True
 
 
 def test_local_server_startup_error_suppresses_hint() -> None:
     """
     The real ``LocalServerStartupError`` carries the marker, so a crashed
-    background server does not trigger the misleading "run omnigent setup" hint.
+    background server does not trigger the misleading stale-host hint.
     """
     from omnigent.host.local_server import LocalServerStartupError
 
     err = LocalServerStartupError("server failed to start")
-    assert cli_diagnostics.suppresses_setup_hint(err) is True
+    assert cli_diagnostics.suppresses_recovery_hint(err) is True
 
 
 def test_does_not_suppress_hint_for_ordinary_errors() -> None:
     """
-    Ordinary errors (including a plain ClickException) keep the setup hint —
-    the dominant real-world cause is still a missing/misconfigured credential.
+    Ordinary errors (including a plain ClickException) keep the recovery
+    hint — a stale host process remains a plausible cause for those.
     """
     import click
 
-    assert cli_diagnostics.suppresses_setup_hint(RuntimeError("boom")) is False
-    assert cli_diagnostics.suppresses_setup_hint(click.ClickException("bad")) is False
+    assert cli_diagnostics.suppresses_recovery_hint(RuntimeError("boom")) is False
+    assert cli_diagnostics.suppresses_recovery_hint(click.ClickException("bad")) is False
 
 
 def test_daemon_exit_error_carries_server_log_tail(
@@ -685,14 +685,14 @@ def test_redact_secrets_scrubs_url_userinfo() -> None:
     assert "db.example:5432/omnigent" in scrubbed  # target stays readable
 
 
-def test_main_surfaces_install_command_on_stderr_without_setup_hint(
+def test_main_surfaces_install_command_on_stderr_without_recovery_hint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
     Foreground acceptance, part 2 (top-level ``main()``): the terminal output
     for a daemon-startup failure must contain the corrective install command
-    and must NOT contain the "run `omnigent setup`" hint — the wizard cannot
-    install a missing dependency.
+    and must NOT contain the stale-host recovery hint — `omnigent stop`
+    cannot install a missing dependency.
     """
     import contextlib
     import io
@@ -720,4 +720,4 @@ def test_main_surfaces_install_command_on_stderr_without_setup_hint(
     assert excinfo.value.code == 1
     output = stderr.getvalue()
     assert "omnigent[postgres]" in output  # corrective command reaches the terminal
-    assert "auth or configuration problem" not in output  # no misleading hint
+    assert "stale host processes" not in output  # no misleading recovery hint

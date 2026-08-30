@@ -439,33 +439,35 @@ def print_stale_host_hint() -> None:
     )
 
 
-#: Attribute an exception may carry to opt out of the ``omnigent setup``
-#: recovery hint. Any exception type that represents a failure the setup
-#: wizard cannot fix (a missing dependency, a failed background server) can
-#: set this to ``True`` — keeps :mod:`cli_diagnostics` decoupled from the
-#: modules that raise those errors.
-SUPPRESS_SETUP_HINT_ATTR = "omnigent_suppress_setup_hint"
+#: Attribute an exception may carry to opt out of the stale-host recovery
+#: hint (:func:`print_stale_host_hint`). Any exception type representing a
+#: failure that hint cannot fix (a missing dependency, a failed background
+#: server whose real cause is already surfaced inline) can set this to
+#: ``True`` — keeps :mod:`cli_diagnostics` decoupled from the modules that
+#: raise those errors.
+SUPPRESS_RECOVERY_HINT_ATTR = "omnigent_suppress_recovery_hint"
 
 
-def suppresses_setup_hint(exc: BaseException) -> bool:
+def suppresses_recovery_hint(exc: BaseException) -> bool:
     """
-    Report whether the ``omnigent setup`` hint should be withheld for *exc*.
+    Report whether the stale-host recovery hint should be withheld for *exc*.
 
-    The setup hint (:func:`print_setup_hint`) assumes the dominant CLI
-    failure is a missing model credential. That is misleading for whole
-    classes of error the wizard cannot fix — a missing Python dependency
-    (e.g. the ``psycopg`` Postgres driver) or a background local server that
-    crashed for a non-credential reason. Suppressing the hint for those keeps
-    the surfaced error pointing at the real fix.
+    The hint (:func:`print_stale_host_hint`) assumes the failure may be a
+    runner tunnel rejection caused by stale host processes. That is
+    misleading for whole classes of error ``omnigent stop`` cannot fix — a
+    missing Python dependency (e.g. the ``psycopg`` Postgres driver) or a
+    background local server that crashed with its real cause already
+    surfaced inline. Suppressing the hint for those keeps the error
+    pointing at the real fix.
 
     :param exc: The exception about to be surfaced by :func:`omnigent.cli.main`.
     :returns: ``True`` when the hint should be suppressed — either *exc* is an
         :class:`ImportError` (missing dependency) or it carries a truthy
-        :data:`SUPPRESS_SETUP_HINT_ATTR` marker.
+        :data:`SUPPRESS_RECOVERY_HINT_ATTR` marker.
     """
     if isinstance(exc, ImportError):
         return True
-    return bool(getattr(exc, SUPPRESS_SETUP_HINT_ATTR, False))
+    return bool(getattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, False))
 
 
 def log_cli_exception(exc: BaseException, *, prefix: str = "CLI error") -> None:

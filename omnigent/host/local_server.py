@@ -61,20 +61,20 @@ class LocalServerStartupError(click.ClickException):
     The background local Omnigent server failed to start or become ready.
 
     A dedicated :class:`click.ClickException` subclass so the top-level CLI
-    can tell a server-startup failure apart from a genuine credential
-    problem: the real cause (a missing dependency, a port conflict, a schema
-    mismatch) lives in the server log, and ``omnigent setup`` cannot fix it.
-    The class-level marker (read by
-    :func:`omnigent.cli_diagnostics.suppresses_setup_hint`) suppresses the
-    otherwise-misleading "run `omnigent setup`" recovery hint. Kept a
+    can tell a server-startup failure apart from a stale-host tunnel
+    rejection: the real cause (a missing dependency, a port conflict, a
+    schema mismatch) lives in the server log, and ``omnigent stop`` cannot
+    fix it. The class-level marker (read by
+    :func:`omnigent.cli_diagnostics.suppresses_recovery_hint`) suppresses
+    the otherwise-misleading stale-host recovery hint. Kept a
     ``ClickException`` so existing ``except click.ClickException`` handlers
     (e.g. in :func:`ensure_local_omnigent_server`) still catch it and its
     exit-code / ``show()`` behavior is unchanged.
     """
 
-    #: Read duck-typed by ``cli_diagnostics.suppresses_setup_hint`` — see
-    #: ``cli_diagnostics.SUPPRESS_SETUP_HINT_ATTR``.
-    omnigent_suppress_setup_hint = True
+    #: Read duck-typed by ``cli_diagnostics.suppresses_recovery_hint`` — see
+    #: ``cli_diagnostics.SUPPRESS_RECOVERY_HINT_ATTR``.
+    omnigent_suppress_recovery_hint = True
 
 
 def _local_data_dir() -> Path:
