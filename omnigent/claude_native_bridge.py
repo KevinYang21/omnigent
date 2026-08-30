@@ -3377,7 +3377,7 @@ def inject_slash_command(
     bridge_dir: Path,
     *,
     command: str,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    timeout_s: float | None = None,
     auto_confirm: bool = False,
     confirm_hint: str | None = None,
 ) -> None:
@@ -3394,6 +3394,10 @@ def inject_slash_command(
     :param command: Single-line slash command including the leading
         ``/``, e.g. ``"/effort high"``.
     :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``.
+        ``None`` (the default) uses the same operator-configurable budget
+        as :func:`inject_user_message` — a routed ``/model`` switch runs
+        on the same slowly-rendering pane right before the message, so
+        it must honor the same readiness override.
     :param auto_confirm: If ``True``, accept the default option of the TUI
         confirmation dialog the command pops (e.g. ``/effort`` when
         switching invalidates the prompt cache). HACK — the chat UI has no
@@ -3417,6 +3421,8 @@ def inject_slash_command(
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
         raise ValueError("slash command must be a single line")
+    if timeout_s is None:
+        timeout_s = _delivery_ready_timeout_s()
     dialog_hint: str | None = None
     if auto_confirm:
         if not confirm_hint:

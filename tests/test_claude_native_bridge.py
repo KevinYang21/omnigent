@@ -3807,6 +3807,49 @@ def test_delivery_ready_timeout_defaults_when_env_unset(
     )
 
 
+def test_inject_slash_command_default_ready_budget_honors_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``OMNIGENT_CLAUDE_READY_TIMEOUT_S`` also governs the slash-command budget.
+
+    A routed ``/model`` switch runs on the same slowly-rendering pane
+    right before the message inject, so a raised readiness budget must
+    reach it too — otherwise a model-routing turn still trips the built-in
+    wall before the message's raised budget is ever consulted. A missing
+    ``tmux.json`` with a small override times out at the override, not at
+    the 30s constant.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_READY_TIMEOUT_S", "0.2")
+    bridge_dir = tmp_path / "bridge"
+    started = time.monotonic()
+    # Deliberately no ``timeout_s=``: the executor's routed ``/model``
+    # switch calls it this way, and the override must apply exactly there.
+    with pytest.raises(claude_native_bridge.TmuxSessionNotAdvertised):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/model opus")
+    assert time.monotonic() - started < 5.0, (
+        "the env override was not honored; the slash command waited on the hardcoded budget"
+    )
+
+
+def test_inject_slash_command_explicit_timeout_wins_over_env_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-supplied ``timeout_s`` is not overridden by the environment."""
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_READY_TIMEOUT_S", "90")
+    bridge_dir = tmp_path / "bridge"
+    started = time.monotonic()
+    with pytest.raises(claude_native_bridge.TmuxSessionNotAdvertised):
+        claude_native_bridge.inject_slash_command(
+            bridge_dir, command="/model opus", timeout_s=0.2
+        )
+    assert time.monotonic() - started < 5.0
+
+
 def test_inject_interrupt_sends_escape_keystroke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
