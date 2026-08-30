@@ -28,7 +28,6 @@ additionally proves the exec form for real by spawning the prepared path.
 
 from __future__ import annotations
 
-import os
 import pathlib
 import subprocess
 import sys
@@ -60,7 +59,7 @@ def _windows_jobobject_spec(cwd: pathlib.Path) -> OSEnvSpec:
 
 
 def _prepare_cli_for_windows_backend(
-    real_cli_path: str, cwd: pathlib.Path
+    real_cli_path: str, cwd: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[str | None, bool]:
     """Run the real ``prepare_claude_cli_path`` resolve path for the Windows backend.
 
@@ -73,18 +72,17 @@ def _prepare_cli_for_windows_backend(
     spec = _windows_jobobject_spec(cwd)
     # An ambient sandbox bypass would short-circuit prepare_claude_cli_path
     # before the backend branch under test, masking the regression.
-    with patch.dict(os.environ):
-        os.environ.pop("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", None)
-        if sys.platform == "win32":
+    monkeypatch.delenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", raising=False)
+    if sys.platform == "win32":
+        prepared = prepare_claude_cli_path(real_cli_path, spec)
+    else:
+        with patch.object(windows_jobobject, "os_name", lambda: "nt"):
             prepared = prepare_claude_cli_path(real_cli_path, spec)
-        else:
-            with patch.object(windows_jobobject, "os_name", lambda: "nt"):
-                prepared = prepare_claude_cli_path(real_cli_path, spec)
     return prepared.cli_path, prepared.enable_native_tools
 
 
 def test_prepare_claude_cli_path_never_returns_dot_py_for_windows_jobobject(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The CLI path handed to the Claude Agent SDK must be Windows-executable.
 
@@ -93,7 +91,7 @@ def test_prepare_claude_cli_path_never_returns_dot_py_for_windows_jobobject(
     WinError 193, killing every claude-sdk session before connect.
     """
     real_cli = sys.executable  # stands in for the installed Claude CLI binary
-    cli_path, _native_tools = _prepare_cli_for_windows_backend(real_cli, tmp_path)
+    cli_path, _native_tools = _prepare_cli_for_windows_backend(real_cli, tmp_path, monkeypatch)
 
     assert cli_path is not None
     suffix = pathlib.Path(cli_path).suffix.lower()
@@ -115,7 +113,7 @@ def test_prepare_claude_cli_path_never_returns_dot_py_for_windows_jobobject(
 
 @pytest.mark.windows_only
 def test_prepared_cli_path_is_spawnable_on_native_windows(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Spawning the prepared CLI path must not raise WinError 193.
 
@@ -125,7 +123,7 @@ def test_prepared_cli_path_is_spawnable_on_native_windows(
     prepared path is a Python source file.
     """
     real_cli = sys.executable  # a known-good Windows .exe standing in for claude
-    cli_path, _native_tools = _prepare_cli_for_windows_backend(real_cli, tmp_path)
+    cli_path, _native_tools = _prepare_cli_for_windows_backend(real_cli, tmp_path, monkeypatch)
     assert cli_path is not None
 
     try:
