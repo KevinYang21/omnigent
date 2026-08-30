@@ -2214,7 +2214,8 @@ async def _persist_external_conversation_item(
     # Claude (not a queued web message) and has no pending entry, so
     # draining for it would hand the queued message's uploads to the marker.
     cleared_pending_id: str | None = None
-    skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
+    skipped_kiro_pending: list[Any] = []
+    durable_pending = False
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2224,14 +2225,32 @@ async def _persist_external_conversation_item(
     ):
         if _is_kiro_native_session(conv):
             text = _message_text(item.data.content) or ""
-            matched = pending_inputs.resolve_matching_text(session_id, text)
-            drained = matched.matched
-            skipped_kiro_pending = matched.skipped
+            durable_resolver = getattr(
+                conversation_store,
+                "resolve_message_event_pending_input_matching_text",
+                None,
+            )
+            durable_match = (
+                await asyncio.to_thread(durable_resolver, session_id, text)
+                if durable_resolver is not None
+                else None
+            )
+            if durable_match is not None and (
+                durable_match.matched is not None or durable_match.skipped
+            ):
+                drained = durable_match.matched
+                skipped_kiro_pending = durable_match.skipped
+                durable_pending = True
+            else:
+                matched = pending_inputs.resolve_matching_text(session_id, text)
+                drained = matched.matched
+                skipped_kiro_pending = matched.skipped
         else:
             drained = await asyncio.to_thread(
                 conversation_store.resolve_oldest_message_event_pending_input,
                 session_id,
             )
+            durable_pending = drained is not None
             if drained is None:
                 drained = pending_inputs.resolve_oldest(session_id)
         if drained is not None:
@@ -2250,11 +2269,20 @@ async def _persist_external_conversation_item(
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
     for skipped in skipped_kiro_pending:
-        await _persist_skipped_kiro_pending_input(
+        skipped_item_id = await _persist_skipped_kiro_pending_input(
             session_id,
             skipped,
             conversation_store,
         )
+        if hasattr(skipped, "client_event_id") and hasattr(
+            conversation_store, "mark_message_event_committed"
+        ):
+            await asyncio.to_thread(
+                conversation_store.mark_message_event_committed,
+                session_id,
+                skipped.client_event_id,
+                skipped_item_id,
+            )
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
@@ -2265,6 +2293,17 @@ async def _persist_external_conversation_item(
     if pending_background_title is not None:
         pending_background_title.schedule()
     persisted = persisted_items[0]
+    if (
+        durable_pending
+        and drained is not None
+        and hasattr(conversation_store, "mark_message_event_committed")
+    ):
+        await asyncio.to_thread(
+            conversation_store.mark_message_event_committed,
+            session_id,
+            drained.client_event_id,
+            persisted.id,
+        )
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -2276,7 +2315,7 @@ async def _persist_skipped_kiro_pending_input(
     session_id: str,
     skipped: pending_inputs.DrainedInput,
     conversation_store: ConversationStore,
-) -> None:
+) -> str:
     """Persist a Kiro web input that never appeared in Kiro's JSONL transcript."""
     turn_id = generate_task_id()
     user_item = NewConversationItem(
@@ -2307,6 +2346,7 @@ async def _persist_skipped_kiro_pending_input(
         cleared_pending_id=skipped.pending_id,
     )
     _publish_external_conversation_item(session_id, persisted_items[1])
+    return persisted_items[0].id
 
 
 async def _enrich_terminal_status_with_subagent_output(
@@ -4304,10 +4344,12 @@ async def _forward_native_terminal_message(
             resp.text,
             extra={"session_id": session_id},
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"{display_name} terminal message delivery failed ({resp.status_code})",
-        )
+        detail = f"{display_name} terminal message delivery failed ({resp.status_code})"
+        if resp.status_code < 500:
+            from omnigent.server.message_idempotency import DefinitiveDeliveryFailure
+
+            raise DefinitiveDeliveryFailure(status_code=502, detail=detail)
+        raise HTTPException(status_code=502, detail=detail)
     failure = _extract_claude_native_runner_failure(resp)
     if failure is not None:
         _logger.warning(

@@ -557,11 +557,189 @@ async def test_native_message_replay_injects_once_and_keeps_one_pending_input(
             "file_id": file_id,
             "filename": "native.png",
         }
+        # A reconnect/retry after the transcript committed gets the
+        # authoritative item link, not the old pending-only outcome.
+        message_idempotency.reset_for_tests()
+        committed_replay = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=event,
+        )
+        assert committed_replay.status_code == 202, committed_replay.text
+        assert committed_replay.json()["idempotency_replayed"] is True
+        assert committed_replay.json()["item_id"] == matching[0]["id"]
+        assert len(
+            [request for request in forwarded_requests if request.url.path.endswith("/events")]
+        ) == 1
         after = await client.get(f"/v1/sessions/{session['id']}")
         assert after.json()["pending_inputs"] == []
     finally:
         await fake_runner.aclose()
         pending_inputs.reset_for_tests()
+
+
+async def test_kiro_restart_reconciles_durable_match_and_skipped_metadata(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Kiro matches durable pending inputs after restart and compacts both."""
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "kiro-native-ui"},
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    for index, prompt in enumerate(("not recorded", "accepted prompt"), start=1):
+        event_id = f"kiro-event-{index}"
+        fingerprint = f"{index:02x}" * 32
+        pending_id = f"pending-kiro-{index}"
+        store.claim_message_event(session["id"], event_id, fingerprint)
+        store.record_message_event_pending_input(
+            session["id"],
+            event_id,
+            fingerprint,
+            pending_id=pending_id,
+            content=[
+                {
+                    "type": "input_image",
+                    "file_id": f"{index:02x}" * 16,
+                    "filename": f"image-{index}.png",
+                },
+                {"type": "input_text", "text": prompt},
+            ],
+            created_by=f"user-{index}@example.com",
+        )
+        store.complete_message_event(
+            session["id"],
+            event_id,
+            fingerprint,
+            status="completed",
+            outcome={"queued": True, "pending_id": pending_id},
+        )
+
+    # Process-local fallback is empty after restart; only durable metadata can
+    # match the accepted Kiro prompt and identify the earlier skipped send.
+    pending_inputs.reset_for_tests()
+    transcript = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "accepted prompt"}],
+                },
+                "response_id": "kiro-turn",
+            },
+        },
+    )
+    assert transcript.status_code == 202, transcript.text
+
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    user_items = [item for item in items if item["type"] == "message"]
+    assert [item["created_by"] for item in user_items] == [
+        "user-1@example.com",
+        "user-2@example.com",
+    ]
+    assert user_items[0]["content"][0]["filename"] == "image-1.png"
+    assert user_items[1]["content"][0]["filename"] == "image-2.png"
+    assert any(
+        item["type"] == "error"
+        and item["code"] == "kiro_native_prompt_not_recorded"
+        for item in items
+    )
+    assert store.list_message_event_pending_inputs(session["id"]) == []
+    for event_id in ("kiro-event-1", "kiro-event-2"):
+        receipt = store.get_message_event(session["id"], event_id)
+        assert receipt is not None
+        assert receipt.committed_item_id is not None
+
+
+async def test_native_definite_rejection_cannot_ghost_into_later_transcript(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    """A rejected native forward strips metadata before unrelated input arrives."""
+    def reject_runner_event(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/terminals"):
+            return httpx.Response(200, json={"resource": "view"})
+        return httpx.Response(400, json={"error": {"message": "rejected"}})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_runner_event),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    uploaded = await client.post(
+        f"/v1/sessions/{session['id']}/resources/files",
+        files={"file": ("ghost.png", b"\x89PNG\r\n\x1a\n", "image/png")},
+    )
+    file_id = uploaded.json()["id"]
+    rejected = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "message",
+            "client_event_id": "rejected-native-event",
+            "data": {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": file_id, "filename": "ghost.png"},
+                    {"type": "input_text", "text": "rejected input"},
+                ],
+            },
+        },
+    )
+    assert rejected.status_code == 502, rejected.text
+    store = SqlAlchemyConversationStore(db_uri)
+    receipt = store.get_message_event(session["id"], "rejected-native-event")
+    assert receipt is not None
+    assert receipt.status == "failed"
+    assert store.list_message_event_pending_inputs(session["id"]) == []
+
+    later = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "later terminal input"}],
+                },
+                "response_id": "later-turn",
+            },
+        },
+    )
+    assert later.status_code == 202, later.text
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    later_item = next(
+        item
+        for item in items
+        if item["type"] == "message"
+        and item["content"][-1].get("text") == "later terminal input"
+    )
+    assert later_item["content"] == [{"type": "input_text", "text": "later terminal input"}]
+    await fake_runner.aclose()
 
 
 async def test_native_offline_message_replay_persists_one_failure_turn(

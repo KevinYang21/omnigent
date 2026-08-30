@@ -13,6 +13,8 @@ from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from fastapi import HTTPException
+
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store import ConversationStore, MessageEventReceipt
 
@@ -42,6 +44,10 @@ _current_identity: contextvars.ContextVar[EventIdentity | None] = contextvars.Co
     "message_event_identity",
     default=None,
 )
+
+
+class DefinitiveDeliveryFailure(HTTPException):
+    """Public HTTP error proving the downstream rejected before acceptance."""
 
 
 def current_identity() -> EventIdentity | None:
@@ -253,7 +259,9 @@ def _is_definite_pre_dispatch_failure(exc: Exception) -> bool:
 
 def _is_definitive_failure(exc: Exception) -> bool:
     """Return whether the server proved the operation ended without acceptance."""
-    return isinstance(exc, OmnigentError) and 400 <= exc.http_status < 500
+    return isinstance(exc, DefinitiveDeliveryFailure) or (
+        isinstance(exc, OmnigentError) and 400 <= exc.http_status < 500
+    )
 
 
 def _as_replay(outcome: dict[str, bool | str]) -> dict[str, bool | str]:

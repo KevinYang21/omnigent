@@ -1006,21 +1006,28 @@ receipt becomes `message_event_uncertain`. The server keeps the identity and
 refuses to dispatch it again; a client must reconcile visible history or retry
 the same identity to observe a later outcome.
 
-Receipt retention is intentionally scoped as follow-up work. Today receipts
-remain until their session is deleted. A future bounded policy must retain a
-tombstone (identity + fingerprint + terminal state) for at least the maximum
-supported offline/client retry window; deleting the row earlier would reopen a
-duplicate-dispatch hole. This API does not yet promise a time after which an id
-may be safely reused.
+Full native pending payload, attachments, and sender metadata expire after
+24 hours. They are stripped immediately after transcript reconciliation or a
+definitive failure, excluded from reconciliation after expiry, and physically
+stripped by the lazy cleanup path on subsequent receipt activity. The minimal
+receipt tombstone (identity, fingerprint, and terminal state/outcome) currently
+remains until its session is deleted.
+Bounding terminal tombstones is explicitly follow-up work: a safe compactor
+must retain them for at least the maximum supported offline/client retry window,
+because deleting one earlier reopens a duplicate-dispatch hole. This API does
+not yet promise a time after which an id may be safely reused.
 
 **Native-terminal `message` events return `pending_id`.** On
-claude-native / codex-native sessions a web-composer `message` is NOT
-persisted at POST time (the transcript forwarder is the single writer);
-the server records it in an in-memory pending-inputs index and returns
-its `pending_id`. The id is what makes the bubble durable across a
-rebind: it (a) re-hydrates from the snapshot's `pending_inputs` (the
-replayed bubble carries the id) and (b) is dropped by id when the
-matching `session.input.consumed` arrives carrying `cleared_pending_id`.
+claude-native / codex-native / kiro-native sessions a web-composer `message`
+is NOT persisted at POST time (the transcript forwarder is the single writer).
+For requests with `client_event_id`, the server records the pending payload and
+sender durably on the receipt, ordered by a per-conversation monotonic sequence,
+and returns its `pending_id`. Older clients without an identity use the legacy
+in-memory fallback. The pending id (a) re-hydrates the bubble from the
+snapshot's `pending_inputs` across server restarts and (b) is dropped by id when
+the matching `session.input.consumed` arrives carrying `cleared_pending_id`.
+After commit, the receipt links to the authoritative conversation item so a
+lost-response replay can reconcile without leaving a second optimistic bubble.
 A client *may* adopt the id onto its live optimistic bubble for id-based
 dedupe; the first-party web client deliberately does NOT (it keeps a
 client temp id for React-key stability and relies on a stable key +
