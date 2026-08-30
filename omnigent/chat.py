@@ -3747,7 +3747,7 @@ def _wait_for_server(
                     if runner_id is None:
                         return
                     runner_resp = client.get(f"/v1/runners/{runner_id}/status")
-                    if runner_resp.status_code == 200 and runner_resp.json()["online"] is True:
+                    if runner_resp.status_code == 200 and runner_resp.json().get("online") is True:
                         return
             except httpx.TransportError:
                 # Refused connects AND transient timeouts (a loaded boot
