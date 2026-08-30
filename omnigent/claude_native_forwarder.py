@@ -1954,12 +1954,6 @@ async def _forward_session_cost(
             model = status_state.get("model")
             if isinstance(model, str) and model:
                 payload["model"] = model
-    _logger.info(
-        "DEBUG-OMNI2972 cost post: payload=%s active_subagents=%s cost_by_model=%s",
-        payload,
-        [e.subagent_id for e in active_subagents],
-        cost_by_model,
-    )
     try:
         await _post_external_session_usage(
             client,
