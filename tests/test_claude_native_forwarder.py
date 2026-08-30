@@ -3129,6 +3129,87 @@ async def test_forwarder_waits_when_versioned_post_hits_older_server(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_forwarder_domain_404_drops_item_and_continues(tmp_path: Path) -> None:
+    """A new-server session 404 is definitive, not a rollout retry."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "missing-session-item",
+                        "message": {"role": "assistant", "content": "first"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "later-item",
+                        "message": {"role": "assistant", "content": "second"},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        requests.append(payload)
+        if payload["type"] == "external_session_status":
+            return httpx.Response(202, json={})
+        if payload["data"]["source_id"] == "missing-session-item:0:message":
+            return httpx.Response(
+                404,
+                json={
+                    "error": {
+                        "code": "not_found",
+                        "message": "Session does not exist",
+                    }
+                },
+            )
+        return httpx.Response(202, json={"item_id": "msg_later"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+    ) as client:
+        result = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_missing",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(
+                max_permanent_attempts=1,
+                base_delay_s=0.0,
+            ),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    assert [request["type"] for request in requests] == [
+        "external_conversation_item",
+        "external_session_status",
+        "external_conversation_item",
+    ]
+    assert result.byte_offset == transcript_path.stat().st_size
+    assert result.seen_source_ids == (
+        "missing-session-item:0:message",
+        "later-item:0:message",
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("commit_before_response_loss", [True, False])
 async def test_forwarder_retries_ambiguous_item_on_versioned_route(
     tmp_path: Path,
@@ -5483,6 +5564,93 @@ async def test_subagent_old_server_reject_keeps_source_unseen(tmp_path: Path) ->
     assert len(requests) == 1
     assert child.byte_offset == 0
     assert child.seen_source_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_subagent_domain_404_drops_item_and_continues(tmp_path: Path) -> None:
+    """A new-server session 404 does not park the child transcript."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagent_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="missingchild1",
+        agent_type="Explore",
+        description="missing child session",
+        tool_use_id="toolu_missingchild",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-missing-session",
+                "message": {"role": "assistant", "content": "first"},
+            },
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-later",
+                "message": {"role": "assistant", "content": "second"},
+            },
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "missingchild1": forwarder.SubagentEntry(
+                subagent_id="missingchild1",
+                child_conversation_id="conv_child_missing",
+            )
+        }
+    )
+    item_sources: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] != "external_conversation_item":
+            return httpx.Response(202, json={})
+        source_id = payload["data"]["source_id"]
+        item_sources.append(source_id)
+        if source_id == "sa-missing-session:0:message":
+            return httpx.Response(
+                404,
+                json={
+                    "error": {
+                        "code": "not_found",
+                        "message": "Session does not exist",
+                    }
+                },
+            )
+        return httpx.Response(202, json={"item_id": "msg_later"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        result = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(
+                max_permanent_attempts=1,
+                base_delay_s=0.0,
+            ),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    child = result.subagents["missingchild1"]
+    assert item_sources == [
+        "sa-missing-session:0:message",
+        "sa-later:0:message",
+    ]
+    assert child.byte_offset == subagent_jsonl.stat().st_size
+    assert child.seen_source_ids == (
+        "sa-missing-session:0:message",
+        "sa-later:0:message",
+    )
 
 
 async def test_subagent_watcher_skips_subagents_already_in_state(

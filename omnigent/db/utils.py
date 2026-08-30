@@ -429,8 +429,10 @@ def _run_sqlite_conversation_schema_upgrades(connection: Connection) -> None:
         connection.exec_driver_sql(
             "ALTER TABLE conversation_items ADD COLUMN source_id VARCHAR(512)"
         )
-    indexes = {index["name"] for index in inspect(connection).get_indexes("conversation_items")}
-    if "ix_conversation_items_source_id" not in indexes:
+    index_exists, index_current = _split_source_index_status(connection, "sqlite")
+    if not index_current:
+        if index_exists:
+            connection.exec_driver_sql("DROP INDEX ix_conversation_items_source_id")
         connection.exec_driver_sql(
             "CREATE INDEX ix_conversation_items_source_id "
             "ON conversation_items (workspace_id, conversation_id, source_id) "
@@ -441,6 +443,29 @@ def _run_sqlite_conversation_schema_upgrades(connection: Connection) -> None:
             version=_CONVERSATION_SCHEMA_SOURCE_ID_VERSION
         )
     )
+
+
+def _split_source_index_status(
+    bind: Engine | Connection,
+    dialect_name: str,
+) -> tuple[bool, bool]:
+    """Return whether the split source index exists with its expected shape."""
+    expected_columns = ("workspace_id", "conversation_id", "source_id")
+    for index in inspect(bind).get_indexes("conversation_items"):
+        if index["name"] != "ix_conversation_items_source_id":
+            continue
+        current = tuple(index.get("column_names") or ()) == expected_columns and not bool(
+            index.get("unique")
+        )
+        if dialect_name == "sqlite":
+            where = (index.get("dialect_options") or {}).get("sqlite_where")
+            predicate = "".join(str(where).lower().split())
+            current = current and predicate in {
+                "source_idisnotnull",
+                "(source_idisnotnull)",
+            }
+        return True, current
+    return False, False
 
 
 def _run_conversation_schema_upgrades(engine: Engine) -> None:
@@ -470,9 +495,7 @@ def _upgrade_split_conversation_source_id(engine: Engine) -> None:
                 "ALTER TABLE conversation_items ADD COLUMN source_id VARCHAR(512)"
             )
 
-    indexes = {index["name"] for index in inspect(engine).get_indexes("conversation_items")}
-    if engine.dialect.name != "postgresql" and "ix_conversation_items_source_id" in indexes:
-        return
+    index_exists, index_current = _split_source_index_status(engine, engine.dialect.name)
     columns_sql = "(workspace_id, conversation_id, source_id)"
     if engine.dialect.name == "postgresql":
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
@@ -492,6 +515,7 @@ def _upgrade_split_conversation_source_id(engine: Engine) -> None:
                 expected_shape = (
                     "(workspace_id, conversation_id, source_id)" in definition
                     and "WHERE (source_id IS NOT NULL)" in definition
+                    and not definition.startswith("CREATE UNIQUE INDEX")
                 )
                 if row["indisvalid"] and expected_shape:
                     return
@@ -506,6 +530,10 @@ def _upgrade_split_conversation_source_id(engine: Engine) -> None:
         return
     where = " WHERE source_id IS NOT NULL" if engine.dialect.name == "sqlite" else ""
     with engine.begin() as connection:
+        if index_current:
+            return
+        if index_exists:
+            connection.exec_driver_sql("DROP INDEX ix_conversation_items_source_id")
         connection.exec_driver_sql(
             f"CREATE INDEX ix_conversation_items_source_id "
             f"ON conversation_items {columns_sql}{where}"

@@ -84,6 +84,34 @@ def test_preexisting_split_database_upgrades_before_append(tmp_path: Path) -> No
         assert list(versions) == [1]
 
 
+def test_split_upgrade_replaces_wrong_shape_source_index(tmp_path: Path) -> None:
+    """A legacy same-name index is validated rather than silently stamped."""
+    main_uri = f"sqlite:///{tmp_path / 'main-wrong-index.db'}"
+    split_uri = f"sqlite:///{tmp_path / 'conversations-wrong-index.db'}"
+    legacy_engine = sa.create_engine(split_uri)
+    ConversationBase.metadata.create_all(legacy_engine)
+    with legacy_engine.begin() as connection:
+        connection.exec_driver_sql("DROP INDEX ix_conversation_items_source_id")
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_conversation_items_source_id ON conversation_items (conversation_id)"
+        )
+    legacy_engine.dispose()
+
+    clear_engine_cache()
+    store = SqlAlchemyConversationStore(main_uri, split_uri)
+    indexes = {
+        index["name"]: index
+        for index in sa.inspect(store._conv_engine).get_indexes("conversation_items")
+    }
+    source_index = indexes["ix_conversation_items_source_id"]
+    assert tuple(source_index["column_names"]) == (
+        "workspace_id",
+        "conversation_id",
+        "source_id",
+    )
+    assert "source_id IS NOT NULL" in str(source_index["dialect_options"]["sqlite_where"])
+
+
 def test_concurrent_processes_serialize_split_database_upgrade(tmp_path: Path) -> None:
     """Multiple server processes can initialize one legacy split database."""
     split_uri = f"sqlite:///{tmp_path / 'shared-conversations.db'}"

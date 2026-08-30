@@ -4027,7 +4027,18 @@ async def _post_clear_supersession(
 
 def _source_id_post_route_unavailable(exc: httpx.HTTPError) -> bool:
     """Return whether an older server rejected the versioned POST before commit."""
-    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {404, 405}
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 404:
+        return False
+    if not exc.response.headers.get("content-type", "").startswith("application/json"):
+        return False
+    try:
+        payload = exc.response.json()
+    except ValueError:
+        return False
+    # Starlette's unmatched-route response is stable and intentionally generic.
+    # Domain 404s from a server that owns source-id-v1 carry Omnigent's error
+    # envelope and must flow through bounded permanent-failure handling.
+    return payload == {"detail": "Not Found"}
 
 
 async def _post_external_conversation_item(

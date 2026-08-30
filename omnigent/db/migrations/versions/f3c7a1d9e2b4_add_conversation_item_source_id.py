@@ -22,6 +22,7 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _INDEX_NAME = "ix_conversation_items_source_id"
+_INDEX_COLUMNS = ("workspace_id", "conversation_id", "source_id")
 
 
 def _source_id_column_exists() -> bool:
@@ -55,9 +56,32 @@ def _repair_postgresql_index_artifact() -> None:
     expected_shape = (
         "(workspace_id, conversation_id, source_id)" in definition
         and "WHERE (source_id IS NOT NULL)" in definition
+        and not definition.startswith("CREATE UNIQUE INDEX")
     )
     if not row["indisvalid"] or not expected_shape:
         op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX_NAME}")
+
+
+def _portable_index_status() -> tuple[bool, bool]:
+    """Return whether the named index exists and has this revision's shape."""
+    if op.get_context().as_sql:
+        return False, False
+    dialect_name = op.get_context().dialect.name
+    for index in sa.inspect(op.get_bind()).get_indexes("conversation_items"):
+        if index["name"] != _INDEX_NAME:
+            continue
+        correct = tuple(index.get("column_names") or ()) == _INDEX_COLUMNS and not bool(
+            index.get("unique")
+        )
+        if dialect_name == "sqlite":
+            where = (index.get("dialect_options") or {}).get("sqlite_where")
+            predicate = "".join(str(where).lower().split())
+            correct = correct and predicate in {
+                "source_idisnotnull",
+                "(source_idisnotnull)",
+            }
+        return True, correct
+    return False, False
 
 
 def upgrade() -> None:
@@ -79,21 +103,26 @@ def upgrade() -> None:
                 "ON conversation_items (workspace_id, conversation_id, source_id) "
                 "WHERE source_id IS NOT NULL"
             )
-    elif dialect_name == "sqlite":
-        op.create_index(
-            _INDEX_NAME,
-            "conversation_items",
-            ["workspace_id", "conversation_id", "source_id"],
-            unique=False,
-            sqlite_where=sa.text("source_id IS NOT NULL"),
-        )
     else:
-        op.create_index(
-            _INDEX_NAME,
-            "conversation_items",
-            ["workspace_id", "conversation_id", "source_id"],
-            unique=False,
-        )
+        exists, current = _portable_index_status()
+        if not current:
+            if exists:
+                op.drop_index(_INDEX_NAME, table_name="conversation_items")
+            if dialect_name == "sqlite":
+                op.create_index(
+                    _INDEX_NAME,
+                    "conversation_items",
+                    list(_INDEX_COLUMNS),
+                    unique=False,
+                    sqlite_where=sa.text("source_id IS NOT NULL"),
+                )
+            else:
+                op.create_index(
+                    _INDEX_NAME,
+                    "conversation_items",
+                    list(_INDEX_COLUMNS),
+                    unique=False,
+                )
 
 
 def downgrade() -> None:
@@ -102,6 +131,9 @@ def downgrade() -> None:
         with op.get_context().autocommit_block():
             op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX_NAME}")
     else:
-        op.drop_index(_INDEX_NAME, table_name="conversation_items")
-    with op.batch_alter_table("conversation_items") as batch_op:
-        batch_op.drop_column("source_id")
+        index_exists, _current = _portable_index_status()
+        if op.get_context().as_sql or index_exists:
+            op.drop_index(_INDEX_NAME, table_name="conversation_items")
+    if op.get_context().as_sql or _source_id_column_exists():
+        with op.batch_alter_table("conversation_items") as batch_op:
+            batch_op.drop_column("source_id")
