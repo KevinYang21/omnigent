@@ -2115,6 +2115,9 @@ def _ensure_stdio_survives_unencodable_output() -> None:
         encoding = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
         if encoding in {"utf-8", "utf8"}:
             continue
+        # Trade-off: errors="replace" is process-wide, so any genuinely
+        # unencodable output (not just decorative glyphs) degrades to "?"
+        # instead of raising — acceptable for a CLI's human-facing stdio.
         # Detached/replaced streams (or a test's capture object) can't be
         # reconfigured; the glyph fallback still guards the actual writes.
         with contextlib.suppress(ValueError, OSError):

@@ -320,6 +320,18 @@ def kind_glyph(kind: str) -> str:
     return glyph
 
 
+def default_marker() -> str:
+    """Return the check mark used in the listing's ``default`` marker.
+
+    A legacy-codepage console (e.g. cp1252) cannot encode ``\N{CHECK MARK}``
+    either, so the marker degrades to ``*`` there — keeping the listing
+    renderable even when the stream itself was not relaxed to replace
+    unencodable output.
+    """
+    check = "\N{CHECK MARK}"
+    return check if encodable(check, console) else "*"
+
+
 def credential_label(
     kind: str,
     provider_name: str,
@@ -654,7 +666,7 @@ def render_provider_listing_by_harness(
                 f"    {glyph} [{kind_style}]{entry.kind}[/] [bold]{name}[/] [dim]{summary}[/dim]"
             )
             if family in _provider_default_families(entry, config):
-                line += " [green]✓ default[/green]"
+                line += f" [green]{default_marker()} default[/green]"
             console.print(line)
 
 
@@ -751,7 +763,7 @@ def render_provider_listing(
             line = f"  {glyph} [{kind_style}]{entry.kind}[/] [bold]{name}[/] [dim]{summary}[/dim]"
             if default_families:
                 labels = " · ".join(_FAMILY_LABEL[f] for f in default_families)
-                line += f" [green]✓ default · {labels}[/green]"
+                line += f" [green]{default_marker()} default · {labels}[/green]"
             console.print(line)
     else:
         console.print("[dim]No providers configured yet.[/dim]")
