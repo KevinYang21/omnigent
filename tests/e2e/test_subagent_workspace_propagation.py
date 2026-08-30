@@ -209,9 +209,12 @@ def test_sys_session_send_workspace_reaches_child_session(
     snap = http_client.get(f"/v1/sessions/{child['id']}")
     snap.raise_for_status()
     persisted_workspace = snap.json().get("workspace")
-    assert persisted_workspace == str(task_dir), (
+    # Dispatch persists the canonical (resolved) path; compare against the
+    # resolved dir so a symlinked tmp_path (e.g. macOS /var) can't flake.
+    expected_workspace = str(task_dir.resolve())
+    assert persisted_workspace == expected_workspace, (
         f"child session {child['id']} was created WITHOUT its assigned "
-        f"workspace: expected {str(task_dir)!r}, persisted "
+        f"workspace: expected {expected_workspace!r}, persisted "
         f"{persisted_workspace!r}. The sys_session_send dispatch dropped "
         f"the per-child workspace, so the runner will fall back to its "
         f"default directory instead of the assigned per-task workspace."

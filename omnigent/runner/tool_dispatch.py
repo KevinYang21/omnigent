@@ -1750,6 +1750,8 @@ def _canonical_subagent_workspace(
     if not canonical.is_dir():
         raise ValueError(f"workspace is not a directory: {workspace!r}")
 
+    # A relative os_env.cwd resolves against the runner process cwd — the
+    # same base the harness spawn uses — so boundary and sandbox agree.
     root = Path(configured_root).expanduser()
     try:
         canonical_root = root.resolve(strict=True)
@@ -1761,7 +1763,7 @@ def _canonical_subagent_workspace(
         raise ValueError(
             f"sub-agent {sub_agent_name!r} os_env.cwd is not a directory: {configured_root!r}"
         )
-    if canonical != canonical_root and not canonical.is_relative_to(canonical_root):
+    if not canonical.is_relative_to(canonical_root):
         raise ValueError(
             f"workspace {str(canonical)!r} is outside sub-agent {sub_agent_name!r} "
             f"root {str(canonical_root)!r}"

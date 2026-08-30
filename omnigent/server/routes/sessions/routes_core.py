@@ -431,7 +431,9 @@ def register_core_routes(
         if _terminal_first_create:
             _publish_terminal_pending(resp.id, True)
         _rc = await _get_runner_client(resp.id, runner_router)
-        if _rc is not None and conv is not None:
+        # The init payload builder requires an agent_id; skip the eager
+        # notify for the (theoretical) agent-less row instead of raising.
+        if _rc is not None and conv is not None and conv.agent_id is not None:
             try:
                 await _rc.post(
                     "/v1/sessions",
