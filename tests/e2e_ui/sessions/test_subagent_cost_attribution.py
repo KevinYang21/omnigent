@@ -222,7 +222,9 @@ def test_task_subagent_on_other_model_appears_in_cost_breakdown(
         base_url, session_id, above=0.0, timeout_s=_COST_SETTLE_TIMEOUT_S
     )
     baseline_cost = float(baseline["total_cost_usd"])
-    _log.info("baseline cost settled: %s by_model=%s", baseline_cost, baseline.get("usage_by_model"))
+    _log.info(
+        "baseline cost settled: %s by_model=%s", baseline_cost, baseline.get("usage_by_model")
+    )
 
     spawn_tool = _spawn_tool_name(mock_llm_server_url)
     _log.info("CLI advertises spawn tool: %s", spawn_tool)

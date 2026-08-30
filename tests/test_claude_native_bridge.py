@@ -7146,9 +7146,7 @@ def test_compute_transcript_cost_by_model_keys_each_response_by_its_model(
             _assistant_entry(model="opus", input_tokens=1, output_tokens=1, request_id="req_B"),
         ],
     )
-    by_model = claude_native_bridge.compute_transcript_cost_by_model(
-        path, include_sidechains=True
-    )
+    by_model = claude_native_bridge.compute_transcript_cost_by_model(path, include_sidechains=True)
     assert by_model == {"sonnet": pytest.approx(80.0), "opus": pytest.approx(30.0)}
     flat = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
     assert sum(by_model.values()) == pytest.approx(flat)

@@ -291,6 +291,4 @@ def test_cost_by_model_rejects_malformed_weights(db_uri: str) -> None:
         {"cost_by_model": {"": 0.5}},
     ):
         with pytest.raises(OmnigentError):
-            _persist_native_cumulative_usage(
-                conv.id, {"cumulative_cost_usd": 1.0, **bad}, store
-            )
+            _persist_native_cumulative_usage(conv.id, {"cumulative_cost_usd": 1.0, **bad}, store)
