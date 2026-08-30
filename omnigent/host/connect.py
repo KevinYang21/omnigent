@@ -391,9 +391,10 @@ _MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # process listens on the port — the local server is gone, not unreachable.
 _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 
-# Consecutive post-connect 401/403 rejections (~5 min at the backoff cap)
-# before the retry loop escalates from "check your VPN" to a re-auth prompt.
-# Operator-facing only — the host keeps retrying and never exits.
+# Consecutive post-connect 401/403 (or 404) rejections (~5 min at the backoff
+# cap) before the retry loop escalates its operator message from a transient
+# hint to a "this may not self-heal" prompt. Operator-facing only — the host
+# keeps retrying and never exits.
 _AUTH_REJECT_ESCALATE_ATTEMPTS = 30
 
 # Consecutive accepted-then-silent connections (upgrade completed, then the
@@ -955,6 +956,10 @@ class HostProcess:
         # upgrade or any non-refused error. Fatal past a bounded streak only
         # when the server URL is loopback (the local server is gone).
         self._refused_streak = 0
+        # Consecutive post-connect 404s (a proxy answering for a restarting
+        # backend); reset by an accepted upgrade or any non-404 error. Never
+        # fatal — bounds only how loudly the retry loop escalates.
+        self._transient_404_streak = 0
         # Consecutive connections that were accepted but died without a single
         # inbound frame; reset by any received frame or a rejected upgrade.
         # Past a bound the reconnect loop escalates instead of fast-recycling.
@@ -1492,6 +1497,38 @@ class HostProcess:
             404, or a :class:`HostConnectError` for a never-connected host.
         """
         if self._ever_connected:
+            self._transient_404_streak += 1
+            cause = (
+                "Connection refused (HTTP 404): the host tunnel route is not "
+                "answering — the server is likely restarting behind its proxy."
+            )
+            if (
+                self._transient_404_streak >= _AUTH_REJECT_ESCALATE_ATTEMPTS
+                and self._transient_404_streak % _AUTH_REJECT_ESCALATE_ATTEMPTS == 0
+            ):
+                # A sustained streak is no longer a restart blip: the route may
+                # be genuinely gone (rollback, URL change). Escalate the
+                # operator signal but keep retrying to preserve live sessions.
+                escalated = (
+                    f"{cause} It has answered 404 "
+                    f"{self._transient_404_streak} times in a row — this is no "
+                    "longer a brief restart window. Check the server URL and "
+                    "deployment. Still retrying."
+                )
+                _logger.warning("%s", escalated)
+                print(f"⚠ {escalated}", file=sys.stderr, flush=True)
+            else:
+                _logger.warning("%s Retrying.", cause)
+                if self._transient_404_streak == 1:
+                    # The warning lands in the CLI log file — print once per
+                    # restart window so a foreground `omnigent host` isn't
+                    # silent while it rides the 404s out.
+                    print(
+                        f"⚠ {cause} Retrying — it will reconnect automatically "
+                        "once the server is back.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             return None
         return HostConnectError(
             "Connection refused (HTTP 404): the server did not expose the "
@@ -3148,6 +3185,12 @@ class HostProcess:
                     ):
                         # Keep the refresh window limited to consecutive auth rejections.
                         self._auth_retry_streak = 0
+                    if not (
+                        isinstance(exc, InvalidStatus) and exc.response.status_code == 404
+                    ):
+                        # The 404 streak counts CONSECUTIVE restart-window
+                        # rejections only, so escalation reflects one outage.
+                        self._transient_404_streak = 0
                     # Refused on loopback is decisive: nothing listens on the
                     # port and no network path can heal it, so bound the
                     # retries. Remote refusals retry forever (outages recover).
@@ -3415,6 +3458,7 @@ class HostProcess:
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
         self._refused_streak = 0
+        self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
         await self._ensure_owner_user_id()
         try:

@@ -3644,6 +3644,71 @@ async def test_never_connected_host_fails_loud_on_404(
     assert spy.call_count == 1
 
 
+async def test_connected_host_404_rideout_prints_notice_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The first 404 of a restart window warns on stderr, exactly once.
+
+    ``_logger.warning`` goes to the CLI log file, so a foreground
+    ``omnigent host`` would sit silent while riding out a proxy's 404
+    window. The terminal notice must name the cause and print only once
+    per window (not on every retry) so it doesn't spam stderr while the
+    server restarts.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    not_found = _invalid_status(404)
+    spy = _ConnectSpy([None, not_found, not_found, not_found, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # The cause reached the terminal, framed as a restart, not an error.
+    assert "HTTP 404" in err
+    assert "restarting" in err
+    # Printed once for the whole window, not once per retry — three
+    # consecutive 404s must yield a single notice line.
+    assert err.count("HTTP 404") == 1
+
+
+def test_connected_host_404_streak_escalates_without_going_fatal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A sustained 404 streak escalates the operator message, never fatally.
+
+    A brief restart window stays quiet after the one-time notice, but a
+    route that answers 404 for minutes is likely not a restart (rollback,
+    changed URL). The classifier escalates the terminal message so the
+    operator learns the retry may not self-heal — while still returning
+    ``None`` so live runner sessions are never torn down.
+    """
+    from omnigent.host.connect import _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+    host = _make_host_process()
+    host._ever_connected = True
+
+    # First 404: retryable (None), framed as a server restart.
+    assert host._classify_http_status(404) is None
+    first = capsys.readouterr().err
+    assert "restarting" in first
+    assert "no longer" not in first
+
+    # Streak climbs toward — but not to — the escalation threshold: stays
+    # quiet so a routine restart never raises a false alarm.
+    for _ in range(2, _AUTH_REJECT_ESCALATE_ATTEMPTS):
+        assert host._classify_http_status(404) is None
+    assert "no longer" not in capsys.readouterr().err
+
+    # Crossing the threshold escalates — and is STILL retryable (no fatal
+    # error, so a host with live sessions is never killed by a long outage).
+    assert host._classify_http_status(404) is None
+    escalated = capsys.readouterr().err
+    assert "no longer a brief restart window" in escalated
+    assert host._transient_404_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [
