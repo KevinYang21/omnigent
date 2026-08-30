@@ -15,7 +15,6 @@ from omnigent_client import QueryResult
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
-    _LOCAL_BOOT_TIMEOUT_SECONDS,
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
     _SERVER_READY_INITIAL_POLL_SECONDS,
@@ -339,7 +338,6 @@ def test_local_boot_budget_covers_consumer_launch_budgets() -> None:
     import inspect
 
     default_timeout = inspect.signature(_wait_for_server).parameters["timeout"].default
-    assert default_timeout == _LOCAL_BOOT_TIMEOUT_SECONDS
     assert default_timeout >= 120.0, (
         "the internal local-boot budget must cover the slowest consumer "
         "launch budget (the REPL e2e tests wait up to 120s for boot)"

@@ -128,8 +128,8 @@ def _server_ready_poll_interval(elapsed: float) -> float:
 # 60-120s) — otherwise a merely-slow boot on a loaded machine is
 # killed by this internal budget first and reported as a hard
 # "Server failed to start", turning boot starvation into a spurious
-# failure. Mirrors the daemon path's ~106s worst-case cold-start
-# budget (see tests/e2e/test_repl_approval_e2e.py::_LAUNCH_TIMEOUT).
+# failure. Matches the 120s launch budget the REPL e2e tests hold
+# boot to (tests/e2e/test_repl_approval_e2e.py::_LAUNCH_TIMEOUT).
 _LOCAL_BOOT_TIMEOUT_SECONDS = 120.0
 
 # Remote ``--server`` runners are disposable subprocesses created for
