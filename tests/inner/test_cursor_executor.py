@@ -641,6 +641,109 @@ async def test_run_turn_rejects_unresolvable_model_before_sdk_dispatch(
     assert not any(isinstance(e, ExecutorError) for e in events3)
 
 
+async def test_usage_attributed_to_resolved_id_not_display_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Usage/cost records the catalog-resolved id, not the requested label."""
+    from omnigent.inner.executor import ExecutorConfig
+
+    turn_ended = SimpleNamespace(
+        type="turn-ended",
+        usage={"inputTokens": 10, "outputTokens": 2, "totalTokens": 12},
+    )
+    script = {
+        "messages": [_assistant("ok")],
+        "interaction_updates": [turn_ended],
+        "status": "finished",
+        "result": "ok",
+    }
+    _install_fake_sdk(monkeypatch, [script])
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        events = [
+            e
+            async for e in executor.run_turn(
+                [_user("hi")], [], "SYS", config=ExecutorConfig(model="Composer")
+            )
+        ]
+    finally:
+        await executor.close()
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completes) == 1 and completes[0].usage is not None
+    assert completes[0].usage["model"] == "composer-2.5"  # not "Composer"
+
+
+async def test_resolved_id_on_next_turn_reuses_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a label resolves ('Composer' -> composer-2.5), a next turn pinning
+    either the label or the resolved id reuses the live agent instead of
+    tearing it down for the same underlying model."""
+    from omnigent.inner.executor import ExecutorConfig
+
+    scripts = [
+        {"messages": [_assistant("one")], "result": "one"},
+        {"messages": [_assistant("two")], "result": "two"},
+        {"messages": [_assistant("three")], "result": "three"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("first")], [], "SYS", config=ExecutorConfig(model="Composer")
+            )
+        ]
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("second")], [], "SYS", config=ExecutorConfig(model="composer-2.5")
+            )
+        ]
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("third")], [], "SYS", config=ExecutorConfig(model="Composer")
+            )
+        ]
+    finally:
+        await executor.close()
+    # One agent creation for all three turns; a genuinely different model
+    # still recreates (see test_session_restart_on_model_change).
+    assert state["create_models"] == ["composer-2.5"]
+    assert len(state["sent"]) == 3
+
+
+async def test_session_restart_on_model_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Switching to a genuinely different model rebuilds the agent."""
+    from omnigent.inner.executor import ExecutorConfig
+
+    scripts = [
+        {"messages": [_assistant("one")], "result": "one"},
+        {"messages": [_assistant("two")], "result": "two"},
+    ]
+    state = _install_fake_sdk(monkeypatch, scripts)
+    executor = CursorExecutor(api_key="crsr_x")
+    try:
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("first")], [], "SYS", config=ExecutorConfig(model="composer-2.5")
+            )
+        ]
+        _ = [
+            e
+            async for e in executor.run_turn(
+                [_user("second")], [], "SYS", config=ExecutorConfig(model="gpt-5.5")
+            )
+        ]
+    finally:
+        await executor.close()
+    assert state["create_models"] == ["composer-2.5", "gpt-5.5"]
+    assert state["closed"] >= 1
+
+
 async def test_api_key_threaded_to_create(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
     executor = CursorExecutor(api_key="crsr_secret")

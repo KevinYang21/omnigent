@@ -598,6 +598,10 @@ class _CursorSessionState:
     client: object | None = None  # cursor_sdk.AsyncClient
     agent: _CursorAgent | None = None  # cursor_sdk.AsyncAgent
     system_prompt: str | None = None
+    # The model string the turn requested (possibly a display label) and the
+    # catalog-resolved id actually dispatched; a next turn naming either one
+    # reuses the live agent instead of recreating it.
+    requested_model: str | None = None
     model: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
@@ -896,6 +900,9 @@ class CursorExecutor(Executor):
             raise
         state.client = client
         state.agent = agent
+        # Persist the catalog-resolved id (not the requested label) so usage
+        # attribution and the next-turn reuse check see the real model.
+        state.model = model
 
     async def run_turn(
         self,
@@ -914,7 +921,7 @@ class CursorExecutor(Executor):
         # set would leave the initial custom_tools stale for the conversation).
         if state.agent is not None and (
             state.system_prompt != system_prompt
-            or state.model != model
+            or model not in (state.requested_model, state.model)
             or state.tools_fingerprint != tools_fp
         ):
             await self._close_state(state)
@@ -922,7 +929,10 @@ class CursorExecutor(Executor):
             self._session_states[session_key] = state
         is_first_turn = not state.has_sent_prompt
         state.system_prompt = system_prompt
-        state.model = model
+        if state.agent is None:
+            # Record the requested string only at creation so a live agent
+            # keeps matching both the original label and the resolved id.
+            state.requested_model = model
         state.tools_fingerprint = tools_fp
 
         try:
@@ -938,6 +948,11 @@ class CursorExecutor(Executor):
             await self.close_session(session_key)
             yield ExecutorError(message=f"Failed to start cursor-sdk agent: {exc}")
             return
+
+        # From here on use the catalog-resolved id (set by _ensure_session) so
+        # usage/cost attribution names the model actually dispatched, not a
+        # display label like "Composer".
+        model = state.model or model
 
         prompt = _build_cursor_prompt(
             messages, is_first_turn=is_first_turn, system_prompt=system_prompt
