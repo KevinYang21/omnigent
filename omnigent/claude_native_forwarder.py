@@ -3490,10 +3490,28 @@ async def _forward_available_items(
                 await _write_forward_state_async(bridge_dir, updated)
                 continue
             if post_may_have_been_delivered(exc):
+                if await _server_supports_source_id_retry(client):
+                    # The upgraded server keys this event by source_id, so both
+                    # ambiguous outcomes are safe: a committed request resolves
+                    # to its existing row, while an uncommitted request inserts
+                    # on retry. Keep the cursor before the item.
+                    _logger.warning(
+                        "Retrying Claude transcript item after an ambiguous POST "
+                        "failure because the server advertises source-id idempotency; "
+                        "session=%s bridge_dir=%s source_id=%s item_type=%s",
+                        session_id,
+                        bridge_dir,
+                        item.source_id,
+                        item.item_type,
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+                    retry_tracker.clear(retry_key)
+                    return updated
                 # Ambiguous failure: the server may have committed this
-                # item before the response was lost. External items aren't
-                # deduped, so a retry would duplicate the bubble —
-                # skip it. At worst one item is lost on a flaky POST.
+                # item before the response was lost. An older server does not
+                # advertise source-keyed dedupe, so preserve the conservative
+                # mixed-version behavior and skip it rather than duplicate it.
                 _logger.warning(
                     "Skipping Claude transcript item after an ambiguous POST failure "
                     "(may already be committed); not retrying to avoid a duplicate; "
@@ -4006,6 +4024,20 @@ async def _post_clear_supersession(
             exc_info=True,
             extra={"session_id": old_session_id},
         )
+
+
+async def _server_supports_source_id_retry(client: httpx.AsyncClient) -> bool:
+    """Return whether this server safely deduplicates source-keyed retries."""
+    try:
+        response = await client.get("/v1/native-forwarder-capabilities")
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("external_conversation_item_source_id_idempotency") is True
+    )
 
 
 async def _post_external_conversation_item(

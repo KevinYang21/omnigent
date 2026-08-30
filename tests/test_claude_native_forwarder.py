@@ -3052,19 +3052,14 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Path) -> None:
+async def test_forwarder_skips_ambiguous_item_for_older_server(tmp_path: Path) -> None:
     """
-    An ambiguous POST failure skips the item instead of re-posting it.
+    An ambiguous POST failure stays conservative with an older server.
 
-    A user message typed while Claude is busy round-trips through the
-    transcript and is POSTed as an ``external_conversation_item``. If
-    that POST's response is lost (e.g. a read timeout AFTER the server
-    appended the item and published ``session.input.consumed``), the
-    server has already committed it — and external items are not deduped
-    server-side. Retrying would append a second copy and re-publish the
-    consume event, producing a duplicate user bubble in the web UI.
-    The forwarder must instead treat the item as delivered:
-    mark it handled, advance the byte cursor, and never re-POST it.
+    A mixed-version deployment can run a new forwarder against a server
+    that does not advertise source-keyed idempotency. Retrying there could
+    duplicate a committed item, so the compatibility behavior remains the
+    historical conservative skip.
 
     A failure here (the item POSTed twice across two polls) is exactly
     the duplicate-user-message regression this guards against.
@@ -3103,6 +3098,9 @@ async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Pat
         :raises httpx.ReadTimeout: For every ``external_conversation_item``
             POST, simulating a lost response.
         """
+        if request.method == "GET":
+            assert request.url.path == "/v1/native-forwarder-capabilities"
+            return httpx.Response(404, json={"detail": "Not Found"})
         payload = json.loads(request.content.decode("utf-8"))
         assert isinstance(payload, dict)
         requests.append(payload)
@@ -3145,6 +3143,84 @@ async def test_forwarder_skips_user_item_on_ambiguous_post_failure(tmp_path: Pat
     assert first.byte_offset == transcript_path.stat().st_size
     assert first.seen_source_ids == ("user-msg-1:0:message",)
     assert second.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_before_response_loss", [True, False])
+async def test_forwarder_retries_ambiguous_item_when_server_advertises_idempotency(
+    tmp_path: Path,
+    commit_before_response_loss: bool,
+) -> None:
+    """An upgraded server safely resolves both ambiguous delivery outcomes."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "ambiguous-item",
+                "message": {"role": "assistant", "content": "ambiguous delivery"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+    committed_sources: set[str] = set()
+    item_posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert request.url.path == "/v1/native-forwarder-capabilities"
+            return httpx.Response(
+                200,
+                json={"external_conversation_item_source_id_idempotency": True},
+            )
+        payload = json.loads(request.content.decode("utf-8"))
+        assert payload["type"] == "external_conversation_item"
+        item_posts.append(payload)
+        source_id = payload["data"]["source_id"]
+        if len(item_posts) == 1:
+            if commit_before_response_loss:
+                committed_sources.add(source_id)
+            raise httpx.ReadTimeout("response lost", request=request)
+        committed_sources.add(source_id)
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        dedupe = forwarder._ForwardDedupeState()
+        first = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+        second = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=first,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+
+    assert first.byte_offset == 0
+    assert first.seen_source_ids == ()
+    assert second.byte_offset == transcript_path.stat().st_size
+    assert second.seen_source_ids == ("ambiguous-item:0:message",)
+    assert len(item_posts) == 2
+    assert committed_sources == {"ambiguous-item:0:message"}
 
 
 @pytest.mark.asyncio
