@@ -226,6 +226,28 @@ describe("Composer session drafts", () => {
     });
     expect(getSessionDraft("conv_draft")?.files).toEqual([existing]);
   });
+
+  it("keeps uncertainty confirmation when a different draft is occupied", async () => {
+    const onSend = vi.fn();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    setSessionDraft("conv_draft", { text: "new draft", files: [] });
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "possibly delivered",
+        files: [],
+        clientEventId: "uncertain-event",
+        deliveryUncertain: true,
+      },
+    });
+
+    render(<Composer {...composerProps({ onSend })} />);
+    await waitFor(() => expect(textarea()).toHaveValue("new draft"));
+    fireEvent.submit(textarea().closest("form")!);
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
+    expect(onSend).not.toHaveBeenCalled();
+  });
 });
 
 describe("Composer growth layout", () => {

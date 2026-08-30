@@ -873,6 +873,29 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
+  it("pairs identical committed and pending messages one-to-one on cold load", async () => {
+    seedSession("conv_native", [userMessage("resp1", "same message")]);
+    seedPendingInputs("conv_native", [
+      {
+        pending_id: "pending_first",
+        content: [{ type: "input_text", text: "same message" }],
+      },
+      {
+        pending_id: "pending_second",
+        content: [{ type: "input_text", text: "same message" }],
+      },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_native");
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      {
+        tempId: "pending_second",
+        content: [{ type: "input_text", text: "same message" }],
+      },
+    ]);
+  });
+
   it("keeps a pending_input matching a committed message that the transcript reformatted", async () => {
     // The native transcript can prepend markers/blockquotes, so the
     // committed text is a superset of the POSTed text. Containment (not

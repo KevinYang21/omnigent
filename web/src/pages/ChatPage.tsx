@@ -4821,7 +4821,19 @@ export function Composer({
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
     if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
-      retryDraftRef.current = null;
+      // Keep uncertainty separate from draft restoration. Editing text/files
+      // invalidates safe ID reuse, but it must not erase the fact that the
+      // original may already have been delivered; submit still needs explicit
+      // duplicate-risk confirmation before minting a replacement identity.
+      retryDraftRef.current =
+        failedSendDraft.deliveryUncertain && failedSendDraft.clientEventId !== undefined
+          ? {
+              clientEventId: failedSendDraft.clientEventId,
+              text: failedSendDraft.text,
+              files: failedSendDraft.files,
+              deliveryUncertain: true,
+            }
+          : null;
       return;
     }
     useChatStore.setState({ failedSendDraft: null });

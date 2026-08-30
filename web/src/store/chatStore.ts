@@ -3442,13 +3442,16 @@ async function bindStream(
       // with an older identical message in history.)
       const dedupePending = hydratePending && candidatePending.length > 0;
       const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
-      const countEndsWith = (texts: string[], suffix: string): number =>
-        texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
       const snapshotPending: PendingUserMessage[] = dedupePending
         ? candidatePending.filter((p) => {
             const text = messageContentText(p.content);
             if (text === "") return true;
-            return countEndsWith(committedUserTexts, text) === 0;
+            const committedIndex = committedUserTexts.findIndex((committed) =>
+              committed.endsWith(text),
+            );
+            if (committedIndex === -1) return true;
+            committedUserTexts.splice(committedIndex, 1);
+            return false;
           })
         : candidatePending;
       const syntheticError: ErrorBlock | null =
