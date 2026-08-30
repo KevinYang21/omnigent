@@ -19,8 +19,8 @@ else CI happens to run concurrently:
 It then holds each boot to the same ``60s`` prompt-ready budget the
 suppressed tests used, and fails with the per-REPL outcome when any
 boot starves past it. Under this load the CLI's *own* local-boot
-budget (``_wait_for_server`` in ``omnigent/chat.py``, 45s for server
-health + runner online) is typically exhausted first, so the REPL
+budget (``_wait_for_server`` in ``omnigent/chat.py``, for server
+health + runner online) was typically exhausted first, so the REPL
 exits with ``Server failed to start`` (EOF) even though the runner
 was healthily retrying its tunnel — the sharpest form of "boot
 starvation counted as a test failure".

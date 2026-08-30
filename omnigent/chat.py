@@ -3723,6 +3723,16 @@ def _wait_for_server(
         while time.monotonic() < deadline:
             if server.proc.poll() is not None:
                 _raise_server_failed(server)
+            runner_proc = server.runner_proc
+            if runner_proc is not None and runner_proc.poll() is not None:
+                # The sibling runner died; without this check the loop
+                # waits out the full boot budget before failing with a
+                # generic message that blames the (healthy) server.
+                raise click.ClickException(
+                    f"Local runner exited early with code {runner_proc.returncode} "
+                    f"while waiting for the server to become ready.\n"
+                    f"  Server log:  {server.log_path}"
+                )
             try:
                 resp = client.get("/health")
                 if resp.status_code == 200:

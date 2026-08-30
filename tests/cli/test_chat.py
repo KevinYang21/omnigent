@@ -240,6 +240,7 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
     server = SimpleNamespace(
         proc=SimpleNamespace(poll=lambda: None),
         runner_id=None,
+        runner_proc=SimpleNamespace(poll=lambda: None),
         log_path=Path("/tmp/server.log"),
     )
     monotonic_values = iter(
@@ -437,6 +438,7 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
     server = SimpleNamespace(
         proc=SimpleNamespace(poll=lambda: None),
         runner_id="runner_wait_test",
+        runner_proc=SimpleNamespace(poll=lambda: None),
         log_path=Path("/tmp/server.log"),
     )
     monotonic_values = iter([0.0, 0.0, 0.2, 0.2, 0.3])
@@ -510,6 +512,7 @@ def test_wait_for_server_retries_through_transient_timeouts(
     server = SimpleNamespace(
         proc=SimpleNamespace(poll=lambda: None),
         runner_id=None,
+        runner_proc=SimpleNamespace(poll=lambda: None),
         log_path=Path("/tmp/server.log"),
     )
     http_calls = {"count": 0}
@@ -544,6 +547,69 @@ def test_wait_for_server_retries_through_transient_timeouts(
         "Expected the wait loop to retry through transient probe "
         "timeouts until the server reports ready."
     )
+
+
+def test_wait_for_server_fails_fast_when_runner_dies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dead sibling runner must fail the wait immediately.
+
+    Without this, a runner that crashes at spawn leaves the loop
+    polling a healthy server (whose runner will never come online)
+    for the full boot budget, then blames the server generically.
+    """
+
+    class _Resp:
+        """Minimal response stub exposing status and JSON body."""
+
+        def __init__(self, status_code: int, body: dict[str, bool] | None = None) -> None:
+            self.status_code = status_code
+            self._body = body
+
+        def json(self) -> dict[str, bool]:
+            """Return the scripted response body."""
+            assert self._body is not None
+            return self._body
+
+    server = SimpleNamespace(
+        proc=SimpleNamespace(poll=lambda: None),
+        runner_id="runner_dead_test",
+        runner_proc=SimpleNamespace(poll=lambda: 1, returncode=1),
+        log_path=Path("/tmp/server.log"),
+    )
+
+    class _FakeClient:
+        """Healthy server whose runner never reports online."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_FakeClient":
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, path: str) -> _Resp:
+            """Report the server healthy but the runner offline."""
+            if path.endswith("/health"):
+                return _Resp(200)
+            return _Resp(200, {"online": False})
+
+    clock = {"now": 0.0}
+
+    def _advancing_monotonic() -> float:
+        """Advance so the wait's deadline eventually passes."""
+        clock["now"] += 0.1
+        return clock["now"]
+
+    monkeypatch.setattr("omnigent.chat.time.monotonic", _advancing_monotonic)
+    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
+
+    with pytest.raises(click.ClickException, match="runner exited early with code 1"):
+        _wait_for_server(8123, server, timeout=5.0)
 
 
 def test_start_local_server_spawns_runner_as_sibling(
