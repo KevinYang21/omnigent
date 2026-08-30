@@ -4654,7 +4654,7 @@ export function NewChatLandingScreen() {
           ) : null}
         </div>
         <div
-          className="relative flex w-full flex-col gap-1"
+          className="relative flex w-full flex-col gap-0"
           data-testid="new-chat-landing-composer-surface"
         >
           {!sandboxSelected && (

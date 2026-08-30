@@ -1067,7 +1067,8 @@ describe("NewChatLandingScreen", () => {
     expect(landingContent).toHaveClass("max-w-[800px]", "md:px-2");
     expect(composerSurface.firstElementChild).toBe(workspace);
     expect(workspace.nextElementSibling).toBe(composer);
-    expect(workspace).toHaveClass("h-8", "mx-4");
+    expect(composerSurface).toHaveClass("gap-0");
+    expect(workspace).toHaveClass("h-8", "mx-4", "-mb-px");
     expect(composer).toHaveClass("min-h-[105px]");
     expect(composer).toContainElement(actions);
     const attach = screen.getByTestId("new-chat-landing-attach");
