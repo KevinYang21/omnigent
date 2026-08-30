@@ -9099,6 +9099,53 @@ async def test_other_producer_bridge_files_are_not_opened_through_path_open(
     assert not opened, f"forwarder opened adjacent-producer-only files: {sorted(opened)}"
 
 
+def test_fingerprint_wakes_on_statusline_raw_capture(tmp_path: Path) -> None:
+    """
+    Writing ``context_raw.json`` moves the fingerprint.
+
+    The statusLine shim drops its raw capture there and the poll loop
+    normalizes it into ``context.json`` (``sync_raw_status_context``) — so a
+    gated idle loop that did not watch it would leave a model/context update
+    stranded until the periodic resync.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    paths = _fingerprint_for(bridge_dir)
+    before = paths.fingerprint()
+
+    (bridge_dir / claude_native_status.CONTEXT_RAW_FILE).write_text(
+        '{"model": {"display_name": "opus"}}', encoding="utf-8"
+    )
+
+    assert paths.fingerprint() != before
+
+
+def test_fingerprint_ignores_tool_relay_env(tmp_path: Path) -> None:
+    """
+    The relay's shim-sourced env file does not move the fingerprint.
+
+    ``tool_relay.env`` mirrors coordinates already carried by the watched
+    ``tool_relay.json``; the poll loop never reads the env flavor, so watching
+    it would only double-count relay restarts.
+
+    :param tmp_path: Per-test temp directory.
+    :returns: None.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    paths = _fingerprint_for(bridge_dir)
+    before = paths.fingerprint()
+
+    (bridge_dir / "tool_relay.env").write_text(
+        "OMNIGENT_RELAY_URL='http://127.0.0.1:1'\n", encoding="utf-8"
+    )
+
+    assert paths.fingerprint() == before
+
+
 def test_fingerprint_does_not_watch_the_forwarders_own_outputs(tmp_path: Path) -> None:
     """
     Writing anything the forwarder owns does not move the fingerprint.

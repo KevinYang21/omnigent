@@ -48,7 +48,7 @@ from omnigent.claude_native_bridge import (
     write_active_session_id,
 )
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
-from omnigent.claude_native_status import sync_raw_status_context
+from omnigent.claude_native_status import CONTEXT_RAW_FILE, sync_raw_status_context
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
@@ -817,6 +817,9 @@ _WATCHED_BRIDGE_FILES = (
     "tmux.json",
     "permission_hook.json",
     "context.json",
+    # The statusLine shim's raw capture; the loop normalizes it into
+    # context.json via sync_raw_status_context, so a write must wake the gate.
+    CONTEXT_RAW_FILE,
     "claude-settings.json",
     MESSAGE_DELTAS_FILE,
 )
@@ -851,6 +854,9 @@ _OTHER_PRODUCER_BRIDGE_FILES = (
     "turn_replay_pending.json",
     "turn_routing.log",
     "subagent_router.json",
+    # Relay coordinates written at relay startup for the in-terminal shim to
+    # source; the poll loop reads tool_relay.json (watched above), never this.
+    "tool_relay.env",
 )
 
 # Sub-agent transcripts grow; their sibling ``agent-*.meta.json`` is read once
