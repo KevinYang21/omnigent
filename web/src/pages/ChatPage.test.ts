@@ -4,6 +4,7 @@ import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
@@ -34,6 +35,7 @@ import {
   MAX_WARM_TERMINAL_SURFACES,
   shouldMountTerminalSurface,
   shouldShowTerminalSurface,
+  stashUndeliveredPrompt,
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
   isBackgroundTasksOnly,
@@ -1600,6 +1602,19 @@ describe("deliverInitialPrompt", () => {
     expect(outcome).toBe("delivered");
     expect(sendSlashCommand).toHaveBeenCalledTimes(2);
     expect(send).not.toHaveBeenCalled();
+  });
+});
+
+describe("stashUndeliveredPrompt", () => {
+  it("does not overwrite an existing files-only draft", () => {
+    const conversationId = "conv_files_only_draft";
+    const file = new File(["attachment"], "evidence.txt", { type: "text/plain" });
+    setSessionDraft(conversationId, { text: "", files: [file] });
+
+    stashUndeliveredPrompt(conversationId, "undelivered first prompt");
+
+    expect(getSessionDraft(conversationId)).toEqual({ text: "", files: [file] });
+    setSessionDraft(conversationId, { text: "", files: [] });
   });
 });
 
