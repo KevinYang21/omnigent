@@ -63,13 +63,9 @@ describe("uncertain delivery replacement", () => {
   it("requires explicit duplicate-risk confirmation for a changed payload", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
 
-    expect(
-      confirmUncertainDeliveryReplacement(
-        { text: "original", files: [], deliveryUncertain: true },
-        "edited",
-        [],
-      ),
-    ).toBe(false);
+    expect(confirmUncertainDeliveryReplacement({ text: "original", files: [] }, "edited", [])).toBe(
+      false,
+    );
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
     confirm.mockRestore();
   });
@@ -80,11 +76,9 @@ describe("uncertain delivery replacement", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
 
     expect(
-      confirmUncertainDeliveryReplacement(
-        { text: "same", files: [original], deliveryUncertain: true },
-        "same",
-        [replacement],
-      ),
+      confirmUncertainDeliveryReplacement({ text: "same", files: [original] }, "same", [
+        replacement,
+      ]),
     ).toBe(false);
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
     confirm.mockRestore();
@@ -94,11 +88,7 @@ describe("uncertain delivery replacement", () => {
     const confirm = vi.spyOn(window, "confirm");
 
     expect(
-      confirmUncertainDeliveryReplacement(
-        { text: "original", files: [], deliveryUncertain: true },
-        "original",
-        [],
-      ),
+      confirmUncertainDeliveryReplacement({ text: "original", files: [] }, "original", []),
     ).toBe(true);
     expect(confirm).not.toHaveBeenCalled();
     confirm.mockRestore();

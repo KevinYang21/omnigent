@@ -2299,7 +2299,10 @@ describe("chatStore — send (first-send ordering)", () => {
     );
     const submittedId = JSON.parse((request?.[1]?.body as string) ?? "{}").client_event_id;
     expect(useChatStore.getState().failedSendDraft?.clientEventId).toBe(submittedId);
-    expect(useChatStore.getState().failedSendDraft?.deliveryUncertain).toBe(true);
+    expect(useChatStore.getState().uncertainDelivery).toMatchObject({
+      clientEventId: submittedId,
+      text: "do this once",
+    });
   });
 
   it("abandons the logical submit id after a terminal HTTP 4xx", async () => {

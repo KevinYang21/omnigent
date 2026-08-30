@@ -669,16 +669,15 @@ export function shouldQueueSend(
 }
 
 export function confirmUncertainDeliveryReplacement(
-  retryDraft: { text: string; files: File[]; deliveryUncertain?: boolean } | null,
+  uncertainDelivery: { text: string; files: File[] } | null,
   messageText: string,
   files: File[],
 ): boolean {
   if (
-    retryDraft === null ||
-    !retryDraft.deliveryUncertain ||
-    (retryDraft.text === messageText &&
-      retryDraft.files.length === files.length &&
-      retryDraft.files.every((file, index) => file === files[index]))
+    uncertainDelivery === null ||
+    (uncertainDelivery.text === messageText &&
+      uncertainDelivery.files.length === files.length &&
+      uncertainDelivery.files.every((file, index) => file === files[index]))
   ) {
     return true;
   }
@@ -4442,6 +4441,7 @@ export function Composer({
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  const uncertainDelivery = useChatStore((s) => s.uncertainDelivery);
   // The conversation whose draft the composer's value/files currently hold.
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
@@ -4564,7 +4564,6 @@ export function Composer({
     clientEventId: string;
     text: string;
     files: File[];
-    deliveryUncertain: boolean;
   } | null>(null);
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
@@ -4821,17 +4820,12 @@ export function Composer({
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
     if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
-      // Keep uncertainty separate from draft restoration. Editing text/files
-      // invalidates safe ID reuse, but it must not erase the fact that the
-      // original may already have been delivered; submit still needs explicit
-      // duplicate-risk confirmation before minting a replacement identity.
       retryDraftRef.current =
-        failedSendDraft.deliveryUncertain && failedSendDraft.clientEventId !== undefined
+        failedSendDraft.clientEventId !== undefined
           ? {
               clientEventId: failedSendDraft.clientEventId,
               text: failedSendDraft.text,
               files: failedSendDraft.files,
-              deliveryUncertain: true,
             }
           : null;
       return;
@@ -4854,7 +4848,6 @@ export function Composer({
             clientEventId: failedSendDraft.clientEventId,
             text: failedSendDraft.text,
             files: restoredFiles,
-            deliveryUncertain: failedSendDraft.deliveryUncertain === true,
           }
         : null;
     if (!isMobileRef.current) textareaRef.current?.focus();
@@ -5159,14 +5152,25 @@ export function Composer({
     // workspace file/folder from this marker; no upload happens.
     const messageText =
       buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
-    const retryDraft = retryDraftRef.current;
+    const retryDraft = retryDraftRef.current ?? uncertainDelivery;
     const retryPayloadMatches =
       retryDraft !== null &&
       retryDraft.text === messageText &&
       retryDraft.files.length === files.length &&
       retryDraft.files.every((file, index) => file === files[index]);
-    if (!confirmUncertainDeliveryReplacement(retryDraft, messageText, files)) {
+    if (!confirmUncertainDeliveryReplacement(uncertainDelivery, messageText, files)) {
+      // No send occurred, so a second click must be allowed to reopen the
+      // explicit duplicate-risk decision without requiring another edit.
+      submitGuardRef.current = false;
       return;
+    }
+    const replacesUncertainDelivery =
+      uncertainDelivery !== null &&
+      (uncertainDelivery.text !== messageText ||
+        uncertainDelivery.files.length !== files.length ||
+        uncertainDelivery.files.some((file, index) => file !== files[index]));
+    if (replacesUncertainDelivery) {
+      useChatStore.setState({ uncertainDelivery: null });
     }
     const retryClientEventId = retryPayloadMatches ? retryDraft.clientEventId : undefined;
     retryDraftRef.current = null;

@@ -122,12 +122,17 @@ function renderWithTooltips(ui: ReactElement) {
 describe("Composer session drafts", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({ conversationId: "conv_draft", failedSendDraft: null });
+    useChatStore.setState({
+      conversationId: "conv_draft",
+      failedSendDraft: null,
+      uncertainDelivery: null,
+    });
   });
 
   afterEach(() => {
     cleanup();
     clearSessionDrafts();
+    vi.restoreAllMocks();
   });
 
   it("publishes unfinished text for the sidebar and clears it after send", async () => {
@@ -237,7 +242,12 @@ describe("Composer session drafts", () => {
         text: "possibly delivered",
         files: [],
         clientEventId: "uncertain-event",
-        deliveryUncertain: true,
+      },
+      uncertainDelivery: {
+        conversationId: "conv_draft",
+        text: "possibly delivered",
+        files: [],
+        clientEventId: "uncertain-event",
       },
     });
 
@@ -247,6 +257,43 @@ describe("Composer session drafts", () => {
 
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("blocks an edited uncertain retry until replacement is confirmed", async () => {
+    const onSend = vi.fn();
+    const confirm = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "possibly delivered",
+        files: [],
+        clientEventId: "uncertain-event",
+      },
+      uncertainDelivery: {
+        conversationId: "conv_draft",
+        text: "possibly delivered",
+        files: [],
+        clientEventId: "uncertain-event",
+      },
+    });
+
+    render(<Composer {...composerProps({ onSend })} />);
+    await waitFor(() => expect(textarea()).toHaveValue("possibly delivered"));
+    fireEvent.change(textarea(), { target: { value: "intentional replacement" } });
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(useChatStore.getState().uncertainDelivery?.clientEventId).toBe("uncertain-event");
+    expect(confirm).toHaveBeenCalledTimes(1);
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("intentional replacement", undefined);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(useChatStore.getState().uncertainDelivery).toBeNull();
   });
 });
 

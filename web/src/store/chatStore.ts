@@ -444,7 +444,13 @@ export interface ConversationState {
     text: string;
     files: File[];
     clientEventId?: string;
-    deliveryUncertain?: boolean;
+  } | null;
+  /** Delivery risk retained independently from draft restoration and ID reuse. */
+  uncertainDelivery: {
+    conversationId: string;
+    clientEventId: string;
+    text: string;
+    files: File[];
   } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
@@ -1383,6 +1389,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
+  uncertainDelivery: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -1773,6 +1780,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           content: serverContent,
         },
       });
+      setterFor(sessionId)((state) =>
+        state.uncertainDelivery?.clientEventId === clientEventId ? { uncertainDelivery: null } : {},
+      );
       result = "settled";
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
@@ -1856,14 +1866,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         draftSessionId !== null &&
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
+        const deliveryUncertain = isUncertainDeliveryError(err);
         setterFor(draftSessionId)({
           failedSendDraft: {
             conversationId: draftSessionId,
             text,
             files: files ?? [],
             ...(shouldPreserveClientEventId(err) ? { clientEventId } : {}),
-            ...(isUncertainDeliveryError(err) ? { deliveryUncertain: true } : {}),
           },
+          ...(deliveryUncertain
+            ? {
+                uncertainDelivery: {
+                  conversationId: draftSessionId,
+                  clientEventId,
+                  text,
+                  files: files ?? [],
+                },
+              }
+            : {}),
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
@@ -1980,6 +2000,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         data: { kind: "skill", name, arguments: args },
         client_event_id: clientEventId,
       });
+      setterFor(sessionId)((state) =>
+        state.uncertainDelivery?.clientEventId === clientEventId ? { uncertainDelivery: null } : {},
+      );
       result = "settled";
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
@@ -2031,14 +2054,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (!suppressFailure && !persistedFailure && draftSessionId !== null) {
+        const deliveryUncertain = isUncertainDeliveryError(err);
         setterFor(draftSessionId)({
           failedSendDraft: {
             conversationId: draftSessionId,
             text: commandText,
             files: [],
             ...(shouldPreserveClientEventId(err) ? { clientEventId } : {}),
-            ...(isUncertainDeliveryError(err) ? { deliveryUncertain: true } : {}),
           },
+          ...(deliveryUncertain
+            ? {
+                uncertainDelivery: {
+                  conversationId: draftSessionId,
+                  clientEventId,
+                  text: commandText,
+                  files: [],
+                },
+              }
+            : {}),
         });
       }
       // Keep an echo the server says it persisted; snapshots reconcile it.
