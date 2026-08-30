@@ -5955,11 +5955,12 @@ export async function deliverInitialPrompt(params: {
       new Promise<void>((resolve) => {
         setTimeout(resolve, ms);
       }));
+  const maxAttempts = delays.length + 1;
   // Sequential by design: each attempt must resolve before the next starts,
   // or a retry could race a late success into a duplicate message — hence
   // the awaits in the loop below.
-  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
-    const isFinal = attempt === delays.length;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const isFinal = attempt === maxAttempts - 1;
     // The store actions settle their own failures; a rejection here would
     // be an unexpected one, and treating it as "not settled" keeps the loop
     // (and the caller's bookkeeping) alive rather than stranding the prompt.
