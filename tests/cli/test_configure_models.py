@@ -3460,6 +3460,8 @@ def test_claude_subscription_relabeled_as_managed_gateway(tmp_path, monkeypatch)
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
     assert _credential_label("claude", entry) == "Databricks AI Gateway"
     assert _compact_credential_label(det) == "Databricks AI Gateway"
+
+
 def _cp1252_console():
     """Build a Rich console whose file encodes as cp1252, like a legacy Windows shell.
 
