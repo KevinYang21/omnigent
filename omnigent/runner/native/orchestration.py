@@ -4346,6 +4346,44 @@ async def _auto_create_codex_terminal(
     return terminal_view
 
 
+async def _start_codex_thread_directly(
+    event_client: CodexAppServerClient, *, session_id: str
+) -> str | None:
+    """
+    Start an app-server thread when the TUI never created one.
+
+    A runner-owned Codex TUI can block before creating its thread — e.g. on
+    an interactive startup prompt (version advertisement, update nag) that
+    nobody answers in a detached pane. The app-server itself is healthy, so
+    ask it for a thread directly: chat keeps working while the terminal
+    still shows the prompt for the user to answer.
+
+    :param event_client: Connected app-server client.
+    :param session_id: Omnigent session id, for logging.
+    :returns: The new thread id, or ``None`` when the app-server refused.
+    """
+    try:
+        response = await event_client.request("thread/start", {})
+    except Exception:
+        _logger.exception("Codex direct thread/start fallback failed for %s", session_id)
+        return None
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
+    if not isinstance(thread_id, str) or not thread_id:
+        _logger.warning(
+            "Codex direct thread/start fallback returned no thread id for %s",
+            session_id,
+        )
+        return None
+    _logger.info(
+        "Codex TUI blocked at startup for %s; adopted app-server thread %s directly",
+        session_id,
+        thread_id,
+    )
+    return thread_id
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -4404,27 +4442,37 @@ async def _codex_discover_thread_and_forward(
         try:
             thread_id = await wait_for_thread_started(event_client)
         except (TimeoutError, RuntimeError) as exc:
-            # Expected failure modes of wait_for_thread_started: the TUI exited
-            # at startup, or the event stream ended before a thread was
-            # created. Stop forwarding (cleanup runs in ``finally``); any other
-            # error is a bug and propagates.
-            _logger.exception(
-                "Codex TUI never started a thread for %s; chat will not forward",
-                session_id,
-            )
-            # Bridge state is never written here; leave the real cause for the executor (#59).
-            cause = (
-                "startup timed out"
-                if isinstance(exc, TimeoutError)
-                else "event stream ended before a thread was created"
-            )
-            write_bridge_startup_error(
-                bridge_dir,
-                f"Codex app-server never started a thread ({cause}: "
-                f"{type(exc).__name__}). Launch routing: {routing_summary}. "
-                "(The runner log has the same near 'native-codex routing'.)",
-            )
-            return
+            # Expected failure modes of wait_for_thread_started: the TUI is
+            # blocked (e.g. on an interactive startup prompt nobody answers
+            # in a runner-owned pane) or exited, or the event stream ended.
+            fallback_thread_id: str | None = None
+            if isinstance(exc, TimeoutError):
+                # The TUI can sit at a startup prompt (version advertisement,
+                # update nag) with nobody to answer it. Start the thread
+                # directly on the app-server so chat survives; the terminal
+                # keeps showing the prompt for the user to answer.
+                fallback_thread_id = await _start_codex_thread_directly(
+                    event_client, session_id=session_id
+                )
+            if fallback_thread_id is None:
+                _logger.exception(
+                    "Codex TUI never started a thread for %s; chat will not forward",
+                    session_id,
+                )
+                # Bridge state is never written here; leave the real cause for the executor (#59).
+                cause = (
+                    "startup timed out"
+                    if isinstance(exc, TimeoutError)
+                    else "event stream ended before a thread was created"
+                )
+                write_bridge_startup_error(
+                    bridge_dir,
+                    f"Codex app-server never started a thread ({cause}: "
+                    f"{type(exc).__name__}). Launch routing: {routing_summary}. "
+                    "(The runner log has the same near 'native-codex routing'.)",
+                )
+                return
+            thread_id = fallback_thread_id
 
         write_bridge_state(
             bridge_dir,

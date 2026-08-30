@@ -3142,6 +3142,139 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 
 
 @pytest.mark.asyncio
+async def test_codex_blocked_tui_startup_falls_back_to_direct_thread_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A TUI blocked on an interactive startup prompt must not kill the session.
+
+    When the runner-owned Codex TUI sits at a startup prompt (version
+    advertisement / update nag) that nobody answers, ``wait_for_thread_started``
+    times out. The discovery task must then start a thread directly on the
+    healthy app-server and persist bridge state pointing at it — so the web
+    chat keeps working — instead of recording a startup error that fails the
+    user's message.
+    """
+    from omnigent import codex_native_forwarder
+    from omnigent.codex_native_bridge import (
+        read_bridge_startup_error,
+        read_bridge_state,
+    )
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    fallback_thread_id = "019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"
+    requests: list[tuple[str, object]] = []
+
+    class _Client:
+        async def request(self, method: str, params: object) -> dict[str, object]:
+            requests.append((method, params))
+            return {"result": {"thread": {"id": fallback_thread_id}}}
+
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    async def _raise_timeout(*_args: object, **_kwargs: object) -> str:
+        raise TimeoutError("no thread/started observed")
+
+    forwarded: dict[str, object] = {}
+
+    async def _fake_supervise(**kwargs: object) -> None:
+        forwarded.update(kwargs)
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise_timeout)
+    monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    session_id = "9f2ad0c1b4e64a30a1c2d3e4f5a6b7c8"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    # The fallback asked the app-server for a thread directly.
+    assert ("thread/start", {}) in requests
+    # No startup error: the session survives with a working chat path.
+    assert read_bridge_startup_error(tmp_path) is None
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == fallback_thread_id
+    assert state.session_id == session_id
+    # The forwarder was started against the fallback thread.
+    assert forwarded.get("thread_id") == fallback_thread_id
+
+
+@pytest.mark.asyncio
+async def test_codex_direct_thread_start_failure_still_records_startup_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    When the direct thread/start fallback also fails, the original
+    startup-error breadcrumb must still be recorded so the executor
+    surfaces the true cause instead of hanging on a missing bridge state.
+    """
+    from omnigent import codex_native_forwarder
+    from omnigent.codex_native_bridge import (
+        read_bridge_startup_error,
+        read_bridge_state,
+    )
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    class _Client:
+        async def request(self, method: str, params: object) -> dict[str, object]:
+            raise RuntimeError("app-server connection lost")
+
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    async def _raise_timeout(*_args: object, **_kwargs: object) -> str:
+        raise TimeoutError("no thread/started observed")
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise_timeout)
+
+    session_id = "8e1bc9d0a3f54b21a0b1c2d3e4f5a6b7"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    recorded = read_bridge_startup_error(tmp_path)
+    assert recorded is not None
+    assert "startup timed out" in recorded
+    assert read_bridge_state(tmp_path) is None
+
+
+@pytest.mark.asyncio
 async def test_cold_start_agy_conversation_rejects_a_foreign_agy_cascade(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
