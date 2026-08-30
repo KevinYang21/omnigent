@@ -4450,7 +4450,11 @@ async def _codex_discover_thread_and_forward(
                 # The TUI can sit at a startup prompt (version advertisement,
                 # update nag) with nobody to answer it. Start the thread
                 # directly on the app-server so chat survives; the terminal
-                # keeps showing the prompt for the user to answer.
+                # keeps showing the prompt for the user to answer. If they
+                # answer later, the un-blocked TUI creates its own thread and
+                # the forwarder's rotation path moves chat onto it (same as a
+                # native /clear). A RuntimeError means the event stream ended
+                # (app-server gone), so no fallback is attempted.
                 fallback_thread_id = await _start_codex_thread_directly(
                     event_client, session_id=session_id
                 )

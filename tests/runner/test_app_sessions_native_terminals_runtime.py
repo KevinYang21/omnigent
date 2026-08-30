@@ -3220,6 +3220,65 @@ async def test_codex_blocked_tui_startup_falls_back_to_direct_thread_start(
 
 
 @pytest.mark.asyncio
+async def test_codex_ended_event_stream_skips_direct_thread_start_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A dead event stream means the app-server is gone, so the direct
+    thread/start fallback must not even be attempted — the startup error
+    is recorded with the stream-ended cause.
+    """
+    from omnigent import codex_native_forwarder
+    from omnigent.codex_native_bridge import (
+        read_bridge_startup_error,
+        read_bridge_state,
+    )
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    requests: list[str] = []
+
+    class _Client:
+        async def request(self, method: str, params: object) -> dict[str, object]:
+            requests.append(method)
+            return {"result": {"thread": {"id": "unexpected"}}}
+
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    async def _raise_stream_ended(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("event stream ended")
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise_stream_ended)
+
+    session_id = "7d0ab8c9e2f14a53b0c1d2e3f4a5b6c7"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert requests == []
+    recorded = read_bridge_startup_error(tmp_path)
+    assert recorded is not None
+    assert "event stream ended before a thread was created" in recorded
+    assert read_bridge_state(tmp_path) is None
+
+
+@pytest.mark.asyncio
 async def test_codex_direct_thread_start_failure_still_records_startup_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
