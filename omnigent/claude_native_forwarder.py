@@ -1196,6 +1196,11 @@ async def forward_claude_transcript_to_session(
     # regression shows up as "gate never engages" (no CPU win) or "gate
     # engaged while a turn was live" (a bug), both visible without a rebuild.
     gate_engaged = False
+    # Correlates the two gate-transition log lines with a session without
+    # logging the bridge path (its name encodes the session identity, which
+    # code scanning treats as sensitive). Operators can recompute the digest
+    # from a known bridge dir to match log lines to a session.
+    bridge_label = hashlib.sha256(str(bridge_dir).encode("utf-8")).hexdigest()[:12]
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
@@ -1223,20 +1228,18 @@ async def forward_claude_transcript_to_session(
                     ):
                         if not gate_engaged:
                             gate_engaged = True
-                            # The bridge dir names the session, so the id
-                            # itself stays out of the log line.
                             _logger.debug(
                                 "Claude transcript forwarder idle; skipping unchanged "
-                                "polls; bridge_dir=%s",
-                                bridge_dir,
+                                "polls; bridge=%s",
+                                bridge_label,
                             )
                         await asyncio.sleep(poll_interval_s)
                         continue
                     if gate_engaged:
                         gate_engaged = False
                         _logger.debug(
-                            "Claude transcript forwarder resumed; bridge_dir=%s",
-                            bridge_dir,
+                            "Claude transcript forwarder resumed; bridge=%s",
+                            bridge_label,
                         )
                     last_full_poll_at = now
                 async with asyncio.timeout(_FORWARD_LOOP_STALL_DEADLINE_S):
