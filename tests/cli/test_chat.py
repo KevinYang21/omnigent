@@ -21,7 +21,6 @@ from omnigent.chat import (
     _SERVER_READY_INITIAL_POLL_SECONDS,
     _SERVER_READY_SLOW_POLL_SECONDS,
     _SERVER_READY_SLOW_POLL_WINDOW_SECONDS,
-    _server_ready_poll_interval,
     ChatOverrides,
     _apply_overrides_to_raw,
     _chat_via_daemon,
@@ -36,6 +35,7 @@ from omnigent.chat import (
     _query_sessions_once,
     _raise_server_failed,
     _remote_headers,
+    _server_ready_poll_interval,
     _spec_used_families,
     _start_local_server,
     _validate_agent_spec,
@@ -306,9 +306,9 @@ def test_server_ready_poll_interval_slows_down_on_cold_boots() -> None:
     boot starvation. The three-tier schedule keeps sub-second boots
     snappy while easing off on the slow tail.
     """
-    assert (
-        _server_ready_poll_interval(0.0) == _SERVER_READY_INITIAL_POLL_SECONDS
-    ), "sub-window probes must stay aggressive for fast boots"
+    assert _server_ready_poll_interval(0.0) == _SERVER_READY_INITIAL_POLL_SECONDS, (
+        "sub-window probes must stay aggressive for fast boots"
+    )
     assert (
         _server_ready_poll_interval(_SERVER_READY_FAST_POLL_WINDOW_SECONDS)
         == _SERVER_READY_BACKOFF_POLL_SECONDS

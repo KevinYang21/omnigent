@@ -120,6 +120,7 @@ def _server_ready_poll_interval(elapsed: float) -> float:
         return _SERVER_READY_BACKOFF_POLL_SECONDS
     return _SERVER_READY_SLOW_POLL_SECONDS
 
+
 # The local-boot budget: how long ``omnigent run`` waits for its own
 # spawned server + runner before giving up. This is a last-resort
 # guard against a genuinely wedged boot, so it must sit ABOVE every
