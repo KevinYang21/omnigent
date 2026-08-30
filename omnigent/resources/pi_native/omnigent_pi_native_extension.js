@@ -1089,7 +1089,10 @@ function startInboxPoller(
         // a web "Send now" delivered as a follow-up stays visibly queued in
         // the Pi CLI even though the web UI already reported success. When
         // the agent is idle, keep "followUp" — it starts the next turn
-        // immediately, preserving initiating-message behavior.
+        // immediately, preserving initiating-message behavior. A turn ending
+        // between this check and the send is benign: the message still
+        // reaches Pi's queue, and a throw leaves the file for the next tick,
+        // which recomputes the mode.
         const deliverAs =
           typeof isTurnActive === "function" && isTurnActive()
             ? "steer"
