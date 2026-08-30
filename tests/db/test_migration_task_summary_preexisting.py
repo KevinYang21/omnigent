@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.script import ScriptDirectory
 from sqlalchemy.engine import Engine
 
 from omnigent.db.utils import (
@@ -40,8 +41,14 @@ from omnigent.db.utils import (
 
 # Revision one step before ``za2b3c4d5e6f`` (which adds ``task_summary``).
 _REVISION_BEFORE_TASK_SUMMARY = "d5e9f1a2b3c4"
-# Current head at the time this bug was filed; asserted as the reachable target.
-_EXPECTED_HEAD = "e5d9bc8ac650"
+
+
+def _alembic_head(uri: str) -> str:
+    """Resolve the current script head so new migrations don't break the assert."""
+    config = _build_alembic_config(uri)
+    head = ScriptDirectory.from_config(config).get_current_head()
+    assert head is not None, "alembic script directory must have a single head"
+    return head
 
 _METADATA_TABLE = "omnigent_conversation_metadata"
 
@@ -107,7 +114,7 @@ def test_upgrade_with_preexisting_task_summary_column(tmp_path: Path) -> None:
     # Drive the real server-startup migration path.
     _initialize_or_verify_schema(engine, uri)
 
-    assert _get_current_db_revision(engine) == _EXPECTED_HEAD, (
+    assert _get_current_db_revision(engine) == _alembic_head(uri), (
         "database must reach head after reconciling the preexisting column"
     )
     assert _task_summary_present(engine), "task_summary must remain present after upgrade"
@@ -132,5 +139,5 @@ def test_upgrade_adds_missing_task_summary_column(tmp_path: Path) -> None:
 
     _initialize_or_verify_schema(engine, uri)
 
-    assert _get_current_db_revision(engine) == _EXPECTED_HEAD
+    assert _get_current_db_revision(engine) == _alembic_head(uri)
     assert _task_summary_present(engine), "task_summary must be added when absent"
