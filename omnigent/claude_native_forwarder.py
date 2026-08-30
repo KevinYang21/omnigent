@@ -1517,6 +1517,7 @@ async def _forward_available_subagents(
                             "item_type": item.item_type,
                             "item_data": item.data,
                             "response_id": item.response_id,
+                            "source_id": item.source_id,
                         },
                         reason="permanent HTTP failure after retries",
                         # Claude only dead-letters permanent 4xx (it retries
@@ -3458,6 +3459,7 @@ async def _forward_available_items(
                         "item_type": item.item_type,
                         "item_data": item.data,
                         "response_id": item.response_id,
+                        "source_id": item.source_id,
                     },
                     reason="permanent HTTP failure after retries",
                     # Claude only dead-letters permanent 4xx (it retries
@@ -4043,6 +4045,7 @@ async def _post_external_conversation_item(
                     "item_type": item.item_type,
                     "item_data": item.data,
                     "response_id": item.response_id,
+                    "source_id": item.source_id,
                 },
             },
         )

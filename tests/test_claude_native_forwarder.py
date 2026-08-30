@@ -1233,6 +1233,7 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
     assert posted[5]["response_id"] == posted[6]["response_id"]
     assert posted[5]["response_id"] != posted[4]["response_id"]
     assert posted[1]["response_id"].startswith("resp_claude_")
+    assert len({item["source_id"] for item in posted}) == len(posted)
 
 
 @pytest.mark.asyncio
