@@ -4776,12 +4776,25 @@ async def _ensure_local_claude_resume_transcript(
     return target
 
 
+# Item page sizes the resume fetch walks down on a server-side failure.
+# Deployed stores have failed on large pages while serving smaller pages of
+# the same history fine (e.g. 200 at limit<=400, 500 at limit>=500), so a
+# 5xx on a big page must not abort the resume when a smaller page recovers
+# the exact same items.
+_CLAUDE_RESUME_PAGE_LIMITS = (1000, 400, 100)
+
+
 async def _fetch_all_session_items_for_claude_resume(
     client: httpx.AsyncClient,
     session_id: str,
 ) -> list[_JsonObject]:
     """
     Fetch committed session items in chronological order.
+
+    Pages at the largest size first and, when the server fails a page with
+    a 5xx, retries that page at progressively smaller sizes — a large-page
+    read can fail on a deployed store while the same history paginates fine
+    in smaller pages. Once degraded, later pages stay at the smaller size.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g.
@@ -4793,14 +4806,31 @@ async def _fetch_all_session_items_for_claude_resume(
     """
     items: list[_JsonObject] = []
     after: str | None = None
+    limit_rung = 0
     while True:
-        params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+        params: dict[str, str | int] = {
+            "limit": _CLAUDE_RESUME_PAGE_LIMITS[limit_rung],
+            "order": "asc",
+        }
         if after is not None:
             params["after"] = after
         resp = await client.get(
             f"/v1/sessions/{url_component(session_id)}/items",
             params=params,
         )
+        if resp.status_code >= 500 and limit_rung < len(_CLAUDE_RESUME_PAGE_LIMITS) - 1:
+            # Server-side failure on a big page: the history may still be
+            # fully readable in smaller pages, so degrade and re-request
+            # the SAME page window before giving up on the resume.
+            limit_rung += 1
+            _logger.warning(
+                "History page fetch for %s failed (%s) at limit=%s; retrying at limit=%s",
+                session_id,
+                resp.status_code,
+                params["limit"],
+                _CLAUDE_RESUME_PAGE_LIMITS[limit_rung],
+            )
+            continue
         if resp.status_code >= 400:
             raise click.ClickException(
                 f"Failed to fetch history for {session_id!r} "
