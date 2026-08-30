@@ -489,6 +489,63 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
     ]
 
 
+def test_wait_for_server_retries_through_transient_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A probe timeout must ride the retry loop, not abort the wait.
+
+    A loaded boot can accept the TCP connect and then be too slow to
+    answer within the probe timeout; ``httpx`` raises ``ReadTimeout``
+    (a ``TransportError`` that is *not* a ``ConnectError``). Treating
+    that as fatal turns a merely-slow boot into a hard failure.
+    """
+
+    class _Resp:
+        """Minimal response stub exposing ``status_code``."""
+
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+    server = SimpleNamespace(
+        proc=SimpleNamespace(poll=lambda: None),
+        runner_id=None,
+        log_path=Path("/tmp/server.log"),
+    )
+    http_calls = {"count": 0}
+
+    class _FakeClient:
+        """Client stub: time out twice, then report ready."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_FakeClient":
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, path: str) -> _Resp:
+            """Raise ReadTimeout twice, then report ready."""
+            del path
+            http_calls["count"] += 1
+            if http_calls["count"] < 3:
+                raise httpx.ReadTimeout("probe timed out")
+            return _Resp(200)
+
+    monkeypatch.setattr("omnigent.chat.time.monotonic", lambda: 0.0)
+    monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
+
+    _wait_for_server(8123, server, timeout=5.0)
+
+    assert http_calls["count"] == 3, (
+        "Expected the wait loop to retry through transient probe "
+        "timeouts until the server reports ready."
+    )
+
+
 def test_start_local_server_spawns_runner_as_sibling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

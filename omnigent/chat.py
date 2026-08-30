@@ -3732,7 +3732,10 @@ def _wait_for_server(
                     runner_resp = client.get(f"/v1/runners/{runner_id}/status")
                     if runner_resp.status_code == 200 and runner_resp.json()["online"] is True:
                         return
-            except httpx.ConnectError:
+            except httpx.TransportError:
+                # Refused connects AND transient timeouts (a loaded boot
+                # can be slow to accept) ride the retry loop instead of
+                # aborting the whole wait.
                 pass
             time.sleep(_server_ready_poll_interval(time.monotonic() - start))
     _raise_server_failed(server)
