@@ -15,9 +15,13 @@ from omnigent_client import QueryResult
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
+    _LOCAL_BOOT_TIMEOUT_SECONDS,
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
     _SERVER_READY_INITIAL_POLL_SECONDS,
+    _SERVER_READY_SLOW_POLL_SECONDS,
+    _SERVER_READY_SLOW_POLL_WINDOW_SECONDS,
+    _server_ready_poll_interval,
     ChatOverrides,
     _apply_overrides_to_raw,
     _chat_via_daemon,
@@ -252,17 +256,29 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
         """Record each poll interval the helper chooses."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, timeout: float) -> _Resp:
-        """Fail twice, then report ready on the third probe."""
-        del url, timeout
-        http_calls["count"] += 1
-        if http_calls["count"] < 3:
-            raise __import__("httpx").ConnectError("not ready")
-        return _Resp(200)
+    class _FakeClient:
+        """Client stub: fail twice, then report ready on the third probe."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> "_FakeClient":
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, path: str) -> _Resp:
+            """Fail twice, then report ready."""
+            del path
+            http_calls["count"] += 1
+            if http_calls["count"] < 3:
+                raise __import__("httpx").ConnectError("not ready")
+            return _Resp(200)
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
     monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     _wait_for_server(8123, server, timeout=5.0)
 
@@ -276,6 +292,57 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
     )
     assert _SERVER_READY_INITIAL_POLL_SECONDS < _SERVER_READY_BACKOFF_POLL_SECONDS
     assert _SERVER_READY_FAST_POLL_WINDOW_SECONDS == 1.0
+
+
+def test_server_ready_poll_interval_slows_down_on_cold_boots() -> None:
+    """
+    Readiness probing must relax for boots that outlive the slow window.
+
+    A boot that is already several seconds in is a cold start on a
+    loaded machine; probing it at 10Hz steals CPU from the very
+    server/runner processes the loop is waiting on (each probe costs
+    real cycles), which under concurrent e2e shard load compounds into
+    boot starvation. The three-tier schedule keeps sub-second boots
+    snappy while easing off on the slow tail.
+    """
+    assert (
+        _server_ready_poll_interval(0.0) == _SERVER_READY_INITIAL_POLL_SECONDS
+    ), "sub-window probes must stay aggressive for fast boots"
+    assert (
+        _server_ready_poll_interval(_SERVER_READY_FAST_POLL_WINDOW_SECONDS)
+        == _SERVER_READY_BACKOFF_POLL_SECONDS
+    ), "past the fast window the probe interval must back off"
+    assert (
+        _server_ready_poll_interval(_SERVER_READY_SLOW_POLL_WINDOW_SECONDS)
+        == _SERVER_READY_SLOW_POLL_SECONDS
+    ), "a boot slower than the slow window must be probed gently"
+    assert (
+        _SERVER_READY_INITIAL_POLL_SECONDS
+        < _SERVER_READY_BACKOFF_POLL_SECONDS
+        < _SERVER_READY_SLOW_POLL_SECONDS
+    )
+
+
+def test_local_boot_budget_covers_consumer_launch_budgets() -> None:
+    """
+    The CLI's internal local-boot budget must not undercut its consumers.
+
+    The REPL e2e tests hold ``omnigent run`` boot to a 60-120s launch
+    budget. When ``_wait_for_server``'s default timeout sat below that
+    (45s), a merely-slow boot on a loaded machine was killed by the
+    internal budget first and misreported as a hard "Server failed to
+    start" — boot starvation counted as failure. The internal budget is
+    a last-resort wedge guard, so it must sit at or above every
+    consumer-facing launch budget.
+    """
+    import inspect
+
+    default_timeout = inspect.signature(_wait_for_server).parameters["timeout"].default
+    assert default_timeout == _LOCAL_BOOT_TIMEOUT_SECONDS
+    assert default_timeout >= 120.0, (
+        "the internal local-boot budget must cover the slowest consumer "
+        "launch budget (the REPL e2e tests wait up to 120s for boot)"
+    )
 
 
 def test_raise_server_failed_truncates_log_to_tail(tmp_path: Path) -> None:
@@ -385,19 +452,31 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
         """Record the poll interval chosen while runner is offline."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, timeout: float) -> _Resp:
-        """Report server readiness immediately but runner online later."""
-        del timeout
-        requested_urls.append(url)
-        if url.endswith("/health"):
-            return _Resp(200)
-        if url.endswith("/v1/runners/runner_wait_test/status"):
-            return _Resp(200, next(status_bodies))
-        raise AssertionError(f"unexpected URL: {url}")
+    class _FakeClient:
+        """Client stub reporting server ready immediately, runner later."""
+
+        def __init__(self, *, base_url: str = "", **_kwargs: object) -> None:
+            self._base_url = base_url
+
+        def __enter__(self) -> "_FakeClient":
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, path: str) -> _Resp:
+            """Report server readiness immediately but runner online later."""
+            url = self._base_url + path
+            requested_urls.append(url)
+            if url.endswith("/health"):
+                return _Resp(200)
+            if url.endswith("/v1/runners/runner_wait_test/status"):
+                return _Resp(200, next(status_bodies))
+            raise AssertionError(f"unexpected URL: {url}")
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
     monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     _wait_for_server(8123, server, timeout=5.0)
 
