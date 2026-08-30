@@ -524,6 +524,9 @@ export function touchScrollPayload(
   const total = partial + (move.previousY - move.currentY) / screen.cellHeight;
   const whole = Math.trunc(total);
   if (mouse.mouseTrackingMode === "none" || !mouse.sgrEncoding) {
+    // Unlike the wheel path (which defers non-SGR tracking to xterm's
+    // native handler), touch has no native fallback — scroll the buffer,
+    // a harmless no-op on an alt-screen TUI with empty scrollback.
     return { consume: true, lines: whole, data: "", partial: total - whole };
   }
   const capped = Math.max(
@@ -833,6 +836,8 @@ export class TerminalSession {
           this.screenMetrics(),
           this.touchPartialLines,
         );
+        // Advance even on an unmeasurable (non-consumed) step so the next
+        // measurable one resumes from the current finger position.
         this.touchLastY = touch.clientY;
         this.touchPartialLines = result.partial;
         if (!result.consume) return;
