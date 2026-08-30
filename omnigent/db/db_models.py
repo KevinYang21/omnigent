@@ -980,18 +980,28 @@ class SqlMessageEventReceipt(ConversationBase):
     fingerprint: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    owner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    lease_expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    pending_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pending_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'completed', 'failed')",
+            "status IN ('pending', 'completed', 'failed', 'uncertain')",
             name="ck_message_event_receipts_status",
         ),
         CheckConstraint(
             "(status = 'completed' AND outcome IS NOT NULL) OR "
-            "(status IN ('pending', 'failed') AND outcome IS NULL)",
+            "(status IN ('pending', 'failed', 'uncertain') AND outcome IS NULL)",
             name="ck_message_event_receipts_outcome",
+        ),
+        CheckConstraint(
+            "(pending_id IS NULL AND pending_payload IS NULL) OR "
+            "(pending_id IS NOT NULL AND pending_payload IS NOT NULL)",
+            name="ck_message_event_receipts_pending_payload",
         ),
     )
 

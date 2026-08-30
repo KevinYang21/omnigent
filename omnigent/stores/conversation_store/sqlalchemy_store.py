@@ -94,6 +94,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     MessageEventReceipt,
+    PendingMessageInput,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -2120,6 +2121,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         conversation_id: str,
         client_event_id: str,
         fingerprint: str,
+        *,
+        owner_id: str = "legacy",
+        lease_expires_at: int = 0,
     ) -> tuple[bool, MessageEventReceipt]:
         """Atomically insert or read a durable message-event receipt."""
         now = now_epoch()
@@ -2132,6 +2136,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             fingerprint=fingerprint_bytes,
             status="pending",
             outcome=None,
+            owner_id=owner_id,
+            lease_expires_at=lease_expires_at,
+            pending_id=None,
+            pending_payload=None,
+            pending_created_by=None,
             created_at=now,
             updated_at=now,
         )
@@ -2152,7 +2161,22 @@ class SqlAlchemyConversationStore(ConversationStore):
             fingerprint=fingerprint,
             status="pending",
             outcome=None,
+            owner_id=owner_id,
+            lease_expires_at=lease_expires_at,
         )
+
+    def get_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+    ) -> MessageEventReceipt | None:
+        """Read the latest durable state for one logical submission."""
+        with self._conv_session("get_message_event") as session:
+            row = session.get(
+                SqlMessageEventReceipt,
+                (current_workspace_id(), conversation_id, client_event_id),
+            )
+            return self._message_event_receipt(row) if row is not None else None
 
     def complete_message_event(
         self,
@@ -2164,10 +2188,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         outcome: dict[str, bool | str] | None,
     ) -> None:
         """Persist a claimed message event's terminal outcome."""
-        if status not in {"completed", "failed"}:
+        if status not in {"completed", "failed", "uncertain"}:
             raise ValueError(f"unsupported message receipt status: {status}")
         if (status == "completed") != (outcome is not None):
-            raise ValueError("completed receipts require an outcome; failed receipts forbid one")
+            raise ValueError(
+                "completed receipts require an outcome; failed/uncertain receipts forbid one"
+            )
         encoded_outcome = (
             json.dumps(outcome, separators=(",", ":"), sort_keys=True)
             if outcome is not None
@@ -2216,6 +2242,89 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "message receipt was not pending when its claim was released"
                 )
 
+    def record_message_event_pending_input(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+        fingerprint: str,
+        *,
+        pending_id: str,
+        content: list[dict[str, Any]],
+        created_by: str | None,
+    ) -> None:
+        """Persist native input metadata before the runner receives it."""
+        encoded = json.dumps(content, separators=(",", ":"), sort_keys=True)
+        with self._conv_session("record_message_event_pending_input") as session:
+            result = session.execute(
+                update(SqlMessageEventReceipt)
+                .where(
+                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
+                    SqlMessageEventReceipt.conversation_id == conversation_id,
+                    SqlMessageEventReceipt.client_event_id == client_event_id,
+                    SqlMessageEventReceipt.fingerprint == bytes.fromhex(fingerprint),
+                    SqlMessageEventReceipt.status == "pending",
+                    SqlMessageEventReceipt.pending_id.is_(None),
+                )
+                .values(
+                    pending_id=pending_id,
+                    pending_payload=encoded,
+                    pending_created_by=created_by,
+                    updated_at=now_epoch(),
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("message receipt could not record its native pending input")
+
+    def list_message_event_pending_inputs(
+        self,
+        conversation_id: str,
+    ) -> list[PendingMessageInput]:
+        """List durable native inputs still awaiting transcript arrival."""
+        with self._conv_session("list_message_event_pending_inputs") as session:
+            rows = session.execute(
+                select(SqlMessageEventReceipt)
+                .where(
+                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
+                    SqlMessageEventReceipt.conversation_id == conversation_id,
+                    SqlMessageEventReceipt.pending_id.is_not(None),
+                )
+                .order_by(
+                    SqlMessageEventReceipt.created_at,
+                    SqlMessageEventReceipt.client_event_id,
+                )
+            ).scalars()
+            return [self._pending_message_input(row) for row in rows]
+
+    def resolve_oldest_message_event_pending_input(
+        self,
+        conversation_id: str,
+    ) -> PendingMessageInput | None:
+        """Atomically drain the oldest durable native pending input."""
+        with self._conv_session("resolve_oldest_message_event_pending_input") as session:
+            row = session.execute(
+                select(SqlMessageEventReceipt)
+                .where(
+                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
+                    SqlMessageEventReceipt.conversation_id == conversation_id,
+                    SqlMessageEventReceipt.pending_id.is_not(None),
+                )
+                .order_by(
+                    SqlMessageEventReceipt.created_at,
+                    SqlMessageEventReceipt.client_event_id,
+                )
+                .limit(1)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            pending = self._pending_message_input(row)
+            row.pending_id = None
+            row.pending_payload = None
+            row.pending_created_by = None
+            row.updated_at = now_epoch()
+            session.flush()
+            return pending
+
     @staticmethod
     def _message_event_receipt(row: SqlMessageEventReceipt) -> MessageEventReceipt:
         outcome: dict[str, bool | str] | None = None
@@ -2228,6 +2337,21 @@ class SqlAlchemyConversationStore(ConversationStore):
             fingerprint=bytes(row.fingerprint).hex(),
             status=row.status,
             outcome=outcome,
+            owner_id=row.owner_id,
+            lease_expires_at=row.lease_expires_at,
+        )
+
+    @staticmethod
+    def _pending_message_input(row: SqlMessageEventReceipt) -> PendingMessageInput:
+        if row.pending_id is None or row.pending_payload is None:
+            raise ValueError("message receipt pending input is incomplete")
+        decoded = json.loads(row.pending_payload)
+        if not isinstance(decoded, list) or not all(isinstance(block, dict) for block in decoded):
+            raise ValueError("message receipt pending payload must be a list of objects")
+        return PendingMessageInput(
+            pending_id=row.pending_id,
+            content=decoded,
+            created_by=row.pending_created_by,
         )
 
     def list_projects(

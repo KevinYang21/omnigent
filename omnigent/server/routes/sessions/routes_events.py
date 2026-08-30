@@ -571,7 +571,7 @@ def register_events_routes(
                 parse_client_side_tool_specs(body.tools)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
-        if body.type == "message" and body.client_event_id is not None:
+        if body.type in {"message", _SLASH_COMMAND_TYPE} and body.client_event_id is not None:
             fingerprint = message_idempotency.event_fingerprint(
                 body.model_dump(
                     mode="json",

@@ -93,7 +93,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import message_idempotency, session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -971,6 +971,7 @@ def _build_session_response(
     host_online: bool | None = None,
     host_resumable: bool = False,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
+    pending_input_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
     viewer_id: str | None = None,
@@ -1131,7 +1132,11 @@ def _build_session_response(
         # so a client that posted then navigated away / rebound re-
         # hydrates the optimistic bubble. Empty for non-native sessions
         # (their message is already persisted into ``items``).
-        pending_inputs=pending_inputs.snapshot_for(conv.id),
+        pending_inputs=(
+            pending_input_events
+            if pending_input_events is not None
+            else pending_inputs.snapshot_for(conv.id)
+        ),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -2223,7 +2228,12 @@ async def _persist_external_conversation_item(
             drained = matched.matched
             skipped_kiro_pending = matched.skipped
         else:
-            drained = pending_inputs.resolve_oldest(session_id)
+            drained = await asyncio.to_thread(
+                conversation_store.resolve_oldest_message_event_pending_input,
+                session_id,
+            )
+            if drained is None:
+                drained = pending_inputs.resolve_oldest(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -5584,11 +5594,22 @@ async def _dispatch_session_event_to_runner_impl(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
-        pending_id: str | None = (
-            pending_inputs.record(session_id, content, created_by=created_by)
-            if isinstance(content, list) and content
-            else None
-        )
+        pending_id: str | None = None
+        if isinstance(content, list) and content:
+            identity = message_idempotency.current_identity()
+            if identity is not None:
+                pending_id = f"pending_{secrets.token_hex(16)}"
+                await asyncio.to_thread(
+                    conversation_store.record_message_event_pending_input,
+                    session_id,
+                    identity.client_event_id,
+                    identity.fingerprint,
+                    pending_id=pending_id,
+                    content=content,
+                    created_by=created_by,
+                )
+            else:
+                pending_id = pending_inputs.record(session_id, content, created_by=created_by)
         # ── Server-side routing for native terminal sessions ────────
         # Same logic as the SDK path in _forward_event_to_runner: if
         # the toggle is on and no model_override is set, call the
@@ -9579,6 +9600,19 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    durable_pending_inputs = await asyncio.to_thread(
+        conv_store.list_message_event_pending_inputs,
+        session_id,
+    )
+    pending_input_events = [
+        {
+            "pending_id": pending.pending_id,
+            "content": pending.content,
+            **({"created_by": pending.created_by} if pending.created_by is not None else {}),
+        }
+        for pending in durable_pending_inputs
+    ]
+    pending_input_events.extend(pending_inputs.snapshot_for(session_id))
     return _build_session_response(
         conv,
         items,
@@ -9601,6 +9635,7 @@ async def _get_session_snapshot(
             conv_store,
             conv,
         ),
+        pending_input_events=pending_input_events,
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
         agent_store=agent_store,

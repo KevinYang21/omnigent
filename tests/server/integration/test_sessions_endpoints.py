@@ -440,7 +440,7 @@ async def test_message_client_event_id_terminal_4xx_is_not_dispatched_on_retry(
 
     assert first.status_code == 400, first.text
     assert replay.status_code == 409, replay.text
-    assert replay.json()["error"]["code"] == ErrorCode.CONFLICT
+    assert replay.json()["error"]["code"] == ErrorCode.MESSAGE_EVENT_FAILED
     assert dispatches == 1
 
 
@@ -481,12 +481,25 @@ async def test_native_message_replay_injects_once_and_keeps_one_pending_input(
         agent["id"],
         labels={"omnigent.wrapper": "claude-code-native-ui"},
     )
+    uploaded = await client.post(
+        f"/v1/sessions/{session['id']}/resources/files",
+        files={"file": ("native.png", b"\x89PNG\r\n\x1a\n", "image/png")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    file_id = uploaded.json()["id"]
     event = {
         "type": "message",
         "client_event_id": "native-logical-submit",
         "data": {
             "role": "user",
-            "content": [{"type": "input_text", "text": "send to claude once"}],
+            "content": [
+                {
+                    "type": "input_image",
+                    "file_id": file_id,
+                    "filename": "native.png",
+                },
+                {"type": "input_text", "text": "send to claude once"},
+            ],
         },
     }
 
@@ -502,9 +515,50 @@ async def test_native_message_replay_injects_once_and_keeps_one_pending_input(
             request for request in forwarded_requests if request.url.path.endswith("/events")
         ]
         assert len(event_requests) == 1
-        pending = pending_inputs.snapshot_for(session["id"])
+        snapshot = await client.get(f"/v1/sessions/{session['id']}")
+        assert snapshot.status_code == 200, snapshot.text
+        pending = snapshot.json()["pending_inputs"]
         assert len(pending) == 1
         assert pending[0]["pending_id"] == first.json()["pending_id"]
+        assert pending[0]["content"] == event["data"]["content"]
+
+        # Simulate an AP restart: the process-local native index is empty, but
+        # the receipt-backed optimistic input remains available and is drained
+        # by the eventual transcript item exactly once.
+        pending_inputs.reset_for_tests()
+        transcript = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "send to claude once"}
+                        ],
+                    },
+                    "response_id": "native-turn-1",
+                },
+            },
+        )
+        assert transcript.status_code == 202, transcript.text
+        committed = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+        matching = [
+            item
+            for item in committed
+            if item["type"] == "message"
+            and item["role"] == "user"
+            and item["content"][-1].get("text") == "send to claude once"
+        ]
+        assert len(matching) == 1
+        assert matching[0]["content"][0] == {
+            "type": "input_image",
+            "file_id": file_id,
+            "filename": "native.png",
+        }
+        after = await client.get(f"/v1/sessions/{session['id']}")
+        assert after.json()["pending_inputs"] == []
     finally:
         await fake_runner.aclose()
         pending_inputs.reset_for_tests()
@@ -1709,18 +1763,29 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         )
         session = await _create_session(client, agent["id"])
 
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={
-                "type": "slash_command",
-                "data": {
-                    "kind": "skill",
-                    "name": "grill-me",
-                    "arguments": "review this rollout",
-                },
+        event = {
+            "type": "slash_command",
+            "client_event_id": "skill-logical-submit",
+            "data": {
+                "kind": "skill",
+                "name": "grill-me",
+                "arguments": "review this rollout",
             },
-        )
+        }
+        resp = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
         assert resp.status_code == 202, resp.text
+        # Model a lost accepted response: process-local state is gone and the
+        # browser repeats the same logical command identity.
+        message_idempotency.reset_for_tests()
+        replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+        assert replay.status_code == 202, replay.text
+        assert replay.json() == {**resp.json(), "idempotency_replayed": True}
+        intentional = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={**event, "client_event_id": "skill-intentional-repeat"},
+        )
+        assert intentional.status_code == 202, intentional.text
+        assert intentional.json()["item_id"] != resp.json()["item_id"]
     finally:
         await fake_runner.aclose()
 
@@ -1730,8 +1795,12 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     items_resp = await client.get(f"/v1/sessions/{session['id']}/items")
     assert items_resp.status_code == 200, items_resp.text
     items = items_resp.json()["data"]
-    visible = next(item for item in items if item["type"] == "slash_command")
-    meta = next(item for item in items if item["type"] == "message" and item.get("is_meta"))
+    visible_items = [item for item in items if item["type"] == "slash_command"]
+    meta_items = [item for item in items if item["type"] == "message" and item.get("is_meta")]
+    assert len(visible_items) == 2
+    assert len(meta_items) == 2
+    visible = visible_items[0]
+    meta = meta_items[0]
     assert visible["name"] == "grill-me"
     assert visible["kind"] == "skill"
     assert visible["arguments"] == "review this rollout"
@@ -1743,21 +1812,20 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     assert "<user_request>\nreview this rollout\n</user_request>" in text
     assert "Use the load_skill tool" not in text
 
-    assert forwarded == [
-        {
-            "type": "message",
-            "role": "user",
-            "content": meta["content"],
-            "agent_id": agent["id"],
-            "model": "skill-agent",
-            "has_mcp_servers": False,
-            # The forwarded message is the meta item; its store id lets the
-            # runner dedup it on a cold-cache history reload.
-            "persisted_item_id": meta["id"],
-        }
-    ]
+    assert len(forwarded) == 2
+    assert forwarded[0] == {
+        "type": "message",
+        "role": "user",
+        "content": meta["content"],
+        "agent_id": agent["id"],
+        "model": "skill-agent",
+        "has_mcp_servers": False,
+        # The forwarded message is the meta item; its store id lets the
+        # runner dedup it on a cold-cache history reload.
+        "persisted_item_id": meta["id"],
+    }
     event_types = [event["type"] for _, event in published]
-    assert event_types == ["response.output_item.done"]
+    assert event_types == ["response.output_item.done", "response.output_item.done"]
     assert published[0][1]["item"]["type"] == "slash_command"
     assert published[0][1]["item"]["id"] == visible["id"]
 

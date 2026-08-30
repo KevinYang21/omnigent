@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import threading
+import time
+import uuid
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +17,17 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store import ConversationStore, MessageEventReceipt
 
 _MAX_IN_FLIGHT = 10_000
+_OWNER_LEASE_SECONDS = 300
+_CROSS_REPLICA_JOIN_SECONDS = 2.0
+_CROSS_REPLICA_POLL_SECONDS = 0.05
+
+
+@dataclass(frozen=True)
+class EventIdentity:
+    """Identity of the durable event currently owned by this task."""
+
+    client_event_id: str
+    fingerprint: str
 
 
 @dataclass
@@ -24,6 +38,15 @@ class _InFlight:
 
 _in_flight: dict[tuple[int, str, str], _InFlight] = {}
 _lock = threading.Lock()
+_current_identity: contextvars.ContextVar[EventIdentity | None] = contextvars.ContextVar(
+    "message_event_identity",
+    default=None,
+)
+
+
+def current_identity() -> EventIdentity | None:
+    """Return the durable event identity owned by the current dispatch task."""
+    return _current_identity.get()
 
 
 def event_fingerprint(payload: Mapping[str, Any], created_by: str | None) -> str:
@@ -83,15 +106,28 @@ async def _run_durable(
     fingerprint: str,
     operation: Callable[[], Coroutine[Any, Any, dict[str, bool | str]]],
 ) -> dict[str, bool | str]:
+    owner_id = uuid.uuid4().hex
     claimed, receipt = await asyncio.to_thread(
         conversation_store.claim_message_event,
         session_id,
         client_event_id,
         fingerprint,
+        owner_id=owner_id,
+        lease_expires_at=int(time.time()) + _OWNER_LEASE_SECONDS,
     )
     if not claimed:
-        return _replay_receipt(receipt, fingerprint)
+        return await _join_or_replay(
+            conversation_store,
+            session_id,
+            client_event_id,
+            fingerprint,
+            receipt,
+            operation,
+        )
 
+    identity_token = _current_identity.set(
+        EventIdentity(client_event_id=client_event_id, fingerprint=fingerprint)
+    )
     try:
         outcome = await operation()
     except asyncio.CancelledError:
@@ -113,10 +149,12 @@ async def _run_durable(
                 session_id,
                 client_event_id,
                 fingerprint,
-                status="failed",
+                status="failed" if _is_definitive_failure(exc) else "uncertain",
                 outcome=None,
             )
         raise
+    finally:
+        _current_identity.reset(identity_token)
 
     await asyncio.to_thread(
         conversation_store.complete_message_event,
@@ -127,6 +165,46 @@ async def _run_durable(
         outcome=outcome,
     )
     return outcome
+
+
+async def _join_or_replay(
+    conversation_store: ConversationStore,
+    session_id: str,
+    client_event_id: str,
+    fingerprint: str,
+    receipt: MessageEventReceipt,
+    operation: Callable[[], Coroutine[Any, Any, dict[str, bool | str]]],
+) -> dict[str, bool | str]:
+    """Join a live cross-replica owner briefly, then fail closed."""
+    if receipt.fingerprint != fingerprint:
+        _raise_identity_conflict()
+    deadline = time.monotonic() + _CROSS_REPLICA_JOIN_SECONDS
+    current = receipt
+    while (
+        current.status == "pending"
+        and current.lease_expires_at > int(time.time())
+        and time.monotonic() < deadline
+    ):
+        await asyncio.sleep(_CROSS_REPLICA_POLL_SECONDS)
+        refreshed = await asyncio.to_thread(
+            conversation_store.get_message_event,
+            session_id,
+            client_event_id,
+        )
+        if refreshed is None:
+            # The owner proved it failed before dispatch and released the
+            # claim. This caller may safely compete for a fresh claim.
+            return await _run_durable(
+                conversation_store,
+                session_id,
+                client_event_id,
+                fingerprint,
+                operation,
+            )
+        current = refreshed
+        if current.fingerprint != fingerprint:
+            _raise_identity_conflict()
+    return _replay_receipt(current, fingerprint)
 
 
 def _replay_receipt(
@@ -140,12 +218,25 @@ def _replay_receipt(
     if receipt.status == "failed":
         raise OmnigentError(
             "The original message submission failed; submit again as a new message",
-            code=ErrorCode.CONFLICT,
+            code=ErrorCode.MESSAGE_EVENT_FAILED,
+        )
+    if receipt.status == "uncertain":
+        raise OmnigentError(
+            "The original message may have been delivered before its outcome "
+            "became uncertain. It was not sent again to avoid a duplicate.",
+            code=ErrorCode.MESSAGE_EVENT_UNCERTAIN,
+        )
+    if receipt.lease_expires_at > int(time.time()):
+        raise OmnigentError(
+            "The original message submission is still active. Retry with the same "
+            "client_event_id to check its outcome.",
+            code=ErrorCode.MESSAGE_EVENT_PENDING,
         )
     raise OmnigentError(
-        "The original message may still be processing; it was not sent again "
-        "to avoid a duplicate. Check the conversation before retrying.",
-        code=ErrorCode.CONFLICT,
+        "The original message may have been delivered before its owner stopped. "
+        "It was not sent again to avoid a duplicate; keep this client_event_id "
+        "while checking the conversation.",
+        code=ErrorCode.MESSAGE_EVENT_UNCERTAIN,
     )
 
 
@@ -160,6 +251,11 @@ def _is_definite_pre_dispatch_failure(exc: Exception) -> bool:
     )
 
 
+def _is_definitive_failure(exc: Exception) -> bool:
+    """Return whether the server proved the operation ended without acceptance."""
+    return isinstance(exc, OmnigentError) and 400 <= exc.http_status < 500
+
+
 def _as_replay(outcome: dict[str, bool | str]) -> dict[str, bool | str]:
     return {**outcome, "idempotency_replayed": True}
 
@@ -167,7 +263,7 @@ def _as_replay(outcome: dict[str, bool | str]) -> dict[str, bool | str]:
 def _raise_identity_conflict() -> None:
     raise OmnigentError(
         "client_event_id was already used for a different message",
-        code=ErrorCode.CONFLICT,
+        code=ErrorCode.MESSAGE_EVENT_IDENTITY_CONFLICT,
     )
 
 

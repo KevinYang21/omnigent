@@ -21,6 +21,7 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import PendingMessageInput
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -180,6 +181,56 @@ def test_message_event_receipt_terminal_transition_is_compare_and_set(
     _, receipt = conversation_store.claim_message_event(conv.id, "event", fingerprint)
     assert receipt.status == "failed"
     assert receipt.outcome is None
+
+
+def test_native_pending_input_survives_store_restart_and_drains_once(db_uri: str) -> None:
+    first_store = SqlAlchemyConversationStore(db_uri)
+    conv = first_store.create_conversation()
+    fingerprint = "de" * 32
+    content = [
+        {"type": "input_image", "file_id": "file-1", "filename": "diagram.png"},
+        {"type": "input_text", "text": "explain this"},
+    ]
+    first_store.claim_message_event(
+        conv.id,
+        "native-event",
+        fingerprint,
+        owner_id="replica-a",
+        lease_expires_at=1234,
+    )
+    first_store.record_message_event_pending_input(
+        conv.id,
+        "native-event",
+        fingerprint,
+        pending_id="pending-native",
+        content=content,
+        created_by="alice@example.com",
+    )
+    first_store.complete_message_event(
+        conv.id,
+        "native-event",
+        fingerprint,
+        status="completed",
+        outcome={"queued": True, "pending_id": "pending-native"},
+    )
+
+    restarted_store = SqlAlchemyConversationStore(db_uri)
+    assert restarted_store.list_message_event_pending_inputs(conv.id) == [
+        PendingMessageInput(
+            pending_id="pending-native",
+            content=content,
+            created_by="alice@example.com",
+        )
+    ]
+    assert restarted_store.resolve_oldest_message_event_pending_input(conv.id) == (
+        PendingMessageInput(
+            pending_id="pending-native",
+            content=content,
+            created_by="alice@example.com",
+        )
+    )
+    assert restarted_store.resolve_oldest_message_event_pending_input(conv.id) is None
+    assert restarted_store.list_message_event_pending_inputs(conv.id) == []
 
 
 def test_message_event_claim_is_atomic_across_store_instances(db_uri: str) -> None:

@@ -197,6 +197,17 @@ class MessageEventReceipt:
     fingerprint: str
     status: str
     outcome: dict[str, bool | str] | None
+    owner_id: str
+    lease_expires_at: int
+
+
+@dataclass(frozen=True)
+class PendingMessageInput:
+    """Durable native-terminal input awaiting transcript reconciliation."""
+
+    pending_id: str
+    content: list[dict[str, Any]]
+    created_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -641,12 +652,24 @@ class ConversationStore(ABC):
         conversation_id: str,
         client_event_id: str,
         fingerprint: str,
+        *,
+        owner_id: str = "legacy",
+        lease_expires_at: int = 0,
     ) -> tuple[bool, MessageEventReceipt]:
         """Atomically claim a logical message submission.
 
         The boolean is true only for the caller that inserted the receipt.
         Replays receive the existing durable state.
         """
+        ...
+
+    @abstractmethod
+    def get_message_event(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+    ) -> MessageEventReceipt | None:
+        """Read the latest durable state for one logical submission."""
         ...
 
     @abstractmethod
@@ -670,6 +693,36 @@ class ConversationStore(ABC):
         fingerprint: str,
     ) -> None:
         """Release a claim after a definite pre-dispatch failure."""
+        ...
+
+    @abstractmethod
+    def record_message_event_pending_input(
+        self,
+        conversation_id: str,
+        client_event_id: str,
+        fingerprint: str,
+        *,
+        pending_id: str,
+        content: list[dict[str, Any]],
+        created_by: str | None,
+    ) -> None:
+        """Attach durable native pending-input metadata to an owned receipt."""
+        ...
+
+    @abstractmethod
+    def list_message_event_pending_inputs(
+        self,
+        conversation_id: str,
+    ) -> list[PendingMessageInput]:
+        """List native inputs not yet reconciled by the transcript forwarder."""
+        ...
+
+    @abstractmethod
+    def resolve_oldest_message_event_pending_input(
+        self,
+        conversation_id: str,
+    ) -> PendingMessageInput | None:
+        """Atomically drain the oldest durable native pending input."""
         ...
 
     @abstractmethod

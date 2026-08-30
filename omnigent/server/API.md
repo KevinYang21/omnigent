@@ -976,10 +976,10 @@ Request body matches `SessionEventInput`:
     types (400 on schema mismatch).
 
   client_event_id (string, optional)
-    Identity of one logical `"message"` submit. Reusing the same id and
-    payload for the lifetime of the session does not forward or persist the
-    message again; completed attempts return their original outcome. Two
-    intentional submits, including identical text, must use different ids.
+    Identity of one logical `"message"` or `"slash_command"` submit.
+    Reusing the same id and payload does not forward or persist the event
+    again; completed attempts return their original outcome. Two intentional
+    submits, including identical text or commands, must use different ids.
     Older clients may omit this field; their behavior is unchanged.
 
 202 Accepted
@@ -990,11 +990,28 @@ Request body matches `SessionEventInput`:
 {"queued": true, ..., "idempotency_replayed": true} # prior durable outcome replay
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
-409 Conflict — an id was reused for different content, a prior attempt failed,
-               or delivery remains uncertain after its owning server stopped
+409 Conflict — inspect error.code:
+  message_event_identity_conflict  id was reused for different content
+  message_event_failed             original attempt definitively failed
+  message_event_pending            another owner is actively processing it
+  message_event_uncertain          owner lease expired before a durable outcome
 404 Not Found — no session with that id
 422 Unprocessable Entity — request body fails Pydantic validation
 ```
+
+The receipt closes duplicate dispatch from response-loss retries and replica
+races. It does not claim end-to-end exactly-once delivery: if a process stops
+after the runner accepted an event but before the receipt outcome commits, the
+receipt becomes `message_event_uncertain`. The server keeps the identity and
+refuses to dispatch it again; a client must reconcile visible history or retry
+the same identity to observe a later outcome.
+
+Receipt retention is intentionally scoped as follow-up work. Today receipts
+remain until their session is deleted. A future bounded policy must retain a
+tombstone (identity + fingerprint + terminal state) for at least the maximum
+supported offline/client retry window; deleting the row earlier would reopen a
+duplicate-dispatch hole. This API does not yet promise a time after which an id
+may be safely reused.
 
 **Native-terminal `message` events return `pending_id`.** On
 claude-native / codex-native sessions a web-composer `message` is NOT
