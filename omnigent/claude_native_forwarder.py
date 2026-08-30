@@ -3459,9 +3459,8 @@ async def _forward_available_items(
                 _logger.warning(
                     "Claude transcript item reached a server without the source-id "
                     "POST protocol; retaining it for retry after rollout; "
-                    "session=%s bridge_dir=%s source_id=%s next_retry_s=%.3f",
+                    "session=%s source_id=%s next_retry_s=%.3f",
                     session_id,
-                    bridge_dir,
                     item.source_id,
                     decision.delay_s,
                     extra={"session_id": session_id},

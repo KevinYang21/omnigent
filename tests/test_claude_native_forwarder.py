@@ -3054,14 +3054,17 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_waits_when_versioned_post_hits_older_server(tmp_path: Path) -> None:
+async def test_forwarder_waits_when_versioned_post_hits_older_server(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     A rolling-deployment old target rejects before commit and leaves state.
 
     The next attempt may hit a new target and commit once. There is no
     capability request that can race against a different POST replica.
     """
-    bridge_dir = tmp_path / "bridge"
+    bridge_dir = tmp_path / "secret-bridge-path"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
         json.dumps(
@@ -3082,6 +3085,7 @@ async def test_forwarder_waits_when_versioned_post_hits_older_server(tmp_path: P
     )
     retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
     requests: list[dict[str, Any]] = []
+    caplog.set_level(logging.WARNING, logger="omnigent.claude_native_forwarder")
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         """
@@ -3126,6 +3130,10 @@ async def test_forwarder_waits_when_versioned_post_hits_older_server(tmp_path: P
     assert first.seen_source_ids == ()
     assert second.byte_offset == transcript_path.stat().st_size
     assert second.seen_source_ids == ("user-msg-1:0:message",)
+    assert "retaining it for retry after rollout" in caplog.text
+    assert str(bridge_dir) not in caplog.text
+    assert "hello while busy" not in caplog.text
+    assert "Not Found" not in caplog.text
 
 
 @pytest.mark.asyncio
