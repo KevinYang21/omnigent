@@ -23,9 +23,6 @@ async def test_claude_source_retry_is_idempotent_but_distinct_sources_are_preser
     created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
     assert created.status_code == 201, created.text
     session_id = created.json()["id"]
-    capabilities = await client.get("/v1/native-forwarder-capabilities")
-    assert capabilities.status_code == 200
-    assert capabilities.json()["external_conversation_item_source_id_idempotency"] is True
 
     transcript_item = ClaudeTranscriptItem(
         source_id="claude-record-uuid:0:message",

@@ -1193,7 +1193,9 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert [request["path"] for request in requests] == ["/v1/sessions/conv_abc/events"] * 7
+    assert [request["path"] for request in requests] == [
+        "/v1/sessions/conv_abc/events/source-id-v1"
+    ] * 7
     assert [request["body"]["type"] for request in requests] == ["external_conversation_item"] * 7
     posted = [request["body"]["data"] for request in requests]
     assert [item["item_type"] for item in posted] == [
@@ -1394,7 +1396,7 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert request["path"] == "/v1/sessions/conv_abc/events"
+    assert request["path"] == "/v1/sessions/conv_abc/events/source-id-v1"
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_type"] == "message"
     assert request["body"]["data"]["item_data"] == {
@@ -3052,17 +3054,12 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
 
 
 @pytest.mark.asyncio
-async def test_forwarder_skips_ambiguous_item_for_older_server(tmp_path: Path) -> None:
+async def test_forwarder_waits_when_versioned_post_hits_older_server(tmp_path: Path) -> None:
     """
-    An ambiguous POST failure stays conservative with an older server.
+    A rolling-deployment old target rejects before commit and leaves state.
 
-    A mixed-version deployment can run a new forwarder against a server
-    that does not advertise source-keyed idempotency. Retrying there could
-    duplicate a committed item, so the compatibility behavior remains the
-    historical conservative skip.
-
-    A failure here (the item POSTed twice across two polls) is exactly
-    the duplicate-user-message regression this guards against.
+    The next attempt may hit a new target and commit once. There is no
+    capability request that can race against a different POST replica.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -3088,25 +3085,19 @@ async def test_forwarder_skips_ambiguous_item_for_older_server(tmp_path: Path) -
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         """
-        Record the POST, then fail the item POST with a read timeout.
-
-        The timeout stands in for "server committed, response lost" —
-        the ambiguous case where a blind retry duplicates.
+        Route the first POST to an old server and the second to a new one.
 
         :param request: Outbound HTTP request from the forwarder.
         :returns: HTTP response (never reached for the item POST).
-        :raises httpx.ReadTimeout: For every ``external_conversation_item``
-            POST, simulating a lost response.
         """
-        if request.method == "GET":
-            assert request.url.path == "/v1/native-forwarder-capabilities"
-            return httpx.Response(404, json={"detail": "Not Found"})
+        assert request.method == "POST"
+        assert request.url.path.endswith("/events/source-id-v1")
         payload = json.loads(request.content.decode("utf-8"))
         assert isinstance(payload, dict)
         requests.append(payload)
-        if payload["type"] == "external_conversation_item":
-            raise httpx.ReadTimeout("response lost", request=request)
-        return httpx.Response(202, json={})
+        if len(requests) == 1:
+            return httpx.Response(404, json={"detail": "Not Found"})
+        return httpx.Response(202, json={"item_id": "msg_once"})
 
     transport = httpx.MockTransport(_handle_request)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -3130,24 +3121,16 @@ async def test_forwarder_skips_ambiguous_item_for_older_server(tmp_path: Path) -
             dedupe=dedupe,
         )
 
-    item_posts = [r for r in requests if r["type"] == "external_conversation_item"]
-    # The item was POSTed exactly once. If the ambiguous-failure skip
-    # were missing, the second poll would re-read offset 0 and POST it
-    # again (len 2) — the duplicate user bubble.
-    assert len(item_posts) == 1
-    # No "failed" status: unlike a permanent 4xx rejection, an ambiguous
-    # failure most likely succeeded, so we must not flag the turn failed.
-    assert all(r["type"] != "external_session_status" for r in requests)
-    # Cursor advanced past the item and it is recorded as handled, so it
-    # is not re-read on subsequent polls.
-    assert first.byte_offset == transcript_path.stat().st_size
-    assert first.seen_source_ids == ("user-msg-1:0:message",)
+    assert len(requests) == 2
+    assert first.byte_offset == 0
+    assert first.seen_source_ids == ()
     assert second.byte_offset == transcript_path.stat().st_size
+    assert second.seen_source_ids == ("user-msg-1:0:message",)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("commit_before_response_loss", [True, False])
-async def test_forwarder_retries_ambiguous_item_when_server_advertises_idempotency(
+async def test_forwarder_retries_ambiguous_item_on_versioned_route(
     tmp_path: Path,
     commit_before_response_loss: bool,
 ) -> None:
@@ -3176,12 +3159,8 @@ async def test_forwarder_retries_ambiguous_item_when_server_advertises_idempoten
     item_posts: list[dict[str, Any]] = []
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            assert request.url.path == "/v1/native-forwarder-capabilities"
-            return httpx.Response(
-                200,
-                json={"external_conversation_item_source_id_idempotency": True},
-            )
+        assert request.method == "POST"
+        assert request.url.path.endswith("/events/source-id-v1")
         payload = json.loads(request.content.decode("utf-8"))
         assert payload["type"] == "external_conversation_item"
         item_posts.append(payload)
@@ -5226,8 +5205,8 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
     try:
         # We need: the start event + at least one item event addressed
         # to the child. Drain up to N requests and collect every
-        # request bound for the child's ``/events`` path.
-        child_path = "/v1/sessions/conv_child_beta/events"
+        # request bound for the child's versioned item path.
+        child_path = "/v1/sessions/conv_child_beta/events/source-id-v1"
         child_requests: list[dict[str, Any]] = []
         for _ in range(40):
             req = await _get_recorded_request(server)
@@ -5356,6 +5335,154 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
         "sa-user-retry:0:message",
         "sa-assistant-retry:0:message",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_before_response_loss", [True, False])
+async def test_subagent_retries_ambiguous_source_item_idempotently(
+    tmp_path: Path,
+    commit_before_response_loss: bool,
+) -> None:
+    """The subagent state loop retains and safely retries ambiguous items."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    subagent_jsonl = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="ambiguous1",
+        agent_type="Explore",
+        description="ambiguous child delivery",
+        tool_use_id="toolu_ambiguous",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-ambiguous",
+                "message": {"role": "assistant", "content": "child output"},
+            }
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "ambiguous1": forwarder.SubagentEntry(
+                subagent_id="ambiguous1",
+                child_conversation_id="conv_child_ambiguous",
+            )
+        }
+    )
+    committed: set[str] = set()
+    item_posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body["type"] != "external_conversation_item":
+            return httpx.Response(202, json={})
+        assert request.url.path.endswith("/events/source-id-v1")
+        source_id = body["data"]["source_id"]
+        item_posts.append(source_id)
+        if len(item_posts) == 1:
+            if commit_before_response_loss:
+                committed.add(source_id)
+            raise httpx.ReadTimeout("response lost", request=request)
+        committed.add(source_id)
+        return httpx.Response(202, json={"item_id": "msg_child"})
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        first = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+        second = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=first,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=tracker,
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    first_child = first.subagents["ambiguous1"]
+    assert first_child.byte_offset == 0
+    assert first_child.seen_source_ids == ()
+    second_child = second.subagents["ambiguous1"]
+    assert second_child.byte_offset == subagent_jsonl.stat().st_size
+    assert second_child.seen_source_ids == ("sa-ambiguous:0:message",)
+    assert item_posts == ["sa-ambiguous:0:message", "sa-ambiguous:0:message"]
+    assert committed == {"sa-ambiguous:0:message"}
+
+
+@pytest.mark.asyncio
+async def test_subagent_old_server_reject_keeps_source_unseen(tmp_path: Path) -> None:
+    """An old server's unknown-route response cannot consume child state."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="oldserver1",
+        agent_type="Explore",
+        description="rolling deploy",
+        tool_use_id="toolu_oldserver",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-old-server",
+                "message": {"role": "assistant", "content": "wait for rollout"},
+            }
+        ],
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "oldserver1": forwarder.SubagentEntry(
+                subagent_id="oldserver1",
+                child_conversation_id="conv_child_oldserver",
+            )
+        }
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.path.endswith("/events/source-id-v1")
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        result = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    child = result.subagents["oldserver1"]
+    assert len(requests) == 1
+    assert child.byte_offset == 0
+    assert child.seen_source_ids == ()
 
 
 async def test_subagent_watcher_skips_subagents_already_in_state(

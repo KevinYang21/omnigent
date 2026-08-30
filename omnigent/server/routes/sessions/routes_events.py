@@ -371,15 +371,6 @@ def register_events_routes(
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
-    @router.get(
-        "/native-forwarder-capabilities",
-        include_in_schema=False,
-        response_model=None,
-    )
-    async def native_forwarder_capabilities() -> dict[str, bool]:
-        """Advertise retry semantics understood by this server build."""
-        return {"external_conversation_item_source_id_idempotency": True}
-
     def _has_runner_created_by_authority(request: Request, conv: Any) -> bool:
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token:
@@ -389,6 +380,12 @@ def register_events_routes(
         runner_id = getattr(conv, "runner_id", None)
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
+    @router.post(
+        "/sessions/{session_id}/events/source-id-v1",
+        include_in_schema=False,
+        status_code=202,
+        response_model=None,
+    )
     @router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -486,6 +483,15 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        if request.url.path.endswith("/events/source-id-v1") and (
+            body.type != _EXTERNAL_CONVERSATION_ITEM_TYPE
+            or not isinstance(body.data.get("source_id"), str)
+            or not body.data["source_id"].strip()
+        ):
+            raise OmnigentError(
+                "source-id-v1 requires external_conversation_item with source_id",
+                code=ErrorCode.INVALID_INPUT,
+            )
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_EDIT, permission_store, conversation_store

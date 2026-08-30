@@ -744,6 +744,27 @@ class _PostRetryTracker:
             permanent=permanent,
         )
 
+    def record_retryable_failure(self, key: str) -> _PostRetryDecision:
+        """Record a protocol-rollout rejection that must never be exhausted."""
+        _note_forward_failure(key)
+        entry = self._entries.get(key)
+        if entry is None:
+            entry = _PostRetryEntry()
+            self._entries[key] = entry
+        entry.attempts += 1
+        exponent = min(max(0, entry.attempts - 1), _HTTP_POST_RETRY_MAX_BACKOFF_EXPONENT)
+        delay_s = min(
+            self._base_delay_s * (2**exponent),
+            self._max_delay_s,
+        )
+        entry.next_attempt_at = time.monotonic() + delay_s
+        return _PostRetryDecision(
+            attempts=entry.attempts,
+            delay_s=delay_s,
+            exhausted=False,
+            permanent=False,
+        )
+
 
 async def forward_claude_transcript_to_session(
     *,
@@ -1497,6 +1518,18 @@ async def _forward_available_subagents(
                     item=item,
                 )
             except httpx.HTTPError as exc:
+                if _source_id_post_route_unavailable(exc):
+                    decision = item_retry_tracker.record_retryable_failure(retry_key)
+                    _logger.warning(
+                        "Claude sub-agent item reached a server without the source-id "
+                        "POST protocol; retaining it for retry after rollout; "
+                        "child=%s source_id=%s next_retry_s=%.3f",
+                        entry.child_conversation_id,
+                        item.source_id,
+                        decision.delay_s,
+                    )
+                    items_failed = True
+                    break
                 decision = item_retry_tracker.record_failure(retry_key, exc)
                 if decision.exhausted:
                     _logger.error(
@@ -1546,34 +1579,19 @@ async def _forward_available_subagents(
                     await _write_subagent_forward_state_async(bridge_dir, updated)
                     continue
                 if post_may_have_been_delivered(exc):
-                    # Ambiguous failure: the item may already be committed
-                    # (no external-item dedup), so a retry would duplicate
-                    # it. Skip rather than re-post.
+                    # The versioned route is accepted only by source-id-aware
+                    # servers, so retain the item and safely retry.
                     _logger.warning(
-                        "Skipping claude-native sub-agent item after an ambiguous POST "
-                        "failure (may already be committed); not retrying to avoid a "
-                        "duplicate; child=%s source_id=%s http_status=%s",
+                        "Retrying claude-native sub-agent item after an ambiguous "
+                        "source-id POST; child=%s source_id=%s http_status=%s",
                         entry.child_conversation_id,
                         item.source_id,
                         _http_status_for_log(exc),
                         exc_info=True,
                     )
                     item_retry_tracker.clear(retry_key)
-                    seen.add(item.source_id)
-                    seen_source_ids.append(item.source_id)
-                    new_entry = SubagentEntry(
-                        subagent_id=entry.subagent_id,
-                        child_conversation_id=entry.child_conversation_id,
-                        byte_offset=entry.byte_offset,
-                        seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                        last_activity_ts=new_entry.last_activity_ts,
-                        last_status=new_entry.last_status,
-                    )
-                    updated = SubagentForwardState(
-                        subagents={**updated.subagents, subagent_id: new_entry}
-                    )
-                    await _write_subagent_forward_state_async(bridge_dir, updated)
-                    continue
+                    items_failed = True
+                    break
                 _logger.warning(
                     "Failed to forward claude-native sub-agent item; child=%s "
                     "source_id=%s attempt=%s permanent=%s next_retry_s=%.3f "
@@ -3436,6 +3454,19 @@ async def _forward_available_items(
                 item=item,
             )
         except httpx.HTTPError as exc:
+            if _source_id_post_route_unavailable(exc):
+                decision = retry_tracker.record_retryable_failure(retry_key)
+                _logger.warning(
+                    "Claude transcript item reached a server without the source-id "
+                    "POST protocol; retaining it for retry after rollout; "
+                    "session=%s bridge_dir=%s source_id=%s next_retry_s=%.3f",
+                    session_id,
+                    bridge_dir,
+                    item.source_id,
+                    decision.delay_s,
+                    extra={"session_id": session_id},
+                )
+                return updated
             decision = retry_tracker.record_failure(retry_key, exc)
             if decision.exhausted:
                 _logger.error(
@@ -3490,31 +3521,12 @@ async def _forward_available_items(
                 await _write_forward_state_async(bridge_dir, updated)
                 continue
             if post_may_have_been_delivered(exc):
-                if await _server_supports_source_id_retry(client):
-                    # The upgraded server keys this event by source_id, so both
-                    # ambiguous outcomes are safe: a committed request resolves
-                    # to its existing row, while an uncommitted request inserts
-                    # on retry. Keep the cursor before the item.
-                    _logger.warning(
-                        "Retrying Claude transcript item after an ambiguous POST "
-                        "failure because the server advertises source-id idempotency; "
-                        "session=%s bridge_dir=%s source_id=%s item_type=%s",
-                        session_id,
-                        bridge_dir,
-                        item.source_id,
-                        item.item_type,
-                        exc_info=True,
-                        extra={"session_id": session_id},
-                    )
-                    retry_tracker.clear(retry_key)
-                    return updated
-                # Ambiguous failure: the server may have committed this
-                # item before the response was lost. An older server does not
-                # advertise source-keyed dedupe, so preserve the conservative
-                # mixed-version behavior and skip it rather than duplicate it.
+                # Only upgraded servers route this versioned POST. Retrying is
+                # therefore safe regardless of which replica receives the next
+                # attempt: upgraded targets dedupe by source_id, while older
+                # targets reject the unknown route before committing.
                 _logger.warning(
-                    "Skipping Claude transcript item after an ambiguous POST failure "
-                    "(may already be committed); not retrying to avoid a duplicate; "
+                    "Retrying Claude transcript item after an ambiguous source-id POST; "
                     "session=%s bridge_dir=%s source_id=%s item_type=%s http_status=%s",
                     session_id,
                     bridge_dir,
@@ -3525,20 +3537,7 @@ async def _forward_available_items(
                     extra={"session_id": session_id},
                 )
                 retry_tracker.clear(retry_key)
-                seen.add(item.source_id)
-                seen_source_ids.append(item.source_id)
-                updated = TranscriptForwardState(
-                    transcript_path=state.transcript_path,
-                    line_cursor=state.line_cursor,
-                    byte_offset=state.byte_offset,
-                    current_response_id=current_response_id,
-                    seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-                    cursor_fingerprint=state.cursor_fingerprint,
-                    settled_response_id=dedupe.settled_response_id,
-                    pending_settled_response_id=dedupe.pending_settled_response_id,
-                )
-                await _write_forward_state_async(bridge_dir, updated)
-                continue
+                return updated
             _logger.warning(
                 "Failed to forward Claude transcript item; session=%s bridge_dir=%s "
                 "source_id=%s item_type=%s attempt=%s permanent=%s "
@@ -4026,18 +4025,9 @@ async def _post_clear_supersession(
         )
 
 
-async def _server_supports_source_id_retry(client: httpx.AsyncClient) -> bool:
-    """Return whether this server safely deduplicates source-keyed retries."""
-    try:
-        response = await client.get("/v1/native-forwarder-capabilities")
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ValueError):
-        return False
-    return (
-        isinstance(payload, dict)
-        and payload.get("external_conversation_item_source_id_idempotency") is True
-    )
+def _source_id_post_route_unavailable(exc: httpx.HTTPError) -> bool:
+    """Return whether an older server rejected the versioned POST before commit."""
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {404, 405}
 
 
 async def _post_external_conversation_item(
@@ -4070,7 +4060,7 @@ async def _post_external_conversation_item(
         ),
     ):
         resp = await client.post(
-            f"/v1/sessions/{session_id}/events",
+            f"/v1/sessions/{session_id}/events/source-id-v1",
             json={
                 "type": "external_conversation_item",
                 "data": {
