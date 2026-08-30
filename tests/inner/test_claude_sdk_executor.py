@@ -762,6 +762,59 @@ class TestConstructor(unittest.TestCase):
 
         _run(_t())
 
+    def test_databricks_profile_model_resolution_cached_across_turns(self):
+        """The unpinned-session catalog resolution runs once per executor.
+
+        Re-resolving every turn repeats both a live network call and the
+        substitution WARNING; the second turn must reuse the cached pick.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        async def _t():
+            with patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+
+            captured: list[str | None] = []
+            resolve_calls: list[str | None] = []
+
+            def fake_resolver(profile):
+                resolve_calls.append(profile)
+                return "system.ai.claude-opus-5"
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured.append(model)
+                raise RuntimeError("stop after model resolution")
+
+            with (
+                patch(
+                    "omnigent.inner.claude_sdk_executor._resolve_databricks_claude_model",
+                    side_effect=fake_resolver,
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                for _ in range(2):
+                    with self.assertRaises(RuntimeError):
+                        async for _ in executor.run_turn(
+                            [{"role": "user", "content": "hi"}], [], ""
+                        ):
+                            pass
+
+            self.assertEqual(captured, ["system.ai.claude-opus-5"] * 2)
+            self.assertEqual(len(resolve_calls), 1)  # resolved once, then cached
+
+        _run(_t())
+
     def test_databricks_profile_model_substitution_warns(self):
         """An unpinned session's silent model pick must emit a WARNING.
 

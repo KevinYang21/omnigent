@@ -47,7 +47,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypeAlias, TypedDict
@@ -163,7 +163,9 @@ def _resolve_model(model: str | None) -> str:
     return model
 
 
-async def _resolve_model_against_catalog(client: object, requested: str, api_key: str) -> str:
+async def _resolve_model_against_catalog(
+    client: object, requested: str, api_key: str | None
+) -> str:
     """Resolve *requested* against the account's live model catalog.
 
     The Cursor backend rejects unknown ids with an opaque ``invalid_argument``
@@ -194,8 +196,10 @@ async def _resolve_model_against_catalog(client: object, requested: str, api_key
         )
         return requested
     try:
-        catalog = await list_models(api_key=api_key)
-    except Exception:  # degrade to backend-side validation
+        listing = list_models(api_key=api_key)
+        raw = await listing if isinstance(listing, Awaitable) else listing
+        catalog: list[object] = list(raw) if isinstance(raw, Iterable) else []
+    except Exception:  # noqa: BLE001 — any listing failure degrades to backend-side validation
         logger.warning(
             "CursorExecutor: model listing failed; dispatching %r unverified.",
             requested,

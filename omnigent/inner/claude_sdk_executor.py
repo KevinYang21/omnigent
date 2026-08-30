@@ -1614,6 +1614,10 @@ class ClaudeSDKExecutor(Executor):
         self._gateway_uses_databricks_profile = bool(
             gateway and self._gateway_host is None and base_url_override is None
         )
+        # Cache the unpinned-session model resolution so the catalog lookup
+        # (a live network call) and its substitution WARNING fire once per
+        # executor, not on every turn.
+        self._resolved_default_model: str | None = None
 
         # Lazily-started local proxy that restores request fields the
         # Claude CLI strips on the gateway path (thinking.display).
@@ -2346,9 +2350,11 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = await run_sync_on_thread(
-                _resolve_databricks_claude_model, self._databricks_profile
-            )
+            if self._resolved_default_model is None:
+                self._resolved_default_model = await run_sync_on_thread(
+                    _resolve_databricks_claude_model, self._databricks_profile
+                )
+            model = self._resolved_default_model
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
