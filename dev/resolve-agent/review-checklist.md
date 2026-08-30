@@ -29,6 +29,14 @@ what to look for, and why it's wrong.
   underlying edit cannot remove. Gate the affordance on "can we act on this," not
   "did something resolve."
 
+## Retry / resilience
+
+- **An indefinite retry loop must escalate its operator signal.** A fix that
+  turns a fatal error into "retry forever" (to preserve live sessions) must not
+  loop silently: print a one-time stderr notice when the outage starts, and
+  escalate the message after a sustained streak (see the host 401/403 pattern)
+  so a permanently-broken endpoint surfaces instead of spinning quietly.
+
 ## Environment / subprocess
 
 - **Never replace a child's whole environment.** Passing a fresh `env=` to
