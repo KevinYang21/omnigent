@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -208,11 +209,27 @@ async def test_compact_runs_omnigent_compaction_when_runner_noops(
 
 async def test_compact_model_less_sdk_harness_returns_clear_unavailable_message(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A model-less SDK-style harness should not expose the raw server-side
-    compaction model requirement.
+    A model-less SDK harness with NO resolvable default still gets the clear
+    unavailable message (not the raw model requirement).
+
+    This is the terminal fallback: the harness family's catalog default is
+    unresolvable AND the server has no ``llm:`` config. Both tiers are pinned
+    off explicitly so the verdict doesn't depend on ambient catalog caches.
     """
+    from omnigent.errors import ErrorCode as _EC
+    from omnigent.errors import OmnigentError as _OE
+
+    def _no_default(_family: str) -> str:
+        raise _OE("no catalog default", code=_EC.INVALID_INPUT)
+
+    monkeypatch.setattr("omnigent.runtime.workflow._catalog_default_model", _no_default)
+    monkeypatch.setattr(
+        "omnigent.runtime.get_caps",
+        lambda: SimpleNamespace(llm=None),
+    )
     agent = await create_test_agent(
         client,
         name="model-less-sdk",
@@ -234,6 +251,127 @@ async def test_compact_model_less_sdk_harness_returns_clear_unavailable_message(
     assert "openai-agents" in resp.text
     assert "llm.model" in resp.text
     assert "executor.model" in resp.text
+
+
+async def test_compact_modelless_sdk_harness_compacts_with_family_default_model(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A model-less SDK harness compacts with its provider-family default model.
+
+    **What breaks if wrong (OMNI-745):** ``/compact`` on a model-less
+    ``openai-agents`` session 400s with "does not declare an LLM model"
+    even though turn-time execution resolves a family default and runs fine —
+    the user's ``/compact`` fails and nothing is compacted.
+    """
+    from omnigent.runtime import set_runner_client
+
+    calls: list[dict[str, Any]] = []
+
+    async def _record(**kwargs: Any) -> CompactionResult:
+        """Record the AP-side compaction call; return a real result."""
+        calls.append(kwargs)
+        return CompactionResult(messages=[], summary_metadata=None, total_tokens=1)
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.compact_conversation_now",
+        _record,
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._catalog_default_model",
+        lambda family: {"openai": "gpt-family-default"}[family],
+    )
+
+    runner, _captured = _fake_runner_returning(204)
+    set_runner_client(runner)
+    try:
+        agent = await create_test_agent(
+            client,
+            name="model-less-sdk-catalog",
+            executor={"type": "omnigent", "config": {"harness": "openai-agents"}},
+            include_llm=False,
+        )
+        sid = await _create_session(client, agent["id"])
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "compact", "data": {}},
+        )
+    finally:
+        await runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 202, resp.text
+    assert len(calls) == 1, (
+        f"Expected exactly one compact_conversation_now call for the "
+        f"model-less session; got {len(calls)}."
+    )
+    assert calls[0]["llm_config"].model == "gpt-family-default", (
+        f"Compaction must summarize with the harness family's default model; "
+        f"got {calls[0]['llm_config'].model!r}."
+    )
+
+
+async def test_compact_modelless_sdk_harness_falls_back_to_server_llm(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When no catalog default resolves, compaction uses the server ``llm:``.
+
+    Deployments with catalog discovery disabled (or unreachable) still carry
+    an operator-configured server-level LLM; ``/compact`` on a model-less
+    session must use it instead of erroring.
+    """
+    from omnigent.errors import ErrorCode as _EC
+    from omnigent.errors import OmnigentError as _OE
+    from omnigent.runtime import set_runner_client
+    from omnigent.spec.types import LLMConfig
+
+    calls: list[dict[str, Any]] = []
+
+    async def _record(**kwargs: Any) -> CompactionResult:
+        """Record the AP-side compaction call; return a real result."""
+        calls.append(kwargs)
+        return CompactionResult(messages=[], summary_metadata=None, total_tokens=1)
+
+    def _no_default(_family: str) -> str:
+        raise _OE("no catalog default", code=_EC.INVALID_INPUT)
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.compact_conversation_now",
+        _record,
+    )
+    monkeypatch.setattr("omnigent.runtime.workflow._catalog_default_model", _no_default)
+    monkeypatch.setattr(
+        "omnigent.runtime.get_caps",
+        lambda: SimpleNamespace(llm=LLMConfig(model="server-config-model")),
+    )
+
+    runner, _captured = _fake_runner_returning(204)
+    set_runner_client(runner)
+    try:
+        agent = await create_test_agent(
+            client,
+            name="model-less-sdk-serverllm",
+            executor={"type": "omnigent", "config": {"harness": "openai-agents"}},
+            include_llm=False,
+        )
+        sid = await _create_session(client, agent["id"])
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "compact", "data": {}},
+        )
+    finally:
+        await runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 202, resp.text
+    assert len(calls) == 1
+    assert calls[0]["llm_config"].model == "server-config-model", (
+        f"With no family default, compaction must fall back to the server "
+        f"llm: config; got {calls[0]['llm_config'].model!r}."
+    )
 
 
 async def test_compact_single_flight_per_session(

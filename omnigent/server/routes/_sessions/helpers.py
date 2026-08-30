@@ -278,6 +278,7 @@ from omnigent.session_lifecycle import (
 )
 from omnigent.spec.types import (
     AgentSpec,
+    LLMConfig,
     Phase,
     PolicyAction,
 )
@@ -7196,6 +7197,47 @@ def _compact_lock_impl(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _default_compaction_llm_config(spec: AgentSpec) -> LLMConfig | None:
+    """Resolve a default summarization model for a model-less spec.
+
+    A spec that pins no model (neither ``llm.model`` nor ``executor.model``)
+    is valid for SDK harnesses: at turn time the executor resolves the
+    harness's provider-family default from the model catalog. Explicit
+    ``/compact`` must do the same rather than reject the session, so this
+    mirrors that resolution, then falls back to the server's own configured
+    LLM:
+
+    1. The harness's provider-family catalog default — the same model
+       turn-time resolution would pick, so the summary is routed to the
+       provider the session already talks to.
+    2. The server-level ``llm:`` config (``RuntimeCaps.llm``) — the
+       operator-configured model the server already uses for its own LLM
+       calls (policy judges), available even where catalog discovery is
+       disabled or unreachable.
+
+    :param spec: The loaded agent spec bound to the session.
+    :returns: An :class:`LLMConfig` to summarize with, or ``None`` when
+        neither tier yields a model — the caller then raises its actionable
+        error.
+    """
+    from omnigent.onboarding.provider_config import provider_family_for_harness
+    from omnigent.runtime import get_caps
+    from omnigent.runtime.workflow import _catalog_default_model
+
+    family = provider_family_for_harness(spec.executor.harness_kind)
+    if family is not None:
+        try:
+            model = _catalog_default_model(family)
+        except OmnigentError:
+            pass
+        else:
+            return LLMConfig(model=model, connection=spec.executor.connection)
+    server_llm = get_caps().llm
+    if server_llm is not None and server_llm.model:
+        return server_llm
+    return None
+
+
 async def _run_compact_locked(
     session_id: str,
     conv: Conversation,
@@ -7238,10 +7280,10 @@ async def _run_compact_locked(
         if spec.llm is not None:
             llm_config = spec.llm
         elif spec.executor.model is not None:
-            from omnigent.spec.types import LLMConfig
-
             llm_config = LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
         else:
+            llm_config = _default_compaction_llm_config(spec)
+        if llm_config is None:
             harness = spec.executor.harness_kind
             raise OmnigentError(
                 f"/compact is unavailable for this {harness} session because the agent "
@@ -10172,6 +10214,7 @@ __all__ = [
     "_create_and_publish_antigravity_child",
     "_create_and_publish_codex_child",
     "_create_session_worktree",
+    "_default_compaction_llm_config",
     "_delete_stored_session_bundle_after_failure",
     "_derive_terminal_launch_args_from_spec",
     "_descendant_sessions",
