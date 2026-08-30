@@ -291,8 +291,7 @@ async def test_serve_tunnel_caps_backoff_low_until_first_connection(
     assert sleeps, "expected reconnect sleeps while the server was 'booting'"
     cap = serve_module._MAX_INITIAL_CONNECT_DELAY_S
     assert all(delay <= cap for delay in sleeps), (
-        f"boot-phase reconnect backoff exceeded the initial-connect cap "
-        f"{cap}s: {sleeps}"
+        f"boot-phase reconnect backoff exceeded the initial-connect cap {cap}s: {sleeps}"
     )
     # The escalation must actually reach (and hold at) the boot cap,
     # not the full 10s reconnect cap.

@@ -263,7 +263,7 @@ def test_wait_for_server_uses_fast_poll_before_backoff(
         def __init__(self, **_kwargs: object) -> None:
             pass
 
-        def __enter__(self) -> "_FakeClient":
+        def __enter__(self) -> _FakeClient:
             return self
 
         def __exit__(self, *_exc: object) -> None:
@@ -460,7 +460,7 @@ def test_wait_for_server_waits_for_runner_tunnel_status(
         def __init__(self, *, base_url: str = "", **_kwargs: object) -> None:
             self._base_url = base_url
 
-        def __enter__(self) -> "_FakeClient":
+        def __enter__(self) -> _FakeClient:
             return self
 
         def __exit__(self, *_exc: object) -> None:
@@ -523,7 +523,7 @@ def test_wait_for_server_retries_through_transient_timeouts(
         def __init__(self, **_kwargs: object) -> None:
             pass
 
-        def __enter__(self) -> "_FakeClient":
+        def __enter__(self) -> _FakeClient:
             return self
 
         def __exit__(self, *_exc: object) -> None:
@@ -585,7 +585,7 @@ def test_wait_for_server_fails_fast_when_runner_dies(
         def __init__(self, **_kwargs: object) -> None:
             pass
 
-        def __enter__(self) -> "_FakeClient":
+        def __enter__(self) -> _FakeClient:
             return self
 
         def __exit__(self, *_exc: object) -> None:
