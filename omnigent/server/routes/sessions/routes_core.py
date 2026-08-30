@@ -1820,15 +1820,22 @@ def register_core_routes(
                 conv = conversation_store.get_conversation(
                     session_id,
                 )
-                if _runner_client is not None and conv is not None:
+                if _runner_client is not None and conv is not None and conv.agent_id is not None:
+                    # The versioned payload's snapshot carries harness_override,
+                    # so a rebind after a cross-harness create initializes the
+                    # override harness — a bare body left the runner resolving
+                    # from the spec, and the recovery turn that executes seeded
+                    # initial_items ran on the spec's harness. Recovery stays
+                    # enabled: on rebind it is what runs the pending kickoff.
+                    from omnigent.version import VERSION
+
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
-                            json={
-                                "session_id": session_id,
-                                "agent_id": conv.agent_id,
-                                "sub_agent_name": conv.sub_agent_name,
-                            },
+                            json=build_runner_session_init_payload(
+                                conv,
+                                server_version=VERSION,
+                            ),
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:

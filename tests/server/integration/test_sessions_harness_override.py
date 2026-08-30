@@ -276,6 +276,56 @@ async def test_create_session_init_carries_harness_override(
     )
 
 
+async def test_patch_rebind_init_carries_harness_override(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PATCH rebind's runner notification must carry the override.
+
+    The external-host launch binds a runner after create via
+    ``PATCH {runner_id}``; the recovery turn that then executes any seeded
+    ``initial_items`` resolves its harness from session init. A bare legacy
+    body loses the override, so the kickoff runs on the spec's harness.
+    """
+    from omnigent.server.routes import sessions as sessions_mod
+
+    captured = _stub_runner_client(monkeypatch)
+
+    async def _skip_relay_readiness(*_: Any, **__: Any) -> None:
+        return None
+
+    def _accept_runner_id(_router: Any, raw: str, *, user_id: Any = None) -> str:
+        del user_id
+        return raw.strip()
+
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _skip_relay_readiness)
+    monkeypatch.setattr(sessions_mod, "_registered_runner_id", _accept_runner_id)
+
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "harness_override": "pi"},
+    )
+    assert resp.status_code == 201, resp.text
+    sid = resp.json()["id"]
+    captured.pop("posts", None)
+
+    patch = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "runner_bound_late"})
+    assert patch.status_code == 200, patch.text
+
+    init_posts = [body for path, body in captured.get("posts", []) if path == "/v1/sessions"]
+    assert init_posts, (
+        "The PATCH rebind never notified the runner about the session — "
+        "check the runner-stub wiring."
+    )
+    snapshot = init_posts[-1].get("session_init", {}).get("snapshot", {})
+    assert snapshot.get("harness_override") == "pi", (
+        f"Rebind session-init notification lost the harness override; got "
+        f"{init_posts[-1]!r}. The runner then resolves the harness from the "
+        f"spec, and the kickoff recovery turn runs on the wrong harness."
+    )
+
+
 async def test_runner_body_omits_harness_override_when_unset(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
