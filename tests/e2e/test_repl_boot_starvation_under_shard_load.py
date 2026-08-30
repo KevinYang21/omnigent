@@ -181,14 +181,16 @@ def test_repl_boot_reaches_prompt_ready_under_full_shard_load(
     reset_mock_llm(mock_llm_server_url)
 
     ncpu = os.cpu_count() or 2
-    burners = [
-        subprocess.Popen([sys.executable, "-c", _BURNER_SRC])
-        for _ in range(ncpu * _BURNERS_PER_CORE)
-    ]
+    # Spawn inside the try: a mid-spawn failure (fork/EAGAIN is plausible
+    # on the loaded box this test creates) must still reach the cleanup
+    # for the burners already started.
+    burners: list[subprocess.Popen[bytes]] = []
     children: list[Any] = []
     results: list[tuple[int, float, str, str]] = []
     t0 = time.monotonic()
     try:
+        for _ in range(ncpu * _BURNERS_PER_CORE):
+            burners.append(subprocess.Popen([sys.executable, "-c", _BURNER_SRC]))
         for i in range(_CONCURRENT_BOOTS):
             env = _build_repl_env(
                 mock_llm_server_url,
@@ -223,6 +225,9 @@ def test_repl_boot_reaches_prompt_ready_under_full_shard_load(
                 child.terminate(force=True)
         for b in burners:
             b.kill()
+        for b in burners:
+            with contextlib.suppress(Exception):
+                b.wait(timeout=10)
 
     failures = [r for r in sorted(results) if r[2] != "ready"]
     summary = "\n".join(
