@@ -1071,7 +1071,7 @@ describe("NewChatLandingScreen", () => {
     expect(workspace).toHaveClass("h-8", "mx-4", "-mb-px");
     expect(composer).toHaveClass("min-h-[105px]");
     expect(composer).toContainElement(actions);
-    expect(actions).toHaveClass("mt-1", "px-2", "pb-0");
+    expect(actions).toHaveClass("mt-2", "px-2", "pb-0");
     const attach = screen.getByTestId("new-chat-landing-attach");
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
     const permission = screen.getByTestId("new-chat-landing-permission-chip");
