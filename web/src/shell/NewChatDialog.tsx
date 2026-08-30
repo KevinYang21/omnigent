@@ -4970,7 +4970,7 @@ export function NewChatLandingScreen() {
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
             <div
-              className="flex min-w-0 items-center gap-0.5 px-2 pb-2"
+              className="mt-1 flex min-w-0 items-center gap-0.5 px-2 pb-0"
               data-testid="new-chat-landing-actions"
             >
               {/* Attachment starts the ordered composer action row. */}
