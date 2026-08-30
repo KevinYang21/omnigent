@@ -6100,15 +6100,12 @@ export async function deliverInitialPrompt(params: {
  * @param conversationId Session the prompt was meant for, e.g. ``"conv_abc"``.
  * @param text The undelivered message text.
  */
-function stashUndeliveredPrompt(conversationId: string, text: string, files: File[] = []): void {
-  const existing = getSessionDraft(conversationId);
-  if (
-    (!text && files.length === 0) ||
-    Boolean(existing?.text) ||
-    (existing?.files.length ?? 0) > 0
-  ) {
-    return;
-  }
+export function stashUndeliveredPrompt(
+  conversationId: string,
+  text: string,
+  files: File[] = [],
+): void {
+  if ((!text && files.length === 0) || getSessionDraft(conversationId) !== undefined) return;
   setSessionDraft(conversationId, { text, files });
 }
 
