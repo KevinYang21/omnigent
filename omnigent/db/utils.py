@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
-from sqlalchemy import Engine, create_engine, event, inspect, text
+from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
 
 if TYPE_CHECKING:
     from alembic.config import Config
@@ -258,8 +258,16 @@ def _create_engine(db_uri: str) -> Engine:
         def _set_sqlite_pragma(dbapi_conn: sqlite3.Connection, _conn_record: object) -> None:
             cur = dbapi_conn.cursor()
             try:
-                cur.execute("PRAGMA journal_mode=WAL")
                 cur.execute("PRAGMA busy_timeout=20000")  # 20s
+                try:
+                    cur.execute("PRAGMA journal_mode=WAL")
+                except sqlite3.OperationalError as exc:
+                    # A different process may already hold BEGIN EXCLUSIVE
+                    # while upgrading this database. Its connection set WAL
+                    # before taking that lock, so this idempotent write can be
+                    # skipped until a later fresh connection.
+                    if "database is locked" not in str(exc):
+                        raise
                 cur.execute("PRAGMA synchronous=NORMAL")  # WAL-safe + fast
                 cur.execute("PRAGMA foreign_keys=ON")
             finally:
@@ -360,9 +368,79 @@ def _ensure_conversation_tables(engine: Engine) -> None:
     from omnigent.db.db_models import ConversationBase
 
     with query_name_scope("omnigent.database.ensure_conversation_schema"):
-        ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
-        _run_conversation_schema_upgrades(engine)
-        ensure_fts_table(engine)
+        if engine.dialect.name == "sqlite":
+            # BEGIN EXCLUSIVE is SQLite's database-level schema lock. Every
+            # schema read/write below uses this same connection so another
+            # process cannot observe or apply a half-finished upgrade.
+            with engine.connect() as connection:
+                connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                try:
+                    ConversationBase.metadata.create_all(bind=connection, checkfirst=True)
+                    _run_sqlite_conversation_schema_upgrades(connection)
+                    connection.execute(_CREATE_FTS)
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+            return
+
+        with _server_conversation_schema_lock(engine):
+            ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
+            _run_conversation_schema_upgrades(engine)
+            ensure_fts_table(engine)
+
+
+@contextmanager
+def _server_conversation_schema_lock(engine: Engine) -> Iterator[None]:
+    """Hold a backend-native cross-process lock for split schema upgrades."""
+    with engine.connect() as connection:
+        if engine.dialect.name == "postgresql":
+            connection.execute(sa.text("SELECT pg_advisory_lock(5714303826658643542)"))
+            try:
+                yield
+            finally:
+                connection.execute(sa.text("SELECT pg_advisory_unlock(5714303826658643542)"))
+            return
+        if engine.dialect.name == "mysql":
+            acquired = connection.execute(
+                sa.text("SELECT GET_LOCK('omnigent_conversation_schema', 60)")
+            ).scalar()
+            if acquired != 1:
+                raise RuntimeError("Timed out acquiring split conversation schema lock")
+            try:
+                yield
+            finally:
+                connection.execute(sa.text("SELECT RELEASE_LOCK('omnigent_conversation_schema')"))
+            return
+        yield
+
+
+def _run_sqlite_conversation_schema_upgrades(connection: Connection) -> None:
+    """Apply split schema versions while holding SQLite's exclusive lock."""
+    _CONVERSATION_SCHEMA_METADATA.create_all(bind=connection, checkfirst=True)
+    applied = set(
+        connection.execute(sa.select(_CONVERSATION_SCHEMA_MIGRATIONS.c.version)).scalars()
+    )
+    if _CONVERSATION_SCHEMA_SOURCE_ID_VERSION in applied:
+        return
+
+    columns = {column["name"] for column in inspect(connection).get_columns("conversation_items")}
+    if "source_id" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE conversation_items ADD COLUMN source_id VARCHAR(512)"
+        )
+    indexes = {index["name"] for index in inspect(connection).get_indexes("conversation_items")}
+    if "ix_conversation_items_source_id" not in indexes:
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_conversation_items_source_id "
+            "ON conversation_items (workspace_id, conversation_id, source_id) "
+            "WHERE source_id IS NOT NULL"
+        )
+    connection.execute(
+        sa.insert(_CONVERSATION_SCHEMA_MIGRATIONS).values(
+            version=_CONVERSATION_SCHEMA_SOURCE_ID_VERSION
+        )
+    )
 
 
 def _run_conversation_schema_upgrades(engine: Engine) -> None:
@@ -393,20 +471,33 @@ def _upgrade_split_conversation_source_id(engine: Engine) -> None:
             )
 
     indexes = {index["name"] for index in inspect(engine).get_indexes("conversation_items")}
-    if "ix_conversation_items_source_id" in indexes:
+    if engine.dialect.name != "postgresql" and "ix_conversation_items_source_id" in indexes:
         return
     columns_sql = "(workspace_id, conversation_id, source_id)"
     if engine.dialect.name == "postgresql":
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-            invalid = connection.execute(
-                sa.text(
-                    "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-                    "WHERE c.relname = :name AND NOT i.indisvalid"
-                ),
-                {"name": "ix_conversation_items_source_id"},
-            ).scalar()
-            if invalid:
-                connection.exec_driver_sql("DROP INDEX ix_conversation_items_source_id")
+            row = (
+                connection.execute(
+                    sa.text(
+                        "SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) AS definition "
+                        "FROM pg_index i WHERE i.indexrelid = to_regclass(:name)"
+                    ),
+                    {"name": "ix_conversation_items_source_id"},
+                )
+                .mappings()
+                .first()
+            )
+            if row is not None:
+                definition = str(row["definition"])
+                expected_shape = (
+                    "(workspace_id, conversation_id, source_id)" in definition
+                    and "WHERE (source_id IS NOT NULL)" in definition
+                )
+                if row["indisvalid"] and expected_shape:
+                    return
+                connection.exec_driver_sql(
+                    "DROP INDEX CONCURRENTLY IF EXISTS ix_conversation_items_source_id"
+                )
             connection.exec_driver_sql(
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
                 f"ix_conversation_items_source_id ON conversation_items {columns_sql} "

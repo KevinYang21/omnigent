@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -12,15 +14,35 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
-def test_preexisting_split_database_upgrades_before_append(tmp_path: Path) -> None:
-    """A legacy split DB gains source identity before normal store writes."""
-    main_uri = f"sqlite:///{tmp_path / 'main.db'}"
-    split_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
+def _initialize_store_process(main_uri: str, split_uri: str) -> tuple[bool, bool]:
+    """Initialize one store in a fresh process and report split schema state."""
+    clear_engine_cache()
+    store = SqlAlchemyConversationStore(main_uri, split_uri)
+    inspector = sa.inspect(store._conv_engine)
+    columns = {column["name"] for column in inspector.get_columns("conversation_items")}
+    indexes = {index["name"] for index in inspector.get_indexes("conversation_items")}
+    return (
+        "source_id" in columns,
+        "ix_conversation_items_source_id" in indexes,
+    )
+
+
+def _create_legacy_split_database(split_uri: str) -> None:
+    """Create the pre-source-id split schema used by upgrade regressions."""
     legacy_engine = sa.create_engine(split_uri)
     ConversationBase.metadata.create_all(legacy_engine)
     with legacy_engine.begin() as connection:
         connection.exec_driver_sql("DROP INDEX ix_conversation_items_source_id")
         connection.exec_driver_sql("ALTER TABLE conversation_items DROP COLUMN source_id")
+    legacy_engine.dispose()
+
+
+def test_preexisting_split_database_upgrades_before_append(tmp_path: Path) -> None:
+    """A legacy split DB gains source identity before normal store writes."""
+    main_uri = f"sqlite:///{tmp_path / 'main.db'}"
+    split_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
+    _create_legacy_split_database(split_uri)
+    legacy_engine = sa.create_engine(split_uri)
     assert "source_id" not in {
         column["name"] for column in sa.inspect(legacy_engine).get_columns("conversation_items")
     }
@@ -60,3 +82,40 @@ def test_preexisting_split_database_upgrades_before_append(tmp_path: Path) -> No
             sa.text("SELECT version FROM omnigent_conversation_schema_migrations")
         ).scalars()
         assert list(versions) == [1]
+
+
+def test_concurrent_processes_serialize_split_database_upgrade(tmp_path: Path) -> None:
+    """Multiple server processes can initialize one legacy split database."""
+    split_uri = f"sqlite:///{tmp_path / 'shared-conversations.db'}"
+    _create_legacy_split_database(split_uri)
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=4, mp_context=context) as executor:
+        futures = [
+            executor.submit(
+                _initialize_store_process,
+                f"sqlite:///{tmp_path / f'main-{index}.db'}",
+                split_uri,
+            )
+            for index in range(4)
+        ]
+        assert [future.result(timeout=60) for future in futures] == [
+            (True, True),
+            (True, True),
+            (True, True),
+            (True, True),
+        ]
+
+    engine = sa.create_engine(split_uri)
+    inspector = sa.inspect(engine)
+    assert "source_id" in {
+        column["name"] for column in inspector.get_columns("conversation_items")
+    }
+    assert "ix_conversation_items_source_id" in {
+        index["name"] for index in inspector.get_indexes("conversation_items")
+    }
+    with engine.connect() as connection:
+        versions = connection.execute(
+            sa.text("SELECT version FROM omnigent_conversation_schema_migrations")
+        ).scalars()
+        assert list(versions) == [1]
+    engine.dispose()
