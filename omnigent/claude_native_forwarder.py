@@ -1640,7 +1640,7 @@ async def _forward_available_subagents(
         # WebFetch, a stalled tool) used to post "idle", which the
         # runner consumed as an authoritative terminal completion,
         # latching the inbox entry delivered and discarding the sub-
-        # agent's real result (#4988). The dedupe on
+        # agent's real result. The dedupe on
         # ``last_status`` avoids spamming the cache on every tick.
         desired_status: str | None = None
         if had_item:
