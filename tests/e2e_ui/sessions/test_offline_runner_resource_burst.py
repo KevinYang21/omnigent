@@ -35,15 +35,16 @@ _OFFLINE_POLL_INTERVAL_S = 0.5
 
 
 def _find_runner_pids() -> list[int]:
-    """Find all PIDs running the runner entry point (``omnigent.runner._entry``).
+    """Find this test run's runner PIDs (``omnigent.runner._entry``).
 
-    The runner is a sibling subprocess of the server (both spawned by the
-    test fixture), so search by command-line pattern rather than parent PID.
+    The fixture spawns the runner as a child of the pytest process, so scope
+    the command-line match to our own children (``-P``) — a bare ``pgrep -f``
+    would match (and get killed as) any other runner on the machine.
 
     :returns: List of runner PIDs (may be empty).
     """
     result = subprocess.run(
-        ["pgrep", "-f", "omnigent.runner._entry"],
+        ["pgrep", "-P", str(os.getpid()), "-f", "omnigent[.]runner[.]_entry"],
         capture_output=True,
         text=True,
     )
