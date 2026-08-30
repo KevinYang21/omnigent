@@ -1463,16 +1463,28 @@ function ConversationList({
     setActiveOverride((prev) => computeNextActiveOverride(activeId, allConversations, prev));
   }, [activeId, allConversations]);
 
-  // While the pointer is inside the list OR a rename edit is open, pin every
-  // row's sort key so background updated_at bumps can't reorder rows under
-  // the cursor / around the edit input — a row sliding into place
-  // mid-interaction receives the click / right-click and the rename it
-  // triggers, hitting a session the user never aimed at; a reorder during an
-  // edit can move (and blur) the input, committing a half-typed title. The
-  // map accumulates keys lazily inside sortByUpdatedAtDesc (a render-time ref
-  // write) and is cleared once neither hold is active, when the order snaps
-  // back to reality.
+  // Pin every row's sort key while any order hold is active, so background
+  // updated_at bumps can't re-order the list mid-hold. Holds:
+  //  - pointer inside the list / a rename edit open: a row sliding into place
+  //    mid-interaction receives the click (and the rename it triggers) meant
+  //    for the row the user aimed at, and a reorder during an edit can move
+  //    (and blur) the input, committing a half-typed title;
+  //  - a conversation is open: a passive reader's sidebar must not shuffle
+  //    every time some background session's turn bumps its updated_at — with
+  //    a few running sessions that would re-order the list on every turn.
+  // The map accumulates keys lazily inside sortByUpdatedAtDesc (a render-time
+  // ref write; new rows enter at their live key — a just-created session may
+  // appear on top, but existing rows keep their relative order). Re-anchoring
+  // replaces the ref's map with a fresh one — never mutates the old — so the
+  // memoized sections see a new identity and recompute against live keys; the
+  // epoch state is what triggers that re-render (a bare ref swap wouldn't).
+  // Re-anchor moments: an interaction hold releasing, or navigating to
+  // another chat while no interaction hold is live (navigation under the
+  // pointer must not resync — rows would move under the cursor). Layout
+  // effect, not passive: the re-anchor must land before paint or navigation
+  // briefly paints the stale order and then visibly snaps.
   const frozenKeysRef = useRef<Map<string, number>>(new Map());
+  const [, setAnchorEpoch] = useState(0);
   const [pointerInside, setPointerInside] = useState(false);
   const [editingIds, setEditingIds] = useState<ReadonlySet<string>>(() => new Set());
   const reportRowEditing = useCallback((id: string, editing: boolean) => {
@@ -1484,11 +1496,15 @@ function ConversationList({
       return next;
     });
   }, []);
-  const orderFrozen = pointerInside || editingIds.size > 0;
+  const interactionHold = pointerInside || editingIds.size > 0;
+  const orderFrozen = interactionHold || activeId !== undefined;
   const frozenKeys = orderFrozen ? frozenKeysRef.current : null;
-  useEffect(() => {
-    if (!orderFrozen) frozenKeysRef.current.clear();
-  }, [orderFrozen]);
+  useLayoutEffect(() => {
+    if (!interactionHold) {
+      frozenKeysRef.current = new Map();
+      setAnchorEpoch((epoch) => epoch + 1);
+    }
+  }, [interactionHold, activeId]);
 
   // Build sections: Pinned and Archived are peeled off; the rest splits into
   // the viewer's own sessions (Chats) and ones shared with them. Archived
@@ -1943,9 +1959,10 @@ function ConversationList({
           <div
             className="flex flex-col gap-4"
             data-testid="sidebar-conversation-list"
-            // Freeze the sort order while the pointer is over the list so rows
-            // never move under the cursor. The frozen-keys map is cleared by the
-            // effect above once no hold (pointer or open rename edit) remains.
+            // Hold the sort order while the pointer is over the list so rows
+            // never move under the cursor. The frozen-keys map re-anchors via
+            // the effect above once no interaction hold (pointer or open
+            // rename edit) remains.
             onMouseEnter={() => setPointerInside(true)}
             onMouseLeave={() => setPointerInside(false)}
           >

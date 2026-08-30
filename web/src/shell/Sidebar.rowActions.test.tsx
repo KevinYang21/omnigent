@@ -8,8 +8,8 @@
 
 import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -1126,6 +1126,100 @@ describe("right-click context menu", () => {
     fireEvent.mouseOut(screen.getByTestId("sidebar-conversation-list"), {
       relatedTarget: document.body,
     });
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session B/);
+  });
+});
+
+describe("passive-viewer order hold", () => {
+  // While a conversation is open, the whole list's sort keys are held: a
+  // background session's updated_at bump (another session's agent turn
+  // delivered over the updates stream) must not shuffle the sidebar under
+  // someone quietly reading a chat — with a few running sessions that
+  // re-orders the list on every turn. The hold re-anchors on navigation
+  // (when no pointer/edit hold is live), snapping the order to reality.
+  const convA: Conversation = {
+    ...CONV,
+    id: "conv_a",
+    title: "Session A",
+    updated_at: 1_700_000_200,
+  };
+  const convB: Conversation = {
+    ...CONV,
+    id: "conv_b",
+    title: "Session B",
+    updated_at: 1_700_000_100,
+  };
+
+  /** Render the sidebar under a navigable router (initially at `initialPath`).
+      Returns a `navigate` that routes the app and a `rerenderSidebar` that
+      rebuilds the tree (so a `mockConversations` swap is picked up). */
+  function renderNavigableSidebar(initialPath: string) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let doNavigate: (to: string) => void = () => {};
+    function CaptureNavigate() {
+      doNavigate = useNavigate();
+      return null;
+    }
+    const makeUi = () => {
+      const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
+      return (
+        <QueryClientProvider client={qc}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialPath]}>
+              <CaptureNavigate />
+              <Routes>
+                <Route path="/c/:conversationId" element={sidebar} />
+                <Route path="/" element={sidebar} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </QueryClientProvider>
+      );
+    };
+    const view = render(makeUi());
+    return {
+      navigate: (to: string) => act(() => doNavigate(to)),
+      rerenderSidebar: () => view.rerender(makeUi()),
+    };
+  }
+
+  it("holds the order for a passive viewer when a background session bumps", () => {
+    mockConversations([convA, convB]);
+    const view = renderNavigableSidebar("/c/conv_a");
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session A/);
+
+    // Background activity: B's updated_at bumps past A while the user is
+    // reading A with the pointer nowhere near the list.
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session A/);
+  });
+
+  it("re-anchors the order when navigating to another chat", () => {
+    mockConversations([convA, convB]);
+    const view = renderNavigableSidebar("/c/conv_a");
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session A/);
+
+    // Navigating (pointer outside the list — e.g. via the command palette)
+    // releases the hold: the order snaps to reality with B on top.
+    view.navigate("/c/conv_b");
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session B/);
+  });
+
+  it("keeps live ordering when no conversation is open", () => {
+    // On the landing route with the pointer outside the list there is no
+    // hold: a background bump re-sorts immediately (recency order is the
+    // sidebar's contract when nobody is reading a chat).
+    mockConversations([convA, convB]);
+    const view = renderNavigableSidebar("/");
+    expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session A/);
+
+    mockConversations([{ ...convB, updated_at: 1_700_000_300 }, convA]);
+    view.rerenderSidebar();
+
     expect(screen.getAllByRole("link", { name: /^Session/ })[0]).toHaveAccessibleName(/Session B/);
   });
 });

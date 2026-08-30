@@ -183,13 +183,15 @@ export function filterConversations(
 //
 // `frozenKeys` (when non-null) pins EVERY row's sort key at its
 // first-seen value: a row's key is read from the map, or captured into it
-// on first sight. The sidebar passes its map while the pointer is inside
-// the list, so background `updated_at` bumps can't slide rows under the
-// cursor — a mid-interaction reorder sends clicks, right-clicks, and the
-// renames they trigger to the wrong session. Rows first seen while frozen
-// (a folder expanding, a page loading) capture their key on entry, and
-// the caller clears the map when the pointer leaves so the order snaps
-// back to reality.
+// on first sight. The sidebar passes its map while an order hold is
+// active — the pointer inside the list or a rename edit open (so rows
+// can't slide under the cursor and send clicks/renames to the wrong
+// session), and while a conversation is open (so background `updated_at`
+// bumps from other sessions' turns don't shuffle the list under a passive
+// reader). Rows first seen while frozen (a folder expanding, a page
+// loading, a just-created session) capture their key on entry, and the
+// caller re-anchors the map when the hold releases or the user navigates
+// to another chat, snapping the order back to reality.
 export function sortByUpdatedAtDesc(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
