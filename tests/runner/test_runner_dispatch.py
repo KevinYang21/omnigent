@@ -3411,11 +3411,16 @@ async def test_sys_session_send_rejects_workspace_outside_worker_root(
     outside.mkdir()
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    requests_seen = 0
+    creates_seen = 0
 
-    async def _server_handler(_request: httpx.Request) -> httpx.Response:
-        nonlocal requests_seen
-        requests_seen += 1
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        # The dispatch may look up existing children (a read) before it
+        # validates the workspace; the invariant is that no child session
+        # is ever CREATED for an out-of-root workspace.
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": []})
+        nonlocal creates_seen
+        creates_seen += 1
         return httpx.Response(500)
 
     async with httpx.AsyncClient(
@@ -3441,7 +3446,7 @@ async def test_sys_session_send_rejects_workspace_outside_worker_root(
 
     assert output.startswith("Error:")
     assert "outside" in output
-    assert requests_seen == 0
+    assert creates_seen == 0
 
 
 @pytest.mark.asyncio

@@ -1731,6 +1731,15 @@ def _canonical_subagent_workspace(
     agent_spec: AgentSpec | None,
 ) -> str:
     """Validate a child workspace against its configured filesystem root."""
+    # Capability check first: a sub-agent without a configured boundary can
+    # never accept a workspace, so fail on that before probing the requested
+    # path (no filesystem existence oracle for incapable sub-agents).
+    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+    os_env = getattr(sub_spec, "os_env", None) if sub_spec is not None else None
+    configured_root = getattr(os_env, "cwd", None) if os_env is not None else None
+    if not isinstance(configured_root, str) or not configured_root:
+        raise ValueError(f"sub-agent {sub_agent_name!r} has no configured os_env.cwd boundary")
+
     requested = Path(workspace)
     if not requested.is_absolute():
         raise ValueError("'workspace' must be an absolute path")
@@ -1741,11 +1750,6 @@ def _canonical_subagent_workspace(
     if not canonical.is_dir():
         raise ValueError(f"workspace is not a directory: {workspace!r}")
 
-    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
-    os_env = getattr(sub_spec, "os_env", None) if sub_spec is not None else None
-    configured_root = getattr(os_env, "cwd", None) if os_env is not None else None
-    if not isinstance(configured_root, str) or not configured_root:
-        raise ValueError(f"sub-agent {sub_agent_name!r} has no configured os_env.cwd boundary")
     root = Path(configured_root).expanduser()
     try:
         canonical_root = root.resolve(strict=True)
@@ -2132,17 +2136,6 @@ async def _execute_subagent_tool(
     if not _has_subagent(sub_agent_name, agent_spec):
         return f"Error: sub-agent {sub_agent_name!r} not found in agent spec"
 
-    canonical_workspace: str | None = None
-    if workspace is not None:
-        try:
-            canonical_workspace = _canonical_subagent_workspace(
-                workspace,
-                sub_agent_name=sub_agent_name,
-                agent_spec=agent_spec,
-            )
-        except ValueError as exc:
-            return f"Error: sys_session_send invalid 'workspace': {exc}"
-
     dispatch_created_by = await _session_turn_actor(
         server_client=server_client,
         conversation_id=conversation_id,
@@ -2196,7 +2189,7 @@ async def _execute_subagent_tool(
                 "it, or sys_session_close it first to spawn a fresh "
                 "session on the requested model."
             )
-        if canonical_workspace is not None:
+        if workspace is not None:
             return (
                 f"Error: sys_session_send 'workspace' applies only when a "
                 f"sub-agent session is first created; {sub_agent_name!r} "
@@ -2344,6 +2337,20 @@ async def _execute_subagent_tool(
                     f"Install/upgrade it with: {install} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
+        # Canonicalize the per-child workspace only on the create path —
+        # after the existing-child lookup — so a continuation send is
+        # rejected with the create-time-only error above without this
+        # dispatch ever probing the filesystem for the supplied path.
+        canonical_workspace: str | None = None
+        if workspace is not None:
+            try:
+                canonical_workspace = _canonical_subagent_workspace(
+                    workspace,
+                    sub_agent_name=sub_agent_name,
+                    agent_spec=agent_spec,
+                )
+            except ValueError as exc:
+                return f"Error: sys_session_send invalid 'workspace': {exc}"
         # Create child session on the server (no initial items —
         # those go via a separate POST so the server forwards them
         # to the runner and triggers a turn).
