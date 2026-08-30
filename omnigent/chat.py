@@ -2006,27 +2006,33 @@ def _poll_remote_runner(
     status_url = f"{base_url}/v1/runners/{runner_id}/status"
     last_error: httpx.HTTPError | None = None
     last_status: int | None = None
-    while time.monotonic() < deadline:
-        if runner_proc.poll() is not None:
-            raise click.ClickException(
-                f"Local runner exited early with code {runner_proc.returncode}."
-                f"{format_runner_log_tail(log_path)}"
-            )
-        try:
-            resp = httpx.get(status_url, headers=headers, timeout=2.0)
-            if resp.status_code == 200 and resp.json().get("online") is True:
-                return
-            last_status = resp.status_code
-            if resp.status_code in {401, 403}:
+    # One client for the whole wait: constructing a fresh client (and
+    # its transport/SSL context) per probe costs CPU each probe, which
+    # at the fast poll rate steals cycles from the booting runner this
+    # loop is waiting on. Ambient proxy env stays honored (trust_env
+    # default) because the server here is remote, not loopback.
+    with httpx.Client(headers=headers, timeout=2.0) as client:
+        while time.monotonic() < deadline:
+            if runner_proc.poll() is not None:
                 raise click.ClickException(
-                    f"Remote runner status check was rejected ({resp.status_code}); "
-                    f"run `{cli_invocation()} login <server-url>` "
-                    "or check remote auth credentials."
+                    f"Local runner exited early with code {runner_proc.returncode}."
                     f"{format_runner_log_tail(log_path)}"
                 )
-        except httpx.HTTPError as exc:
-            last_error = exc
-        time.sleep(_server_ready_poll_interval(time.monotonic() - start))
+            try:
+                resp = client.get(status_url)
+                if resp.status_code == 200 and resp.json().get("online") is True:
+                    return
+                last_status = resp.status_code
+                if resp.status_code in {401, 403}:
+                    raise click.ClickException(
+                        f"Remote runner status check was rejected ({resp.status_code}); "
+                        f"run `{cli_invocation()} login <server-url>` "
+                        "or check remote auth credentials."
+                        f"{format_runner_log_tail(log_path)}"
+                    )
+            except httpx.HTTPError as exc:
+                last_error = exc
+            time.sleep(_server_ready_poll_interval(time.monotonic() - start))
     detail = ""
     if last_status is not None:
         detail = f" Last status check returned HTTP {last_status}."

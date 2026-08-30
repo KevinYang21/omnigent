@@ -750,15 +750,27 @@ def test_wait_for_remote_runner_uses_status_endpoint_and_auth(
         """Record the chosen poll interval."""
         sleep_calls.append(seconds)
 
-    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> _Resp:
-        """Return offline once, then online."""
-        del timeout
-        requested.append((url, headers))
-        return _Resp(next(status_bodies))
+    class _FakeClient:
+        """Shared-client stub recording each status probe with its headers."""
+
+        def __init__(self, *, headers: dict[str, str], timeout: float) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, url: str) -> _Resp:
+            """Return offline once, then online."""
+            requested.append((url, self._headers))
+            return _Resp(next(status_bodies))
 
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
     monkeypatch.setattr("omnigent.chat.time.sleep", _fake_sleep)
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     _wait_for_remote_runner(
         "https://example.databricksapps.com",
@@ -804,18 +816,24 @@ def test_wait_for_remote_runner_fails_loud_on_auth_rejection(
 
     proc = SimpleNamespace(poll=lambda: None, returncode=None)
 
-    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> _Resp:
-        """Return an auth rejection for the status endpoint.
+    class _FakeClient:
+        """Client stub returning an auth rejection for the status endpoint."""
 
-        :param url: Status endpoint URL.
-        :param headers: Auth headers passed by the caller.
-        :param timeout: Per-request timeout.
-        :returns: A 401 response.
-        """
-        del url, headers, timeout
-        return _Resp()
+        def __init__(self, **_kwargs: object) -> None:
+            pass
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, url: str) -> _Resp:
+            """Return a 401 response."""
+            del url
+            return _Resp()
+
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     with pytest.raises(click.ClickException, match="status check was rejected \\(401\\)"):
         _wait_for_remote_runner(
@@ -877,12 +895,26 @@ def test_wait_for_remote_runner_timeout_surfaces_log_path(
         """
         return next(monotonic_values)
 
+    class _FakeClient:
+        """Client stub whose probes always report the runner offline."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, url: str) -> _Resp:
+            """Return an offline status response."""
+            del url
+            return _Resp()
+
     monkeypatch.setattr("omnigent.chat.time.monotonic", _fake_monotonic)
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
-    monkeypatch.setattr(
-        "omnigent.chat.httpx.get",
-        lambda *_a, **_k: _Resp(),
-    )
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     with pytest.raises(click.ClickException) as exc_info:
         _wait_for_remote_runner(
@@ -932,14 +964,26 @@ def test_wait_for_remote_runner_early_exit_surfaces_log_path(
     monkeypatch.setattr("omnigent.chat.time.monotonic", lambda: 0.0)
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
 
-    def _fake_get(*_a, **_k):
-        """Status probe never invoked because the runner is dead.
+    class _FakeClient:
+        """Client stub that must never be probed: the runner is dead."""
 
-        :raises AssertionError: If the poll loop reaches httpx.
-        """
-        raise AssertionError("should not reach httpx when runner already exited")
+        def __init__(self, **_kwargs: object) -> None:
+            pass
 
-    monkeypatch.setattr("omnigent.chat.httpx.get", _fake_get)
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def get(self, url: str) -> object:
+            """Fail the test if the poll loop reaches httpx.
+
+            :raises AssertionError: Always.
+            """
+            raise AssertionError("should not reach httpx when runner already exited")
+
+    monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
     with pytest.raises(click.ClickException) as exc_info:
         _wait_for_remote_runner(
