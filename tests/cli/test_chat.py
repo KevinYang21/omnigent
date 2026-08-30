@@ -577,6 +577,7 @@ def test_wait_for_server_fails_fast_when_runner_dies(
         runner_id="runner_dead_test",
         runner_proc=SimpleNamespace(poll=lambda: 1, returncode=1),
         log_path=Path("/tmp/server.log"),
+        runner_log_path=Path("/tmp/runner-dead.log"),
     )
 
     class _FakeClient:
@@ -608,8 +609,12 @@ def test_wait_for_server_fails_fast_when_runner_dies(
     monkeypatch.setattr("omnigent.chat.time.sleep", lambda _s: None)
     monkeypatch.setattr("omnigent.chat.httpx.Client", _FakeClient)
 
-    with pytest.raises(click.ClickException, match="runner exited early with code 1"):
+    with pytest.raises(click.ClickException, match="runner exited early with code 1") as exc_info:
         _wait_for_server(8123, server, timeout=5.0)
+    # The runner's own captured log is the durable record of a
+    # crash-at-spawn, so the error must point at it, not only at the
+    # (healthy) server's log.
+    assert "/tmp/runner-dead.log" in exc_info.value.message
 
 
 def test_start_local_server_spawns_runner_as_sibling(

@@ -263,12 +263,16 @@ class LocalServer:
         sibling of the server by :func:`_start_local_server`.
         ``None`` when no runner was started (shouldn't happen in
         normal operation).
+    :param runner_log_path: Captured runner log file, the durable
+        record of a runner crash-at-spawn. ``None`` when the runner
+        was not started with log capture.
     """
 
     proc: subprocess.Popen[bytes]
     log_path: Path
     runner_id: str | None = None
     runner_proc: subprocess.Popen[bytes] | None = None
+    runner_log_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -3702,6 +3706,7 @@ def _start_local_server(
         log_path=log_path,
         runner_id=runner_id,
         runner_proc=runner.proc,
+        runner_log_path=runner.log_path,
     )
 
 
@@ -3735,10 +3740,13 @@ def _wait_for_server(
                 # The sibling runner died; without this check the loop
                 # waits out the full boot budget before failing with a
                 # generic message that blames the (healthy) server.
+                from omnigent._runner_startup import format_runner_log_tail
+
                 raise click.ClickException(
                     f"Local runner exited early with code {runner_proc.returncode} "
                     f"while waiting for the server to become ready.\n"
                     f"  Server log:  {server.log_path}"
+                    f"{format_runner_log_tail(server.runner_log_path)}"
                 )
             try:
                 resp = client.get("/health")
