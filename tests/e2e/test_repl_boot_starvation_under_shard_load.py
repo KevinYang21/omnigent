@@ -38,6 +38,7 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import subprocess
@@ -195,10 +196,8 @@ def test_repl_boot_reaches_prompt_ready_under_full_shard_load(
             t.join()
     finally:
         for child in children:
-            try:
+            with contextlib.suppress(Exception):
                 child.terminate(force=True)
-            except Exception:
-                pass
         for b in burners:
             b.kill()
 
