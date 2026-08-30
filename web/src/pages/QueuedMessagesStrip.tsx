@@ -117,32 +117,42 @@ function QueuedRow({
           <TooltipTrigger asChild>
             <button
               type="button"
-              aria-label="Send queued message now"
+              aria-label={
+                message.deliveryUncertain === true
+                  ? "Check queued message delivery"
+                  : "Send queued message now"
+              }
               className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
               onClick={() => onSteer(message.queueId)}
             >
               <ArrowUpIcon className="size-3.5" aria-hidden="true" />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="top">Send now</TooltipContent>
+          <TooltipContent side="top">
+            {message.deliveryUncertain === true ? "Check delivery (safe retry)" : "Send now"}
+          </TooltipContent>
         </Tooltip>
       ) : null}
-      <button
-        type="button"
-        aria-label="Edit queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
-        onClick={() => onEdit(message.queueId)}
-      >
-        <PencilIcon className="size-3.5" aria-hidden="true" />
-      </button>
-      <button
-        type="button"
-        aria-label="Remove queued message"
-        className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
-        onClick={() => onDelete(message.queueId)}
-      >
-        <Trash2Icon className="size-3.5" aria-hidden="true" />
-      </button>
+      {message.deliveryUncertain !== true ? (
+        <>
+          <button
+            type="button"
+            aria-label="Edit queued message"
+            className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+            onClick={() => onEdit(message.queueId)}
+          >
+            <PencilIcon className="size-3.5" aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            aria-label="Remove queued message"
+            className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground"
+            onClick={() => onDelete(message.queueId)}
+          >
+            <Trash2Icon className="size-3.5" aria-hidden="true" />
+          </button>
+        </>
+      ) : null}
     </div>
   );
 }

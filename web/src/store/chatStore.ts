@@ -168,6 +168,8 @@ export type SendAttemptResult = "settled" | "retryable_failure" | "terminal_fail
  */
 export interface PendingUserMessage {
   tempId: string;
+  /** Logical submit identity, retained across ambiguous replay attempts. */
+  clientEventId?: string;
   content: MessageContentBlock[];
   /** Client epoch seconds stamped ONCE at send time — the optimistic
    *  bubble's display timestamp. Stamping here (not at render or
@@ -209,6 +211,8 @@ export interface QueuedMessage {
   deliveryError?: string;
   /** Prevent automatic FIFO flush until the user edits or explicitly retries. */
   retryBlocked?: boolean;
+  /** Delivery may already have happened; retries must retain clientEventId. */
+  deliveryUncertain?: boolean;
   /** Fully-assembled message text (mentions/quotes already applied). */
   text: string;
   /** Attachments to send with the message. */
@@ -440,6 +444,7 @@ export interface ConversationState {
     text: string;
     files: File[];
     clientEventId?: string;
+    deliveryUncertain?: boolean;
   } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
@@ -1467,7 +1472,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, {
       clientEventId:
-        target.retryBlocked === true
+        target.retryBlocked === true && target.deliveryUncertain !== true
           ? createClientEventId()
           : (target.clientEventId ?? createClientEventId()),
     });
@@ -1617,10 +1622,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
           );
           const retryBlocked = err instanceof ApiError && err.status !== 408 && err.status < 500;
+          const deliveryUncertain = isUncertainDeliveryError(err);
           const requeuedHead = retryBlocked
             ? {
                 ...claimedHead,
                 retryBlocked: true,
+                ...(deliveryUncertain ? { deliveryUncertain: true } : {}),
                 deliveryError: err.message,
               }
             : claimedHead;
@@ -1687,6 +1694,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...s.pendingUserMessages,
         {
           tempId,
+          clientEventId,
           content,
           createdAtS: Math.floor(Date.now() / 1000),
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
@@ -1796,6 +1804,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           sessionId,
           tempId,
           postResult.pendingId,
+          postResult.itemId,
+          clientEventId,
           setterFor(sessionId),
           () => setterForState(sessionId) ?? get(),
         );
@@ -1852,6 +1862,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             text,
             files: files ?? [],
             ...(shouldPreserveClientEventId(err) ? { clientEventId } : {}),
+            ...(isUncertainDeliveryError(err) ? { deliveryUncertain: true } : {}),
           },
         });
       }
@@ -1912,6 +1923,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.sendSlashCommand: no agentId");
     }
+    const clientEventId = opts?.clientEventId ?? createClientEventId();
     // Mirror `send`'s lifecycle scaffolding (streaming flag + send-chain
     // serialization) so a skill invocation behaves like any other turn.
     const alreadyStreaming = get().status === "streaming";
@@ -1936,6 +1948,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...s.pendingUserMessages,
         {
           tempId,
+          clientEventId,
           content: [{ type: "input_text" as const, text: commandText }],
           createdAtS: Math.floor(Date.now() / 1000),
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
@@ -1965,6 +1978,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const postResult = await postEvent(sessionId, {
         type: "slash_command",
         data: { kind: "skill", name, arguments: args },
+        client_event_id: clientEventId,
       });
       result = "settled";
       if (postResult.denied) {
@@ -2018,7 +2032,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (!suppressFailure && !persistedFailure && draftSessionId !== null) {
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text: commandText, files: [] },
+          failedSendDraft: {
+            conversationId: draftSessionId,
+            text: commandText,
+            files: [],
+            ...(shouldPreserveClientEventId(err) ? { clientEventId } : {}),
+            ...(isUncertainDeliveryError(err) ? { deliveryUncertain: true } : {}),
+          },
         });
       }
       // Keep an echo the server says it persisted; snapshots reconcile it.
@@ -3933,36 +3953,24 @@ async function reconcileReplayedSubmit(
   id: string,
   tempId: string,
   pendingId: string | undefined,
+  committedItemId: string | undefined,
+  clientEventId: string,
   set: Setter,
   get: Getter,
 ): Promise<void> {
-  // A native receipt carries the pending-input id from the original dispatch.
-  // Keep the bubble only while that exact entry remains outstanding; otherwise
-  // the transcript forwarder has already committed it and the history backfill
-  // below is authoritative. On snapshot failure, conservatively keep/rekey the
-  // bubble so a later consumed event can still match it exactly.
-  let retainPending = pendingId !== undefined;
-  if (pendingId !== undefined) {
-    try {
-      const session = await getSessionSlim(id);
-      if (isConversationDisposed(id)) return;
-      retainPending = (session.pendingInputs ?? []).some(
-        (pending) => pending.pendingId === pendingId,
-      );
-    } catch {
-      // Keep the conservative default.
-    }
-  }
-
+  // Never remove the only visible copy merely because the receipt says the
+  // original attempt completed. The committed item still has to be observed
+  // successfully below; a failed snapshot/items fetch leaves this bubble as
+  // the user's evidence that the message exists.
   set((state) => {
     const index = state.pendingUserMessages.findIndex((pending) => pending.tempId === tempId);
     if (index === -1) return {};
-    if (!retainPending || pendingId === undefined) {
+    if (pendingId === undefined) {
+      const replayed = state.pendingUserMessages[index]!;
       return {
-        pendingUserMessages: [
-          ...state.pendingUserMessages.slice(0, index),
-          ...state.pendingUserMessages.slice(index + 1),
-        ],
+        pendingUserMessages: state.pendingUserMessages.map((pending, at) =>
+          at === index ? { ...replayed, posted: true } : pending,
+        ),
       };
     }
     // A cold snapshot may already have restored this pending id. Keep one
@@ -3989,9 +3997,19 @@ async function reconcileReplayedSubmit(
   });
 
   // The original consumed event may have crossed the failed HTTP response and
-  // is not re-emitted for a receipt replay. Reuse the reconnect backfill: it
-  // merges any missing committed item and drains its FIFO optimistic entry.
+  // is not re-emitted for a receipt replay. Only this successful snapshot +
+  // items reconciliation is allowed to replace the optimistic bubble.
   await reconcileOnReconnect(id, set, get);
+  if (
+    committedItemId !== undefined &&
+    get().blocks.some((block) => block.ctx.itemId === committedItemId)
+  ) {
+    set((state) => ({
+      pendingUserMessages: state.pendingUserMessages.filter(
+        (pending) => pending.tempId !== tempId && pending.clientEventId !== clientEventId,
+      ),
+    }));
+  }
 }
 
 /**
@@ -6381,7 +6399,23 @@ function describeSendFailure(err: unknown): { message: string; code: string } {
 
 function shouldPreserveClientEventId(err: unknown): boolean {
   if (!(err instanceof ApiError)) return true;
-  return err.status === 408 || err.status >= 500 || err.code === "wrong_replica";
+  return (
+    err.status === 408 ||
+    err.status >= 500 ||
+    err.code === "wrong_replica" ||
+    err.code === "message_event_pending" ||
+    err.code === "message_event_uncertain"
+  );
+}
+
+function isUncertainDeliveryError(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return true;
+  return (
+    err.status === 408 ||
+    err.status >= 500 ||
+    err.code === "message_event_pending" ||
+    err.code === "message_event_uncertain"
+  );
 }
 
 /**

@@ -668,6 +668,27 @@ export function shouldQueueSend(
   return isBusy || hasQueued;
 }
 
+export function confirmUncertainDeliveryReplacement(
+  retryDraft: { text: string; files: File[]; deliveryUncertain?: boolean } | null,
+  messageText: string,
+  files: File[],
+): boolean {
+  if (
+    retryDraft === null ||
+    !retryDraft.deliveryUncertain ||
+    (retryDraft.text === messageText &&
+      retryDraft.files.length === files.length &&
+      retryDraft.files.every((file, index) => file === files[index]))
+  ) {
+    return true;
+  }
+  return window.confirm(
+    "Delivery of the original message is uncertain. Sending this edited message " +
+      "will use a new identity and may duplicate work if the original was delivered. " +
+      "Send as a new message anyway?",
+  );
+}
+
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
 const SessionSharedContext = createContext(false);
@@ -988,7 +1009,9 @@ export function ChatPage() {
       }).then((outcome) => {
         if (outcome !== "cancelled") {
           clearPendingInitialPrompt(convId);
-          if (outcome === "failed") stashUndeliveredPrompt(convId, prompt.text);
+          if (outcome === "failed") {
+            stashUndeliveredPrompt(convId, prompt.text, prompt.files ?? []);
+          }
         }
         return outcome;
       });
@@ -4541,6 +4564,7 @@ export function Composer({
     clientEventId: string;
     text: string;
     files: File[];
+    deliveryUncertain: boolean;
   } | null>(null);
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
@@ -4794,13 +4818,13 @@ export function Composer({
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
-    useChatStore.setState({ failedSendDraft: null });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
     if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
       retryDraftRef.current = null;
       return;
     }
+    useChatStore.setState({ failedSendDraft: null });
     setValue(failedSendDraft.text);
     dirtyRef.current = true;
     let restoredFiles: File[] = [];
@@ -4818,10 +4842,11 @@ export function Composer({
             clientEventId: failedSendDraft.clientEventId,
             text: failedSendDraft.text,
             files: restoredFiles,
+            deliveryUncertain: failedSendDraft.deliveryUncertain === true,
           }
         : null;
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId]);
+  }, [failedSendDraft, conversationId, settledConversationId, value, files]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -5125,13 +5150,15 @@ export function Composer({
     const messageText =
       buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
     const retryDraft = retryDraftRef.current;
-    const retryClientEventId =
+    const retryPayloadMatches =
       retryDraft !== null &&
       retryDraft.text === messageText &&
       retryDraft.files.length === files.length &&
-      retryDraft.files.every((file, index) => file === files[index])
-        ? retryDraft.clientEventId
-        : undefined;
+      retryDraft.files.every((file, index) => file === files[index]);
+    if (!confirmUncertainDeliveryReplacement(retryDraft, messageText, files)) {
+      return;
+    }
+    const retryClientEventId = retryPayloadMatches ? retryDraft.clientEventId : undefined;
     retryDraftRef.current = null;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
@@ -6046,9 +6073,16 @@ export async function deliverInitialPrompt(params: {
  * @param conversationId Session the prompt was meant for, e.g. ``"conv_abc"``.
  * @param text The undelivered message text.
  */
-function stashUndeliveredPrompt(conversationId: string, text: string): void {
-  if (!text || getSessionDraft(conversationId)?.text) return;
-  setSessionDraft(conversationId, { text, files: [] });
+function stashUndeliveredPrompt(conversationId: string, text: string, files: File[] = []): void {
+  const existing = getSessionDraft(conversationId);
+  if (
+    (!text && files.length === 0) ||
+    Boolean(existing?.text) ||
+    (existing?.files.length ?? 0) > 0
+  ) {
+    return;
+  }
+  setSessionDraft(conversationId, { text, files });
 }
 
 /**

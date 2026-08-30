@@ -2178,6 +2178,42 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
   });
 
+  it("keeps a replay bubble when reconciliation fails, then merges once", async () => {
+    seedSession("conv_replay_fetch", []);
+    await useChatStore.getState().switchTo("conv_replay_fetch");
+    const base = fetchMock.getMockImplementation()!;
+    let failItemsFetch = true;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_replay_fetch/events")) {
+        return mockResponse({
+          queued: false,
+          item_id: "msg_resp_original_user",
+          idempotency_replayed: true,
+        });
+      }
+      if (url.includes("/v1/sessions/conv_replay_fetch/items") && failItemsFetch) {
+        return mockResponse({}, { ok: false, status: 503 });
+      }
+      return base(input, init);
+    });
+
+    await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { clientEventId: "logical-submit" });
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+
+    seedSessionItems("conv_replay_fetch", [userMessage("resp_original", "do this once")]);
+    failItemsFetch = false;
+    await useChatStore
+      .getState()
+      .send("do this once", "agent_xyz", [], { clientEventId: "logical-submit" });
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.filter((block) => block.type === "user_message")).toHaveLength(1);
+  });
+
   it("rekeys a native durable replay to its original pending input", async () => {
     seedSession("conv_native_replay", []);
     await useChatStore.getState().switchTo("conv_native_replay");
@@ -2236,6 +2272,8 @@ describe("chatStore — send (first-send ordering)", () => {
   it.each([
     [408, "request_timeout"],
     [500, "internal_error"],
+    [409, "message_event_pending"],
+    [409, "message_event_uncertain"],
   ] as const)("preserves the logical submit id after ambiguous HTTP %i", async (status, code) => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -2261,6 +2299,7 @@ describe("chatStore — send (first-send ordering)", () => {
     );
     const submittedId = JSON.parse((request?.[1]?.body as string) ?? "{}").client_event_id;
     expect(useChatStore.getState().failedSendDraft?.clientEventId).toBe(submittedId);
+    expect(useChatStore.getState().failedSendDraft?.deliveryUncertain).toBe(true);
   });
 
   it("abandons the logical submit id after a terminal HTTP 4xx", async () => {
@@ -2571,7 +2610,11 @@ describe("chatStore — send (first-send ordering)", () => {
 
 describe("chatStore — sendSlashCommand", () => {
   /** Parse the JSON body of the single POST /events call. */
-  function lastEventBody(): { type: string; data: Record<string, unknown> } {
+  function lastEventBody(): {
+    type: string;
+    data: Record<string, unknown>;
+    client_event_id?: string;
+  } {
     const post = fetchMock.mock.calls.find(
       ([u, init]) =>
         String(u).endsWith("/events") && (init as RequestInit | undefined)?.method === "POST",
@@ -2586,13 +2629,16 @@ describe("chatStore — sendSlashCommand", () => {
       abortController: new AbortController(),
     });
 
-    await useChatStore.getState().sendSlashCommand("grill-me", "review this plan", "agent_xyz");
+    await useChatStore.getState().sendSlashCommand("grill-me", "review this plan", "agent_xyz", {
+      clientEventId: "skill-logical-submit",
+    });
 
     // The wire shape must match the REPL's: type=slash_command, kind=skill,
     // name without leading slash, and the raw argument text. A regression to
     // a plaintext message would set type="message" and fail here.
     expect(lastEventBody()).toEqual({
       type: "slash_command",
+      client_event_id: "skill-logical-submit",
       data: { kind: "skill", name: "grill-me", arguments: "review this plan" },
     });
   });
@@ -11295,6 +11341,36 @@ describe("chatStore — background cross-session flush", () => {
     expect(useChatStore.getState().queuedMessages[0]?.clientEventId).toBe(
       requestBody.client_event_id,
     );
+  });
+
+  it("checks an uncertain queued delivery with the same logical id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_bg",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "retry-me",
+          conversationId: "conv_bg",
+          clientEventId: "logical-submit",
+          retryBlocked: true,
+          deliveryUncertain: true,
+        },
+      ],
+    });
+
+    useChatStore.getState().steerMessage("q_1");
+    await tick();
+    await tick();
+
+    const requestBody = JSON.parse(
+      (fetchMock.mock.calls.find(
+        ([input, init]) =>
+          String(input) === "/v1/sessions/conv_bg/events" && init?.method === "POST",
+      )?.[1]?.body as string) ?? "{}",
+    );
+    expect(requestBody.client_event_id).toBe("logical-submit");
   });
 
   it("does not re-POST a just-failed conversation within its cooldown", async () => {

@@ -8,7 +8,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
-import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
+import {
+  clearSessionDrafts,
+  getSessionDraft,
+  hasSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
@@ -201,6 +206,25 @@ describe("Composer session drafts", () => {
     fireEvent.submit(textarea().closest("form")!);
 
     expect(onSend).toHaveBeenCalledWith("intentional new submit", undefined);
+  });
+
+  it("does not discard failed files when a files-only draft is occupied", async () => {
+    const existing = new File(["existing"], "existing.png", { type: "image/png" });
+    const undelivered = new File(["retry"], "retry.png", { type: "image/png" });
+    setSessionDraft("conv_draft", { text: "", files: [existing] });
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "",
+        files: [undelivered],
+      },
+    });
+
+    render(<Composer {...composerProps()} />);
+    await waitFor(() => {
+      expect(useChatStore.getState().failedSendDraft?.files).toEqual([undelivered]);
+    });
+    expect(getSessionDraft("conv_draft")?.files).toEqual([existing]);
   });
 });
 

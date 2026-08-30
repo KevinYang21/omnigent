@@ -18,6 +18,7 @@ import {
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  confirmUncertainDeliveryReplacement,
   containsMarkdownTable,
   deliverInitialPrompt,
   dispatchInitialPrompt,
@@ -57,6 +58,36 @@ function composerState(permissionLevel: number | null) {
   const canSubmit = !isReadOnly;
   return { isReadOnly, canType, canSubmit };
 }
+
+describe("uncertain delivery replacement", () => {
+  it("requires explicit duplicate-risk confirmation for a changed payload", () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    expect(
+      confirmUncertainDeliveryReplacement(
+        { text: "original", files: [], deliveryUncertain: true },
+        "edited",
+        [],
+      ),
+    ).toBe(false);
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
+    confirm.mockRestore();
+  });
+
+  it("safe-retries an unchanged payload without confirmation", () => {
+    const confirm = vi.spyOn(window, "confirm");
+
+    expect(
+      confirmUncertainDeliveryReplacement(
+        { text: "original", files: [], deliveryUncertain: true },
+        "original",
+        [],
+      ),
+    ).toBe(true);
+    expect(confirm).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+});
 
 describe("Composer permission gating", () => {
   it("read-only (level 1) disables textarea and submit", () => {
