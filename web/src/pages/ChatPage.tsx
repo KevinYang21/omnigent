@@ -103,7 +103,7 @@ import {
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retrySession } from "@/lib/sessionsApi";
+import { createClientEventId, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   clearPendingInitialPrompt,
@@ -1063,9 +1063,9 @@ export function ChatPage() {
     }
     if (pendingResumePrompt === null || !agentId) return;
     sentResumePromptRef.current = pendingResumePrompt;
-    const { text, files } = pendingResumePrompt;
+    const { text, files, clientEventId } = pendingResumePrompt;
     setPendingResumePrompt(null);
-    void useChatStore.getState().send(text, agentId, files);
+    void useChatStore.getState().send(text, agentId, files, { clientEventId });
   }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
   // Opened when the user tries to interact with an unreachable session
@@ -1313,15 +1313,21 @@ export function ChatPage() {
   const isUnreachable =
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
-  function onSend(text: string, files?: File[]) {
+  function onSend(text: string, files?: File[], retryClientEventId?: string) {
     if (!agentId) return;
+    const clientEventId = retryClientEventId ?? createClientEventId();
     // An unbound coding clone (fork-source label) needs a directory before
     // it can run: open the picker and stash this message to replay after
     // the bind. Pin the prompt to THIS session so it replays here, never
     // into a session the user may switch to first; carry any attachments
     // so the replay sends the same payload.
     if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
-      setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
+      setPendingResumePrompt({
+        sessionId: urlConvId,
+        text,
+        files: files ?? [],
+        clientEventId,
+      });
       setResumeDirDialogOpen(true);
       return;
     }
@@ -1346,10 +1352,11 @@ export function ChatPage() {
         readAlwaysSteer(),
       )
     ) {
-      chat.enqueueMessage(text, files);
+      chat.enqueueMessage(text, files, clientEventId);
       return;
     }
     void useChatStore.getState().send(text, agentId, files, {
+      clientEventId,
       onConversationCreated: (newId) => {
         // Eager URL update: the moment the server tells us this
         // conversation's id, promote `/` → `/c/:newId`. Replace (not
@@ -1673,7 +1680,7 @@ interface MainAgentSurfaceProps {
   liveness: SessionLiveness;
   agentsError: unknown;
   disabled: boolean;
-  onSend: (text: string, files?: File[]) => void;
+  onSend: (text: string, files?: File[], clientEventId?: string) => void;
   /**
    * Invoke a skill via the `slash_command` event path. Gated off inside
    * `MainAgentSurface` for terminal-first (native) sessions, where `/skill`
@@ -3738,7 +3745,7 @@ interface ComposerProps {
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
   disabled: boolean;
-  onSend: (text: string, files?: File[]) => void;
+  onSend: (text: string, files?: File[], clientEventId?: string) => void;
   /**
    * Send a recognised skill as a `slash_command` event (the REPL's wire
    * shape) instead of plaintext. When present and the typed command names
@@ -4530,6 +4537,11 @@ export function Composer({
   const filesRef = useRef(files);
   filesRef.current = files;
   const submitGuardRef = useRef(false);
+  const retryDraftRef = useRef<{
+    clientEventId: string;
+    text: string;
+    files: File[];
+  } | null>(null);
   // Guards against React StrictMode double-invoke in development:
   // setup → cleanup → setup runs cleanup before the user has touched
   // the input, which would delete the draft. Only save when the user
@@ -4554,6 +4566,7 @@ export function Composer({
 
   useEffect(() => {
     const restored = conversationId ? getSessionDraft(conversationId) : undefined;
+    retryDraftRef.current = null;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
@@ -4784,14 +4797,29 @@ export function Composer({
     useChatStore.setState({ failedSendDraft: null });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore.
-    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
+      retryDraftRef.current = null;
+      return;
+    }
     setValue(failedSendDraft.text);
     dirtyRef.current = true;
+    let restoredFiles: File[] = [];
+    let filesRejected = false;
     if (failedSendDraft.files.length > 0) {
       const { accepted, errors } = validateAttachments(failedSendDraft.files);
+      restoredFiles = accepted;
+      filesRejected = errors.length > 0;
       setFiles(accepted);
       setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
     }
+    retryDraftRef.current =
+      failedSendDraft.clientEventId !== undefined && !filesRejected
+        ? {
+            clientEventId: failedSendDraft.clientEventId,
+            text: failedSendDraft.text,
+            files: restoredFiles,
+          }
+        : null;
     if (!isMobileRef.current) textareaRef.current?.focus();
   }, [failedSendDraft, conversationId, settledConversationId]);
 
@@ -4953,6 +4981,7 @@ export function Composer({
     // message. The server enforces the same limits authoritatively.
     const { accepted, errors } = validateAttachments(incoming);
     if (accepted.length > 0) {
+      retryDraftRef.current = null;
       setFiles((prev) => [...prev, ...accepted]);
       dirtyRef.current = true;
       // Return focus to the composer so the user can keep typing right
@@ -4991,6 +5020,7 @@ export function Composer({
   };
 
   const removeFile = (index: number) => {
+    retryDraftRef.current = null;
     setFiles((prev) => prev.filter((_, i) => i !== index));
     setAttachmentError(null);
     dirtyRef.current = true;
@@ -5094,12 +5124,25 @@ export function Composer({
     // workspace file/folder from this marker; no upload happens.
     const messageText =
       buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
+    const retryDraft = retryDraftRef.current;
+    const retryClientEventId =
+      retryDraft !== null &&
+      retryDraft.text === messageText &&
+      retryDraft.files.length === files.length &&
+      retryDraft.files.every((file, index) => file === files[index])
+        ? retryDraft.clientEventId
+        : undefined;
+    retryDraftRef.current = null;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
     if (trimmed) appendEntry(trimmed);
-    onSend(messageText, files.length > 0 ? files : undefined);
+    if (retryClientEventId === undefined) {
+      onSend(messageText, files.length > 0 ? files : undefined);
+    } else {
+      onSend(messageText, files.length > 0 ? files : undefined, retryClientEventId);
+    }
     dirtyRef.current = true;
     setValue("");
     setFiles([]);
@@ -5383,6 +5426,9 @@ export function Composer({
             ref={textareaRef}
             value={value}
             onChange={(e) => {
+              if (retryDraftRef.current !== null && e.target.value !== retryDraftRef.current.text) {
+                retryDraftRef.current = null;
+              }
               setValue(e.target.value);
               dirtyRef.current = true;
               if (commandError !== null) setCommandError(null);
@@ -5832,9 +5878,10 @@ interface ResumePrompt {
   sessionId: string;
   text: string;
   files: File[];
+  clientEventId: string;
 }
 
-/** Gate resume delivery by object identity so one effect replay cannot resend it. */
+/** Gate resume delivery by logical identity so one effect replay cannot resend it. */
 export function shouldSendResumePrompt(params: {
   pendingPrompt: ResumePrompt | null;
   sentPrompt: ResumePrompt | null;
@@ -5843,7 +5890,9 @@ export function shouldSendResumePrompt(params: {
   runnerOnline: boolean | undefined;
 }): boolean {
   const { pendingPrompt } = params;
-  if (pendingPrompt === null || pendingPrompt === params.sentPrompt) return false;
+  if (pendingPrompt === null || pendingPrompt.clientEventId === params.sentPrompt?.clientEventId) {
+    return false;
+  }
   if (pendingPrompt.sessionId !== params.conversationId) return false;
   if (!params.agentId || params.runnerOnline !== true) return false;
   return true;
@@ -5949,6 +5998,7 @@ export async function deliverInitialPrompt(params: {
   sleep?: (ms: number) => Promise<void>;
 }): Promise<"delivered" | "cancelled" | "failed"> {
   const delays = params.retryDelaysMs ?? INITIAL_PROMPT_RETRY_DELAYS_MS;
+  const clientEventId = params.prompt.clientEventId ?? createClientEventId();
   const sleep =
     params.sleep ??
     ((ms: number) =>
@@ -5971,7 +6021,7 @@ export async function deliverInitialPrompt(params: {
       params.sendSlashCommand,
       // Only the final attempt lets the store paint the failure: an error
       // block per attempt would stack failures the next attempt resolves.
-      { retryPending: !isFinal },
+      { retryPending: !isFinal, clientEventId },
     ).catch((): SendAttemptResult => "terminal_failure");
     if (result === "settled") return "delivered";
     if (result === "terminal_failure") return "failed";

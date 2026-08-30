@@ -117,7 +117,7 @@ function renderWithTooltips(ui: ReactElement) {
 describe("Composer session drafts", () => {
   beforeEach(() => {
     clearSessionDrafts();
-    useChatStore.setState({ conversationId: "conv_draft" });
+    useChatStore.setState({ conversationId: "conv_draft", failedSendDraft: null });
   });
 
   afterEach(() => {
@@ -164,6 +164,43 @@ describe("Composer session drafts", () => {
     expect(onSend).toHaveBeenCalledTimes(2);
     expect(onSend).toHaveBeenNthCalledWith(1, "same text", undefined);
     expect(onSend).toHaveBeenNthCalledWith(2, "same text", undefined);
+  });
+
+  it("reuses the logical submit id for an unchanged ambiguous-failure retry", async () => {
+    const onSend = vi.fn();
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "retry exactly",
+        files: [],
+        clientEventId: "logical-submit",
+      },
+    });
+    render(<Composer {...composerProps({ onSend })} />);
+
+    await waitFor(() => expect(textarea()).toHaveValue("retry exactly"));
+    fireEvent.submit(textarea().closest("form")!);
+
+    expect(onSend).toHaveBeenCalledWith("retry exactly", undefined, "logical-submit");
+  });
+
+  it("abandons the retry id when the restored message is edited", async () => {
+    const onSend = vi.fn();
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_draft",
+        text: "retry exactly",
+        files: [],
+        clientEventId: "logical-submit",
+      },
+    });
+    render(<Composer {...composerProps({ onSend })} />);
+
+    await waitFor(() => expect(textarea()).toHaveValue("retry exactly"));
+    fireEvent.change(textarea(), { target: { value: "intentional new submit" } });
+    fireEvent.submit(textarea().closest("form")!);
+
+    expect(onSend).toHaveBeenCalledWith("intentional new submit", undefined);
   });
 });
 

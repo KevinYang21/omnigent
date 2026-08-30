@@ -62,6 +62,7 @@ import {
   ApiError,
   approve as approveElicitation,
   bindOnlyOnlineRunner,
+  createClientEventId,
   createSession,
   getSessionSlim,
   fetchSessionItemsPage,
@@ -128,6 +129,8 @@ import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
+  /** Identity of this logical submit, retained through transport retries. */
+  clientEventId?: string;
   /**
    * Fires synchronously after `createSession` returns for a brand-new
    * session (before the first message is posted). Callers use this
@@ -200,6 +203,12 @@ export interface PendingUserMessage {
 export interface QueuedMessage {
   /** Client-only id, e.g. `q_1`. */
   queueId: string;
+  /** Stable identity retained until this logical submit is accepted or abandoned. */
+  clientEventId?: string;
+  /** Terminal delivery error that requires an explicit user retry. */
+  deliveryError?: string;
+  /** Prevent automatic FIFO flush until the user edits or explicitly retries. */
+  retryBlocked?: boolean;
   /** Fully-assembled message text (mentions/quotes already applied). */
   text: string;
   /** Attachments to send with the message. */
@@ -426,7 +435,12 @@ export interface ConversationState {
    * into — but the landing path binds a session first, so the reported flow
    * is covered.
    */
-  failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  failedSendDraft: {
+    conversationId: string;
+    text: string;
+    files: File[];
+    clientEventId?: string;
+  } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -667,7 +681,7 @@ export interface ChatActions {
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
-  enqueueMessage: (text: string, files?: File[]) => void;
+  enqueueMessage: (text: string, files?: File[], clientEventId?: string) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1252,6 +1266,8 @@ function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
  * the vendor CLI interprets slash commands itself.
  */
 export interface PendingInitialPrompt {
+  /** Stable identity reused by the bounded initial-prompt delivery loop. */
+  clientEventId?: string;
   /** Sanitized full text the user typed, e.g. `"/review-pr 123"`. */
   text: string;
   /** Matched bundled-skill invocation, or `null` for a plain message. */
@@ -1288,7 +1304,10 @@ export function setPendingInitialPrompt(
   prompt: PendingInitialPrompt,
 ): void {
   if (!prompt.text) return;
-  pendingInitialPrompts.set(conversationId, prompt);
+  pendingInitialPrompts.set(conversationId, {
+    ...prompt,
+    clientEventId: prompt.clientEventId ?? createClientEventId(),
+  });
 }
 
 /**
@@ -1380,7 +1399,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files) => {
+  enqueueMessage: (text, files, clientEventId = createClientEventId()) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
@@ -1390,6 +1409,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...s.queuedMessages,
         {
           queueId,
+          clientEventId,
           text,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
@@ -1445,7 +1465,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (target === undefined || agentId === null) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files);
+    void s.send(target.text, agentId, target.files, {
+      clientEventId:
+        target.retryBlocked === true
+          ? createClientEventId()
+          : (target.clientEventId ?? createClientEventId()),
+    });
   },
 
   clearQueuedMessages: (conversationId) => {
@@ -1489,10 +1514,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined) return;
+    if (head === undefined || head.retryBlocked === true) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, {
+      clientEventId: head.clientEventId ?? createClientEventId(),
+    });
   },
 
   flushBackgroundQueues: () => {
@@ -1536,7 +1563,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined) continue;
+      if (head === undefined || head.retryBlocked === true) continue;
+      const claimedHead = {
+        ...head,
+        clientEventId: head.clientEventId ?? createClientEventId(),
+      };
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
@@ -1567,28 +1598,39 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         await waitForPrior();
         // Reuse prior successful uploads so cooldown-paced retries do not
         // orphan blobs that already landed.
-        const fileBlocks = await uploadFileBlocks(conversationId, head.files ?? []);
+        const fileBlocks = await uploadFileBlocks(conversationId, claimedHead.files ?? []);
         const content: ContentBlock[] = [
           ...fileBlocks,
-          ...(head.text.trim() ? [{ type: "input_text" as const, text: head.text }] : []),
+          ...(claimedHead.text.trim()
+            ? [{ type: "input_text" as const, text: claimedHead.text }]
+            : []),
         ];
         await postEvent(conversationId, {
           type: "message",
+          client_event_id: claimedHead.clientEventId,
           data: { role: "user", content },
         });
       })()
-        .catch(() => {
+        .catch((err: unknown) => {
           backgroundFlushCooldownUntil.set(
             conversationId,
             Date.now() + BACKGROUND_FLUSH_COOLDOWN_MS,
           );
+          const retryBlocked = err instanceof ApiError && err.status !== 408 && err.status < 500;
+          const requeuedHead = retryBlocked
+            ? {
+                ...claimedHead,
+                retryBlocked: true,
+                deliveryError: err.message,
+              }
+            : claimedHead;
           setActive((st) => {
             const idx = st.queuedMessages.findIndex((m) => m.conversationId === conversationId);
             const at = idx === -1 ? st.queuedMessages.length : idx;
             return {
               queuedMessages: [
                 ...st.queuedMessages.slice(0, at),
-                head,
+                requeuedHead,
                 ...st.queuedMessages.slice(at),
               ],
             };
@@ -1607,6 +1649,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
+    const clientEventId = opts?.clientEventId ?? createClientEventId();
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
@@ -1716,6 +1759,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
       const postResult = await postEvent(sessionId, {
         type: "message",
+        client_event_id: clientEventId,
         data: {
           role: "user",
           content: serverContent,
@@ -1743,6 +1787,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           }
           return patch;
         });
+      } else if (postResult.idempotencyReplayed) {
+        // The server accepted this logical submit on an earlier HTTP attempt.
+        // No second consumed event is emitted for a durable replay, so
+        // reconcile the original committed/pending input instead of stranding
+        // this retry's optimistic bubble.
+        await reconcileReplayedSubmit(
+          sessionId,
+          tempId,
+          postResult.pendingId,
+          setterFor(sessionId),
+          () => setterForState(sessionId) ?? get(),
+        );
       } else {
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
@@ -1791,7 +1847,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         (text.trim() !== "" || (files?.length ?? 0) > 0)
       ) {
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [] },
+          failedSendDraft: {
+            conversationId: draftSessionId,
+            text,
+            files: files ?? [],
+            ...(shouldPreserveClientEventId(err) ? { clientEventId } : {}),
+          },
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
@@ -3862,6 +3923,75 @@ async function rehydrateWindowOnReconnect(
       historyGeneration: s.historyGeneration + 1,
     };
   });
+}
+
+/**
+ * Reconcile a successful durable replay with the optimistic bubble created by
+ * the retrying HTTP attempt.
+ */
+async function reconcileReplayedSubmit(
+  id: string,
+  tempId: string,
+  pendingId: string | undefined,
+  set: Setter,
+  get: Getter,
+): Promise<void> {
+  // A native receipt carries the pending-input id from the original dispatch.
+  // Keep the bubble only while that exact entry remains outstanding; otherwise
+  // the transcript forwarder has already committed it and the history backfill
+  // below is authoritative. On snapshot failure, conservatively keep/rekey the
+  // bubble so a later consumed event can still match it exactly.
+  let retainPending = pendingId !== undefined;
+  if (pendingId !== undefined) {
+    try {
+      const session = await getSessionSlim(id);
+      if (isConversationDisposed(id)) return;
+      retainPending = (session.pendingInputs ?? []).some(
+        (pending) => pending.pendingId === pendingId,
+      );
+    } catch {
+      // Keep the conservative default.
+    }
+  }
+
+  set((state) => {
+    const index = state.pendingUserMessages.findIndex((pending) => pending.tempId === tempId);
+    if (index === -1) return {};
+    if (!retainPending || pendingId === undefined) {
+      return {
+        pendingUserMessages: [
+          ...state.pendingUserMessages.slice(0, index),
+          ...state.pendingUserMessages.slice(index + 1),
+        ],
+      };
+    }
+    // A cold snapshot may already have restored this pending id. Keep one
+    // canonical bubble rather than introducing duplicate keys.
+    const alreadyPresent = state.pendingUserMessages.some(
+      (pending, at) => at !== index && pending.tempId === pendingId,
+    );
+    if (alreadyPresent) {
+      return {
+        pendingUserMessages: [
+          ...state.pendingUserMessages.slice(0, index),
+          ...state.pendingUserMessages.slice(index + 1),
+        ],
+      };
+    }
+    const replayed = state.pendingUserMessages[index]!;
+    return {
+      pendingUserMessages: [
+        ...state.pendingUserMessages.slice(0, index),
+        { ...replayed, tempId: pendingId, posted: true },
+        ...state.pendingUserMessages.slice(index + 1),
+      ],
+    };
+  });
+
+  // The original consumed event may have crossed the failed HTTP response and
+  // is not re-emitted for a receipt replay. Reuse the reconnect backfill: it
+  // merges any missing committed item and drains its FIFO optimistic entry.
+  await reconcileOnReconnect(id, set, get);
 }
 
 /**
@@ -6247,6 +6377,11 @@ function describeSendFailure(err: unknown): { message: string; code: string } {
     return { message: err.message, code: err.code ?? "" };
   }
   return { message: err instanceof Error ? err.message : String(err), code: "" };
+}
+
+function shouldPreserveClientEventId(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return true;
+  return err.status === 408 || err.status >= 500 || err.code === "wrong_replica";
 }
 
 /**

@@ -102,6 +102,120 @@ def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> Non
     assert conversation_store.get_conversation("c55a64c3f6f954fe0fc8738ba3f45f26") is None
 
 
+def test_message_event_receipt_lifecycle(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    fingerprint = "ab" * 32
+
+    claimed, pending = conversation_store.claim_message_event(
+        conv.id, "CaseSensitiveEvent", fingerprint
+    )
+    assert claimed is True
+    assert pending.status == "pending"
+    assert pending.outcome is None
+
+    claimed_again, same_pending = conversation_store.claim_message_event(
+        conv.id, "CaseSensitiveEvent", fingerprint
+    )
+    assert claimed_again is False
+    assert same_pending == pending
+
+    outcome = {"queued": True, "pending_id": "pending-1"}
+    conversation_store.complete_message_event(
+        conv.id,
+        "CaseSensitiveEvent",
+        fingerprint,
+        status="completed",
+        outcome=outcome,
+    )
+    claimed_after_completion, completed = conversation_store.claim_message_event(
+        conv.id, "CaseSensitiveEvent", fingerprint
+    )
+    assert claimed_after_completion is False
+    assert completed.status == "completed"
+    assert completed.outcome == outcome
+
+    # Opaque event ids are case-sensitive even when the server database uses a
+    # case-insensitive default collation.
+    lower_claimed, _ = conversation_store.claim_message_event(
+        conv.id, "casesensitiveevent", fingerprint
+    )
+    assert lower_claimed is True
+
+
+def test_message_event_receipt_terminal_transition_is_compare_and_set(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    fingerprint = "cd" * 32
+    conversation_store.claim_message_event(conv.id, "event", fingerprint)
+    conversation_store.complete_message_event(
+        conv.id,
+        "event",
+        fingerprint,
+        status="failed",
+        outcome=None,
+    )
+
+    with pytest.raises(RuntimeError, match="was not pending"):
+        conversation_store.complete_message_event(
+            conv.id,
+            "event",
+            fingerprint,
+            status="completed",
+            outcome={"queued": True},
+        )
+    with pytest.raises(RuntimeError, match="was not pending"):
+        conversation_store.abandon_message_event(conv.id, "event", fingerprint)
+    with pytest.raises(ValueError, match="require an outcome"):
+        conversation_store.complete_message_event(
+            conv.id,
+            "event",
+            fingerprint,
+            status="completed",
+            outcome=None,
+        )
+
+    _, receipt = conversation_store.claim_message_event(conv.id, "event", fingerprint)
+    assert receipt.status == "failed"
+    assert receipt.outcome is None
+
+
+def test_message_event_claim_is_atomic_across_store_instances(db_uri: str) -> None:
+    import threading
+
+    first_store = SqlAlchemyConversationStore(db_uri)
+    second_store = SqlAlchemyConversationStore(db_uri)
+    conv = first_store.create_conversation()
+    barrier = threading.Barrier(2)
+    results: list[tuple[bool, str]] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def claim(store: SqlAlchemyConversationStore) -> None:
+        try:
+            barrier.wait()
+            claimed, receipt = store.claim_message_event(conv.id, "event", "ef" * 32)
+            with lock:
+                results.append((claimed, receipt.status))
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [
+        threading.Thread(target=claim, args=(first_store,)),
+        threading.Thread(target=claim, args=(second_store,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert sorted(results) == [(False, "pending"), (True, "pending")]
+
+
 def test_rename_conversation_if_title_matches_is_atomic(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

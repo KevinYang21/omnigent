@@ -1519,6 +1519,11 @@ describe("deliverInitialPrompt", () => {
       (call) => (call[3] as { retryPending: boolean }).retryPending,
     );
     expect(retryFlags).toEqual([true, true, false]);
+    const clientEventIds = send.mock.calls.map(
+      (call) => (call[3] as { clientEventId: string }).clientEventId,
+    );
+    expect(new Set(clientEventIds).size).toBe(1);
+    expect(clientEventIds[0]).toEqual(expect.any(String));
   });
 
   it("never retries a terminal or ambiguously accepted failure", async () => {
@@ -1710,6 +1715,7 @@ describe("shouldSendResumePrompt", () => {
     sessionId: "conv_abc",
     text: "continue",
     files: [],
+    clientEventId: "event-first",
   };
   const ready = {
     pendingPrompt,
@@ -1722,10 +1728,11 @@ describe("shouldSendResumePrompt", () => {
   it("claims a ready prompt once", () => {
     expect(shouldSendResumePrompt(ready)).toBe(true);
     expect(shouldSendResumePrompt({ ...ready, sentPrompt: pendingPrompt })).toBe(false);
+    expect(shouldSendResumePrompt({ ...ready, sentPrompt: { ...pendingPrompt } })).toBe(false);
   });
 
   it("allows a later intentional prompt with identical content", () => {
-    const laterPrompt = { ...pendingPrompt };
+    const laterPrompt = { ...pendingPrompt, clientEventId: "event-later" };
     expect(
       shouldSendResumePrompt({
         ...ready,

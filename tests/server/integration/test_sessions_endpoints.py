@@ -25,8 +25,10 @@ import httpx
 import pytest
 
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
+from omnigent.server import message_idempotency
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
     _NativeTerminalEnsureOutcome,
@@ -290,6 +292,258 @@ async def test_background_title_failure_does_not_break_subsequent_user_turn(
         await fake_runner.aclose()
 
     assert len(forwarded_requests) == 2
+
+
+async def test_message_client_event_id_deduplicates_replayed_submit(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replays share an outcome; distinct ids preserve intentional repeats."""
+    forwarded_requests: list[httpx.Request] = []
+
+    def forward_to_runner(request: httpx.Request) -> httpx.Response:
+        forwarded_requests.append(request)
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(forward_to_runner),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    def event(client_event_id: str) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "client_event_id": client_event_id,
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "same request"}],
+            },
+        }
+
+    try:
+        first = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=event("submit-one"),
+        )
+        message_idempotency.reset_for_tests()
+        reordered_replay = {
+            "client_event_id": "submit-one",
+            "data": {
+                "content": [{"text": "same request", "type": "input_text"}],
+                "role": "user",
+            },
+            "type": "message",
+        }
+        replay = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=reordered_replay,
+        )
+        conflicting_reuse = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                **event("submit-one"),
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "different request"}],
+                },
+            },
+        )
+        intentional_repeat = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=event("submit-two"),
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert first.status_code == 202, first.text
+    assert replay.status_code == 202, replay.text
+    assert "idempotency_replayed" not in first.json()
+    assert replay.json() == {**first.json(), "idempotency_replayed": True}
+    assert conflicting_reuse.status_code == 409, conflicting_reuse.text
+    assert intentional_repeat.status_code == 202, intentional_repeat.text
+    assert intentional_repeat.json()["item_id"] != first.json()["item_id"]
+    event_requests = [
+        request for request in forwarded_requests if request.url.path.endswith("/events")
+    ]
+    assert len(event_requests) == 2
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    user_items = [
+        item for item in items if item["type"] == "message" and item["role"] == "user"
+    ]
+    assert [item["content"][0]["text"] for item in user_items] == [
+        "same request",
+        "same request",
+    ]
+
+
+async def test_message_client_event_id_terminal_4xx_is_not_dispatched_on_retry(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected logical submit stays failed instead of running again."""
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202)),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    dispatches = 0
+
+    async def reject_dispatch(*_args: object, **_kwargs: object) -> object:
+        nonlocal dispatches
+        dispatches += 1
+        raise OmnigentError("invalid message", code=ErrorCode.INVALID_INPUT)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._dispatch_session_event_to_runner",
+        reject_dispatch,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    event = {
+        "type": "message",
+        "client_event_id": "terminal-failure",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "rejected once"}],
+        },
+    }
+
+    try:
+        first = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+        message_idempotency.reset_for_tests()
+        replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+    finally:
+        await fake_runner.aclose()
+
+    assert first.status_code == 400, first.text
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["error"]["code"] == ErrorCode.CONFLICT
+    assert dispatches == 1
+
+
+async def test_native_message_replay_injects_once_and_keeps_one_pending_input(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude-native replays share the original pending id and runner inject."""
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    forwarded_requests: list[httpx.Request] = []
+
+    def forward_to_runner(request: httpx.Request) -> httpx.Response:
+        forwarded_requests.append(request)
+        if request.url.path.endswith("/resources/terminals"):
+            return httpx.Response(200, json={"resource": "view"})
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(forward_to_runner),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    event = {
+        "type": "message",
+        "client_event_id": "native-logical-submit",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "send to claude once"}],
+        },
+    }
+
+    try:
+        first = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+        replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+
+        assert first.status_code == 202, first.text
+        assert replay.status_code == 202, replay.text
+        assert replay.json() == {**first.json(), "idempotency_replayed": True}
+        assert first.json().get("pending_id")
+        event_requests = [
+            request for request in forwarded_requests if request.url.path.endswith("/events")
+        ]
+        assert len(event_requests) == 1
+        pending = pending_inputs.snapshot_for(session["id"])
+        assert len(pending) == 1
+        assert pending[0]["pending_id"] == first.json()["pending_id"]
+    finally:
+        await fake_runner.aclose()
+        pending_inputs.reset_for_tests()
+
+
+async def test_native_offline_message_replay_persists_one_failure_turn(
+    client: httpx.AsyncClient,
+) -> None:
+    """Idempotency also covers the early native runner-offline fallback."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    event = {
+        "type": "message",
+        "client_event_id": "offline-native-logical-submit",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "persist this failure once"}],
+        },
+    }
+
+    first = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+    replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
+
+    assert first.status_code == 202, first.text
+    assert replay.status_code == 202, replay.text
+    assert replay.json() == {**first.json(), "idempotency_replayed": True}
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    user_items = [
+        item for item in items if item["type"] == "message" and item["role"] == "user"
+    ]
+    error_items = [item for item in items if item["type"] == "error"]
+    assert [item["content"][0]["text"] for item in user_items] == [
+        "persist this failure once"
+    ]
+    assert len(error_items) == 1
 
 
 async def test_initial_item_schedules_background_semantic_title(

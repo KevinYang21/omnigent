@@ -849,6 +849,7 @@ Content-Type: application/json
 
 {
   "type": "message",
+  "client_event_id": "fd8f77ef-258f-41d7-bd88-4fd6325b8e33",
   "data": {
     "role": "user",
     "content": [{"type": "input_text", "text": "What about hotels?"}]
@@ -974,13 +975,23 @@ Request body matches `SessionEventInput`:
     against the item-type's Pydantic data class for non-interrupt
     types (400 on schema mismatch).
 
+  client_event_id (string, optional)
+    Identity of one logical `"message"` submit. Reusing the same id and
+    payload for the lifetime of the session does not forward or persist the
+    message again; completed attempts return their original outcome. Two
+    intentional submits, including identical text, must use different ids.
+    Older clients may omit this field; their behavior is unchanged.
+
 202 Accepted
 {"queued": true}                            # regular queued item events
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
+{"queued": true, ..., "idempotency_replayed": true} # prior durable outcome replay
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
+409 Conflict — an id was reused for different content, a prior attempt failed,
+               or delivery remains uncertain after its owning server stopped
 404 Not Found — no session with that id
 422 Unprocessable Entity — request body fails Pydantic validation
 ```

@@ -9,7 +9,14 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { ArrowUpIcon, ClockIcon, GripVerticalIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  ArrowUpIcon,
+  CircleAlertIcon,
+  ClockIcon,
+  GripVerticalIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react";
 
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
@@ -89,6 +96,19 @@ function QueuedRow({
       ) : (
         <ClockIcon className="size-3.5 shrink-0" aria-hidden="true" />
       )}
+      {message.retryBlocked === true ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <CircleAlertIcon
+              aria-label="Queued message needs attention"
+              className="size-3.5 shrink-0 text-destructive"
+            />
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {message.deliveryError ?? "Delivery failed. Edit or send again to retry."}
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
       <span className="min-w-0 flex-1 truncate">{message.text}</span>
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
