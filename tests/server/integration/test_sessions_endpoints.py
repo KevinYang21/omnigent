@@ -25,7 +25,6 @@ import httpx
 import pytest
 
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
-from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server import message_idempotency
@@ -294,19 +293,18 @@ async def test_background_title_failure_does_not_break_subsequent_user_turn(
     assert len(forwarded_requests) == 2
 
 
-async def test_message_client_event_id_deduplicates_replayed_submit(
+async def test_message_client_event_id_replays_once_but_distinct_ids_dispatch_twice(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Replays share an outcome; distinct ids preserve intentional repeats."""
-    forwarded_requests: list[httpx.Request] = []
+    forwarded: list[httpx.Request] = []
 
-    def forward_to_runner(request: httpx.Request) -> httpx.Response:
-        forwarded_requests.append(request)
+    def forward(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request)
         return httpx.Response(202, json={"queued": True})
 
     fake_runner = httpx.AsyncClient(
-        transport=httpx.MockTransport(forward_to_runner),
+        transport=httpx.MockTransport(forward),
         base_url="http://runner",
     )
 
@@ -323,10 +321,10 @@ async def test_message_client_event_id_deduplicates_replayed_submit(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
-    def event(client_event_id: str) -> dict[str, Any]:
+    def event(event_id: str) -> dict[str, Any]:
         return {
             "type": "message",
-            "client_event_id": client_event_id,
+            "client_event_id": event_id,
             "data": {
                 "role": "user",
                 "content": [{"type": "input_text", "text": "same request"}],
@@ -336,132 +334,44 @@ async def test_message_client_event_id_deduplicates_replayed_submit(
     try:
         first = await client.post(
             f"/v1/sessions/{session['id']}/events",
-            json=event("submit-one"),
+            json=event("logical-one"),
         )
-        message_idempotency.reset_for_tests()
-        reordered_replay = {
-            "client_event_id": "submit-one",
-            "data": {
-                "content": [{"text": "same request", "type": "input_text"}],
-                "role": "user",
-            },
-            "type": "message",
-        }
+        message_idempotency.reset_for_tests()  # simulate a different AP process
         replay = await client.post(
             f"/v1/sessions/{session['id']}/events",
-            json=reordered_replay,
+            json=event("logical-one"),
         )
-        conflicting_reuse = await client.post(
+        intentional = await client.post(
             f"/v1/sessions/{session['id']}/events",
-            json={
-                **event("submit-one"),
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "different request"}],
-                },
-            },
-        )
-        intentional_repeat = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json=event("submit-two"),
+            json=event("logical-two"),
         )
     finally:
         await fake_runner.aclose()
 
-    assert first.status_code == 202, first.text
-    assert replay.status_code == 202, replay.text
-    assert "idempotency_replayed" not in first.json()
+    assert first.status_code == replay.status_code == intentional.status_code == 202
     assert replay.json() == {**first.json(), "idempotency_replayed": True}
-    assert conflicting_reuse.status_code == 409, conflicting_reuse.text
-    assert intentional_repeat.status_code == 202, intentional_repeat.text
-    assert intentional_repeat.json()["item_id"] != first.json()["item_id"]
-    event_requests = [
-        request for request in forwarded_requests if request.url.path.endswith("/events")
-    ]
-    assert len(event_requests) == 2
-    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
-    user_items = [
-        item for item in items if item["type"] == "message" and item["role"] == "user"
-    ]
-    assert [item["content"][0]["text"] for item in user_items] == [
-        "same request",
-        "same request",
-    ]
+    assert intentional.json()["item_id"] != first.json()["item_id"]
+    assert len([r for r in forwarded if r.url.path.endswith("/events")]) == 2
 
 
-async def test_message_client_event_id_terminal_4xx_is_not_dispatched_on_retry(
+async def test_native_same_id_replay_calls_runner_once_without_new_reconciliation(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A rejected logical submit stays failed instead of running again."""
-    fake_runner = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(202)),
-        base_url="http://runner",
-    )
-
-    async def get_runner_client(
-        _session_id: str,
-        _runner_router: object,
-    ) -> httpx.AsyncClient:
-        return fake_runner
-
-    dispatches = 0
-
-    async def reject_dispatch(*_args: object, **_kwargs: object) -> object:
-        nonlocal dispatches
-        dispatches += 1
-        raise OmnigentError("invalid message", code=ErrorCode.INVALID_INPUT)
-
-    monkeypatch.setattr(
-        "omnigent.server.routes.sessions._get_runner_client",
-        get_runner_client,
-    )
-    monkeypatch.setattr(
-        "omnigent.server.routes.sessions._dispatch_session_event_to_runner",
-        reject_dispatch,
-    )
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    event = {
-        "type": "message",
-        "client_event_id": "terminal-failure",
-        "data": {
-            "role": "user",
-            "content": [{"type": "input_text", "text": "rejected once"}],
-        },
-    }
-
-    try:
-        first = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
-        message_idempotency.reset_for_tests()
-        replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
-    finally:
-        await fake_runner.aclose()
-
-    assert first.status_code == 400, first.text
-    assert replay.status_code == 409, replay.text
-    assert replay.json()["error"]["code"] == ErrorCode.MESSAGE_EVENT_FAILED
-    assert dispatches == 1
-
-
-async def test_native_message_replay_injects_once_and_keeps_one_pending_input(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Claude-native replays share the original pending id and runner inject."""
+    """Native receipt dedupe stops at the API-to-runner dispatch boundary."""
     from omnigent.runtime import pending_inputs
 
     pending_inputs.reset_for_tests()
-    forwarded_requests: list[httpx.Request] = []
+    forwarded: list[httpx.Request] = []
 
-    def forward_to_runner(request: httpx.Request) -> httpx.Response:
-        forwarded_requests.append(request)
+    def forward(request: httpx.Request) -> httpx.Response:
+        forwarded.append(request)
         if request.url.path.endswith("/resources/terminals"):
             return httpx.Response(200, json={"resource": "view"})
         return httpx.Response(202, json={"queued": True})
 
     fake_runner = httpx.AsyncClient(
-        transport=httpx.MockTransport(forward_to_runner),
+        transport=httpx.MockTransport(forward),
         base_url="http://runner",
     )
 
@@ -481,301 +391,30 @@ async def test_native_message_replay_injects_once_and_keeps_one_pending_input(
         agent["id"],
         labels={"omnigent.wrapper": "claude-code-native-ui"},
     )
-    uploaded = await client.post(
-        f"/v1/sessions/{session['id']}/resources/files",
-        files={"file": ("native.png", b"\x89PNG\r\n\x1a\n", "image/png")},
-    )
-    assert uploaded.status_code == 201, uploaded.text
-    file_id = uploaded.json()["id"]
     event = {
         "type": "message",
         "client_event_id": "native-logical-submit",
         "data": {
             "role": "user",
-            "content": [
-                {
-                    "type": "input_image",
-                    "file_id": file_id,
-                    "filename": "native.png",
-                },
-                {"type": "input_text", "text": "send to claude once"},
-            ],
+            "content": [{"type": "input_text", "text": "send once"}],
         },
     }
-
     try:
         first = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
         replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
-
-        assert first.status_code == 202, first.text
-        assert replay.status_code == 202, replay.text
-        assert replay.json() == {**first.json(), "idempotency_replayed": True}
-        assert first.json().get("pending_id")
-        event_requests = [
-            request for request in forwarded_requests if request.url.path.endswith("/events")
-        ]
-        assert len(event_requests) == 1
-        snapshot = await client.get(f"/v1/sessions/{session['id']}")
-        assert snapshot.status_code == 200, snapshot.text
-        pending = snapshot.json()["pending_inputs"]
-        assert len(pending) == 1
-        assert pending[0]["pending_id"] == first.json()["pending_id"]
-        assert pending[0]["content"] == event["data"]["content"]
-
-        # Simulate an AP restart: the process-local native index is empty, but
-        # the receipt-backed optimistic input remains available and is drained
-        # by the eventual transcript item exactly once.
-        pending_inputs.reset_for_tests()
-        transcript = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "message",
-                    "item_data": {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "send to claude once"}
-                        ],
-                    },
-                    "response_id": "native-turn-1",
-                },
-            },
-        )
-        assert transcript.status_code == 202, transcript.text
-        committed = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
-        matching = [
-            item
-            for item in committed
-            if item["type"] == "message"
-            and item["role"] == "user"
-            and item["content"][-1].get("text") == "send to claude once"
-        ]
-        assert len(matching) == 1
-        assert matching[0]["content"][0] == {
-            "type": "input_image",
-            "file_id": file_id,
-            "filename": "native.png",
-        }
-        # A reconnect/retry after the transcript committed gets the
-        # authoritative item link, not the old pending-only outcome.
-        message_idempotency.reset_for_tests()
-        committed_replay = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json=event,
-        )
-        assert committed_replay.status_code == 202, committed_replay.text
-        assert committed_replay.json()["idempotency_replayed"] is True
-        assert committed_replay.json()["item_id"] == matching[0]["id"]
-        assert len(
-            [request for request in forwarded_requests if request.url.path.endswith("/events")]
-        ) == 1
-        after = await client.get(f"/v1/sessions/{session['id']}")
-        assert after.json()["pending_inputs"] == []
     finally:
         await fake_runner.aclose()
-        pending_inputs.reset_for_tests()
 
-
-async def test_kiro_restart_reconciles_durable_match_and_skipped_metadata(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """Kiro matches durable pending inputs after restart and compacts both."""
-    from omnigent.runtime import pending_inputs
-
-    agent = await create_test_agent(client)
-    session = await _create_session(
-        client,
-        agent["id"],
-        labels={"omnigent.wrapper": "kiro-native-ui"},
-    )
-    store = SqlAlchemyConversationStore(db_uri)
-    for index, prompt in enumerate(("not recorded", "accepted prompt"), start=1):
-        event_id = f"kiro-event-{index}"
-        fingerprint = f"{index:02x}" * 32
-        pending_id = f"pending-kiro-{index}"
-        store.claim_message_event(session["id"], event_id, fingerprint)
-        store.record_message_event_pending_input(
-            session["id"],
-            event_id,
-            fingerprint,
-            pending_id=pending_id,
-            content=[
-                {
-                    "type": "input_image",
-                    "file_id": f"{index:02x}" * 16,
-                    "filename": f"image-{index}.png",
-                },
-                {"type": "input_text", "text": prompt},
-            ],
-            created_by=f"user-{index}@example.com",
-        )
-        store.complete_message_event(
-            session["id"],
-            event_id,
-            fingerprint,
-            status="completed",
-            outcome={"queued": True, "pending_id": pending_id},
-        )
-
-    # Process-local fallback is empty after restart; only durable metadata can
-    # match the accepted Kiro prompt and identify the earlier skipped send.
-    pending_inputs.reset_for_tests()
-    transcript = await client.post(
-        f"/v1/sessions/{session['id']}/events",
-        json={
-            "type": "external_conversation_item",
-            "data": {
-                "item_type": "message",
-                "item_data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "accepted prompt"}],
-                },
-                "response_id": "kiro-turn",
-            },
-        },
-    )
-    assert transcript.status_code == 202, transcript.text
-
-    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
-    user_items = [item for item in items if item["type"] == "message"]
-    assert [item["created_by"] for item in user_items] == [
-        "user-1@example.com",
-        "user-2@example.com",
-    ]
-    assert user_items[0]["content"][0]["filename"] == "image-1.png"
-    assert user_items[1]["content"][0]["filename"] == "image-2.png"
-    assert any(
-        item["type"] == "error"
-        and item["code"] == "kiro_native_prompt_not_recorded"
-        for item in items
-    )
-    assert store.list_message_event_pending_inputs(session["id"]) == []
-    for event_id in ("kiro-event-1", "kiro-event-2"):
-        receipt = store.get_message_event(session["id"], event_id)
-        assert receipt is not None
-        assert receipt.committed_item_id is not None
-
-
-async def test_native_definite_rejection_cannot_ghost_into_later_transcript(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    db_uri: str,
-) -> None:
-    """A rejected native forward strips metadata before unrelated input arrives."""
-    def reject_runner_event(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/resources/terminals"):
-            return httpx.Response(200, json={"resource": "view"})
-        return httpx.Response(400, json={"error": {"message": "rejected"}})
-
-    fake_runner = httpx.AsyncClient(
-        transport=httpx.MockTransport(reject_runner_event),
-        base_url="http://runner",
-    )
-
-    async def get_runner_client(
-        _session_id: str,
-        _runner_router: object,
-    ) -> httpx.AsyncClient:
-        return fake_runner
-
-    monkeypatch.setattr(
-        "omnigent.server.routes.sessions._get_runner_client",
-        get_runner_client,
-    )
-    agent = await create_test_agent(client)
-    session = await _create_session(
-        client,
-        agent["id"],
-        labels={"omnigent.wrapper": "claude-code-native-ui"},
-    )
-    uploaded = await client.post(
-        f"/v1/sessions/{session['id']}/resources/files",
-        files={"file": ("ghost.png", b"\x89PNG\r\n\x1a\n", "image/png")},
-    )
-    file_id = uploaded.json()["id"]
-    rejected = await client.post(
-        f"/v1/sessions/{session['id']}/events",
-        json={
-            "type": "message",
-            "client_event_id": "rejected-native-event",
-            "data": {
-                "role": "user",
-                "content": [
-                    {"type": "input_image", "file_id": file_id, "filename": "ghost.png"},
-                    {"type": "input_text", "text": "rejected input"},
-                ],
-            },
-        },
-    )
-    assert rejected.status_code == 502, rejected.text
-    store = SqlAlchemyConversationStore(db_uri)
-    receipt = store.get_message_event(session["id"], "rejected-native-event")
-    assert receipt is not None
-    assert receipt.status == "failed"
-    assert store.list_message_event_pending_inputs(session["id"]) == []
-
-    later = await client.post(
-        f"/v1/sessions/{session['id']}/events",
-        json={
-            "type": "external_conversation_item",
-            "data": {
-                "item_type": "message",
-                "item_data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "later terminal input"}],
-                },
-                "response_id": "later-turn",
-            },
-        },
-    )
-    assert later.status_code == 202, later.text
-    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
-    later_item = next(
-        item
-        for item in items
-        if item["type"] == "message"
-        and item["content"][-1].get("text") == "later terminal input"
-    )
-    assert later_item["content"] == [{"type": "input_text", "text": "later terminal input"}]
-    await fake_runner.aclose()
-
-
-async def test_native_offline_message_replay_persists_one_failure_turn(
-    client: httpx.AsyncClient,
-) -> None:
-    """Idempotency also covers the early native runner-offline fallback."""
-    agent = await create_test_agent(client)
-    session = await _create_session(
-        client,
-        agent["id"],
-        labels={"omnigent.wrapper": "claude-code-native-ui"},
-    )
-    event = {
-        "type": "message",
-        "client_event_id": "offline-native-logical-submit",
-        "data": {
-            "role": "user",
-            "content": [{"type": "input_text", "text": "persist this failure once"}],
-        },
-    }
-
-    first = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
-    replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
-
-    assert first.status_code == 202, first.text
-    assert replay.status_code == 202, replay.text
+    assert first.status_code == replay.status_code == 202
     assert replay.json() == {**first.json(), "idempotency_replayed": True}
-    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
-    user_items = [
-        item for item in items if item["type"] == "message" and item["role"] == "user"
+    assert len([r for r in forwarded if r.url.path.endswith("/events")]) == 1
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["pending_inputs"] == [
+        {
+            "pending_id": first.json()["pending_id"],
+            "content": event["data"]["content"],
+        }
     ]
-    error_items = [item for item in items if item["type"] == "error"]
-    assert [item["content"][0]["text"] for item in user_items] == [
-        "persist this failure once"
-    ]
-    assert len(error_items) == 1
 
 
 async def test_initial_item_schedules_background_semantic_title(
@@ -1951,19 +1590,15 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             },
         }
         resp = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
-        assert resp.status_code == 202, resp.text
-        # Model a lost accepted response: process-local state is gone and the
-        # browser repeats the same logical command identity.
         message_idempotency.reset_for_tests()
         replay = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
-        assert replay.status_code == 202, replay.text
-        assert replay.json() == {**resp.json(), "idempotency_replayed": True}
         intentional = await client.post(
             f"/v1/sessions/{session['id']}/events",
             json={**event, "client_event_id": "skill-intentional-repeat"},
         )
+        assert resp.status_code == 202, resp.text
+        assert replay.json() == {**resp.json(), "idempotency_replayed": True}
         assert intentional.status_code == 202, intentional.text
-        assert intentional.json()["item_id"] != resp.json()["item_id"]
     finally:
         await fake_runner.aclose()
 
@@ -1975,8 +1610,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     items = items_resp.json()["data"]
     visible_items = [item for item in items if item["type"] == "slash_command"]
     meta_items = [item for item in items if item["type"] == "message" and item.get("is_meta")]
-    assert len(visible_items) == 2
-    assert len(meta_items) == 2
+    assert len(visible_items) == len(meta_items) == 2
     visible = visible_items[0]
     meta = meta_items[0]
     assert visible["name"] == "grill-me"

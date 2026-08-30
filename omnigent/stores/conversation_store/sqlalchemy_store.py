@@ -94,27 +94,11 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     MessageEventReceipt,
-    PendingMessageInput,
-    PendingMessageInputMatch,
     SessionConnectivity,
     pinned_label_key,
 )
 
 _logger = logging.getLogger(__name__)
-
-_PENDING_MESSAGE_METADATA_TTL_SECONDS = 24 * 60 * 60
-
-
-def _pending_content_text(content: list[dict[str, Any]]) -> str:
-    return "\n".join(
-        str(block.get("text", ""))
-        for block in content
-        if block.get("type") == "input_text" and block.get("text")
-    )
-
-
-def _normalize_pending_text(value: str) -> str:
-    return " ".join(value.split())
 
 # Server-side deadline (ms) for the content-search query in
 # ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
@@ -2153,21 +2137,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             outcome=None,
             owner_id=owner_id,
             lease_expires_at=lease_expires_at,
-            pending_id=None,
-            pending_payload=None,
-            pending_created_by=None,
-            pending_sequence=None,
-            pending_metadata_expires_at=None,
-            committed_item_id=None,
             created_at=now,
             updated_at=now,
         )
         with self._conv_session("claim_message_event") as session:
-            self._compact_expired_pending_metadata(
-                session,
-                before=now,
-                conversation_id=conversation_id,
-            )
             session.add(row)
             try:
                 session.flush()
@@ -2235,17 +2208,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(
                     status=status,
                     outcome=encoded_outcome,
-                    **(
-                        {
-                            "pending_id": None,
-                            "pending_payload": None,
-                            "pending_created_by": None,
-                            "pending_sequence": None,
-                            "pending_metadata_expires_at": None,
-                        }
-                        if status == "failed"
-                        else {}
-                    ),
                     updated_at=now_epoch(),
                 )
             )
@@ -2276,247 +2238,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     "message receipt was not pending when its claim was released"
                 )
 
-    def record_message_event_pending_input(
-        self,
-        conversation_id: str,
-        client_event_id: str,
-        fingerprint: str,
-        *,
-        pending_id: str,
-        content: list[dict[str, Any]],
-        created_by: str | None,
-    ) -> None:
-        """Persist native input metadata before the runner receives it."""
-        encoded = json.dumps(content, separators=(",", ":"), sort_keys=True)
-        with self._conv_session("record_message_event_pending_input") as session:
-            workspace_id = current_workspace_id()
-            allocated = session.execute(
-                update(SqlConversation)
-                .where(
-                    SqlConversation.workspace_id == workspace_id,
-                    SqlConversation.id == conversation_id,
-                )
-                .values(
-                    next_message_event_sequence=(
-                        func.coalesce(SqlConversation.next_message_event_sequence, 0) + 1
-                    )
-                )
-            )
-            if allocated.rowcount != 1:
-                raise RuntimeError("conversation disappeared while allocating pending sequence")
-            sequence = session.execute(
-                select(SqlConversation.next_message_event_sequence).where(
-                    SqlConversation.workspace_id == workspace_id,
-                    SqlConversation.id == conversation_id,
-                )
-            ).scalar_one()
-            now = now_epoch()
-            result = session.execute(
-                update(SqlMessageEventReceipt)
-                .where(
-                    SqlMessageEventReceipt.workspace_id == workspace_id,
-                    SqlMessageEventReceipt.conversation_id == conversation_id,
-                    SqlMessageEventReceipt.client_event_id == client_event_id,
-                    SqlMessageEventReceipt.fingerprint == bytes.fromhex(fingerprint),
-                    SqlMessageEventReceipt.status == "pending",
-                    SqlMessageEventReceipt.pending_id.is_(None),
-                )
-                .values(
-                    pending_id=pending_id,
-                    pending_payload=encoded,
-                    pending_created_by=created_by,
-                    pending_sequence=sequence,
-                    pending_metadata_expires_at=now + _PENDING_MESSAGE_METADATA_TTL_SECONDS,
-                    updated_at=now,
-                )
-            )
-            if result.rowcount != 1:
-                raise RuntimeError("message receipt could not record its native pending input")
-
-    def list_message_event_pending_inputs(
-        self,
-        conversation_id: str,
-    ) -> list[PendingMessageInput]:
-        """List durable native inputs still awaiting transcript arrival."""
-        with self._conv_session("list_message_event_pending_inputs") as session:
-            now = now_epoch()
-            self._compact_expired_pending_metadata(
-                session,
-                before=now,
-                conversation_id=conversation_id,
-            )
-            rows = session.execute(
-                select(SqlMessageEventReceipt)
-                .where(
-                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
-                    SqlMessageEventReceipt.conversation_id == conversation_id,
-                    SqlMessageEventReceipt.status == "completed",
-                    SqlMessageEventReceipt.pending_id.is_not(None),
-                    SqlMessageEventReceipt.pending_metadata_expires_at > now,
-                )
-                .order_by(SqlMessageEventReceipt.pending_sequence)
-            ).scalars()
-            return [self._pending_message_input(row) for row in rows]
-
-    def resolve_oldest_message_event_pending_input(
-        self,
-        conversation_id: str,
-    ) -> PendingMessageInput | None:
-        """Atomically drain the oldest durable native pending input."""
-        with self._conv_session("resolve_oldest_message_event_pending_input") as session:
-            now = now_epoch()
-            self._compact_expired_pending_metadata(
-                session,
-                before=now,
-                conversation_id=conversation_id,
-            )
-            row = session.execute(
-                select(SqlMessageEventReceipt)
-                .where(
-                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
-                    SqlMessageEventReceipt.conversation_id == conversation_id,
-                    SqlMessageEventReceipt.status == "completed",
-                    SqlMessageEventReceipt.pending_id.is_not(None),
-                    SqlMessageEventReceipt.pending_metadata_expires_at > now,
-                )
-                .order_by(SqlMessageEventReceipt.pending_sequence)
-                .limit(1)
-                .with_for_update()
-            ).scalar_one_or_none()
-            if row is None:
-                return None
-            pending = self._pending_message_input(row)
-            row.pending_id = None
-            row.pending_payload = None
-            row.pending_created_by = None
-            row.pending_sequence = None
-            row.pending_metadata_expires_at = None
-            row.updated_at = now_epoch()
-            session.flush()
-            return pending
-
-    def resolve_message_event_pending_input_matching_text(
-        self,
-        conversation_id: str,
-        text: str,
-    ) -> PendingMessageInputMatch:
-        """Atomically drain a Kiro text match and earlier skipped inputs."""
-        needle = _normalize_pending_text(text)
-        if not needle:
-            return PendingMessageInputMatch(matched=None, skipped=[])
-        with self._conv_session(
-            "resolve_message_event_pending_input_matching_text"
-        ) as session:
-            now = now_epoch()
-            self._compact_expired_pending_metadata(
-                session,
-                before=now,
-                conversation_id=conversation_id,
-            )
-            rows = list(
-                session.execute(
-                    select(SqlMessageEventReceipt)
-                    .where(
-                        SqlMessageEventReceipt.workspace_id == current_workspace_id(),
-                        SqlMessageEventReceipt.conversation_id == conversation_id,
-                        SqlMessageEventReceipt.status == "completed",
-                        SqlMessageEventReceipt.pending_id.is_not(None),
-                        SqlMessageEventReceipt.pending_metadata_expires_at > now,
-                    )
-                    .order_by(SqlMessageEventReceipt.pending_sequence)
-                    .with_for_update()
-                ).scalars()
-            )
-            match_index = next(
-                (
-                    index
-                    for index, row in enumerate(rows)
-                    if _normalize_pending_text(
-                        _pending_content_text(self._pending_message_input(row).content)
-                    )
-                    == needle
-                ),
-                None,
-            )
-            if match_index is None:
-                return PendingMessageInputMatch(matched=None, skipped=[])
-            drained = [self._pending_message_input(row) for row in rows[: match_index + 1]]
-            consumed_ids = [row.client_event_id for row in rows[: match_index + 1]]
-            session.execute(
-                update(SqlMessageEventReceipt)
-                .where(
-                    SqlMessageEventReceipt.workspace_id == current_workspace_id(),
-                    SqlMessageEventReceipt.conversation_id == conversation_id,
-                    SqlMessageEventReceipt.client_event_id.in_(consumed_ids),
-                    SqlMessageEventReceipt.status == "completed",
-                )
-                .values(
-                    pending_id=None,
-                    pending_payload=None,
-                    pending_created_by=None,
-                    pending_sequence=None,
-                    pending_metadata_expires_at=None,
-                    updated_at=now,
-                )
-            )
-            return PendingMessageInputMatch(matched=drained[-1], skipped=drained[:-1])
-
-    def mark_message_event_committed(
-        self,
-        conversation_id: str,
-        client_event_id: str,
-        item_id: str,
-    ) -> None:
-        """Link a reconciled native receipt to the committed transcript item."""
-        with self._conv_session("mark_message_event_committed") as session:
-            row = session.get(
-                SqlMessageEventReceipt,
-                (current_workspace_id(), conversation_id, client_event_id),
-                with_for_update=True,
-            )
-            if row is None or row.status != "completed" or row.outcome is None:
-                raise RuntimeError("completed message receipt was not found for reconciliation")
-            outcome = json.loads(row.outcome)
-            if not isinstance(outcome, dict):
-                raise ValueError("message receipt outcome must be an object")
-            outcome["item_id"] = item_id
-            row.outcome = json.dumps(outcome, separators=(",", ":"), sort_keys=True)
-            row.committed_item_id = item_id
-            row.updated_at = now_epoch()
-
-    def compact_expired_message_event_pending_inputs(self, *, before: int) -> int:
-        """Strip expired sensitive metadata while retaining receipt tombstones."""
-        with self._conv_session("compact_expired_message_event_pending_inputs") as session:
-            return self._compact_expired_pending_metadata(session, before=before)
-
-    @staticmethod
-    def _compact_expired_pending_metadata(
-        session: Session,
-        *,
-        before: int,
-        conversation_id: str | None = None,
-    ) -> int:
-        filters: list[ColumnElement[bool]] = [
-            SqlMessageEventReceipt.workspace_id == current_workspace_id(),
-            SqlMessageEventReceipt.pending_id.is_not(None),
-            SqlMessageEventReceipt.pending_metadata_expires_at <= before,
-        ]
-        if conversation_id is not None:
-            filters.append(SqlMessageEventReceipt.conversation_id == conversation_id)
-        result = session.execute(
-            update(SqlMessageEventReceipt)
-            .where(*filters)
-            .values(
-                pending_id=None,
-                pending_payload=None,
-                pending_created_by=None,
-                pending_sequence=None,
-                pending_metadata_expires_at=None,
-                updated_at=now_epoch(),
-            )
-        )
-        return int(result.rowcount or 0)
-
     @staticmethod
     def _message_event_receipt(row: SqlMessageEventReceipt) -> MessageEventReceipt:
         outcome: dict[str, bool | str] | None = None
@@ -2531,26 +2252,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             outcome=outcome,
             owner_id=row.owner_id or "legacy",
             lease_expires_at=row.lease_expires_at or 0,
-            committed_item_id=row.committed_item_id,
-        )
-
-    @staticmethod
-    def _pending_message_input(row: SqlMessageEventReceipt) -> PendingMessageInput:
-        if (
-            row.pending_id is None
-            or row.pending_payload is None
-            or row.pending_sequence is None
-        ):
-            raise ValueError("message receipt pending input is incomplete")
-        decoded = json.loads(row.pending_payload)
-        if not isinstance(decoded, list) or not all(isinstance(block, dict) for block in decoded):
-            raise ValueError("message receipt pending payload must be a list of objects")
-        return PendingMessageInput(
-            client_event_id=row.client_event_id,
-            pending_id=row.pending_id,
-            sequence=row.pending_sequence,
-            content=decoded,
-            created_by=row.pending_created_by,
         )
 
     def list_projects(

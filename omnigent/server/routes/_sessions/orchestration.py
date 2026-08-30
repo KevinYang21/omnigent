@@ -93,7 +93,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import message_idempotency, session_live_state, shutdown_state
+from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -971,7 +971,6 @@ def _build_session_response(
     host_online: bool | None = None,
     host_resumable: bool = False,
     pending_elicitation_events: list[dict[str, Any]] | None = None,
-    pending_input_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
     viewer_id: str | None = None,
@@ -1132,11 +1131,7 @@ def _build_session_response(
         # so a client that posted then navigated away / rebound re-
         # hydrates the optimistic bubble. Empty for non-native sessions
         # (their message is already persisted into ``items``).
-        pending_inputs=(
-            pending_input_events
-            if pending_input_events is not None
-            else pending_inputs.snapshot_for(conv.id)
-        ),
+        pending_inputs=pending_inputs.snapshot_for(conv.id),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -2214,8 +2209,7 @@ async def _persist_external_conversation_item(
     # Claude (not a queued web message) and has no pending entry, so
     # draining for it would hand the queued message's uploads to the marker.
     cleared_pending_id: str | None = None
-    skipped_kiro_pending: list[Any] = []
-    durable_pending = False
+    skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -2225,34 +2219,11 @@ async def _persist_external_conversation_item(
     ):
         if _is_kiro_native_session(conv):
             text = _message_text(item.data.content) or ""
-            durable_resolver = getattr(
-                conversation_store,
-                "resolve_message_event_pending_input_matching_text",
-                None,
-            )
-            durable_match = (
-                await asyncio.to_thread(durable_resolver, session_id, text)
-                if durable_resolver is not None
-                else None
-            )
-            if durable_match is not None and (
-                durable_match.matched is not None or durable_match.skipped
-            ):
-                drained = durable_match.matched
-                skipped_kiro_pending = durable_match.skipped
-                durable_pending = True
-            else:
-                matched = pending_inputs.resolve_matching_text(session_id, text)
-                drained = matched.matched
-                skipped_kiro_pending = matched.skipped
+            matched = pending_inputs.resolve_matching_text(session_id, text)
+            drained = matched.matched
+            skipped_kiro_pending = matched.skipped
         else:
-            drained = await asyncio.to_thread(
-                conversation_store.resolve_oldest_message_event_pending_input,
-                session_id,
-            )
-            durable_pending = drained is not None
-            if drained is None:
-                drained = pending_inputs.resolve_oldest(session_id)
+            drained = pending_inputs.resolve_oldest(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -2269,20 +2240,11 @@ async def _persist_external_conversation_item(
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
     for skipped in skipped_kiro_pending:
-        skipped_item_id = await _persist_skipped_kiro_pending_input(
+        await _persist_skipped_kiro_pending_input(
             session_id,
             skipped,
             conversation_store,
         )
-        if hasattr(skipped, "client_event_id") and hasattr(
-            conversation_store, "mark_message_event_committed"
-        ):
-            await asyncio.to_thread(
-                conversation_store.mark_message_event_committed,
-                session_id,
-                skipped.client_event_id,
-                skipped_item_id,
-            )
     pending_background_title = prepare_background_session_title(
         coordinator=background_title_coordinator,
         conversation=conv,
@@ -2293,17 +2255,6 @@ async def _persist_external_conversation_item(
     if pending_background_title is not None:
         pending_background_title.schedule()
     persisted = persisted_items[0]
-    if (
-        durable_pending
-        and drained is not None
-        and hasattr(conversation_store, "mark_message_event_committed")
-    ):
-        await asyncio.to_thread(
-            conversation_store.mark_message_event_committed,
-            session_id,
-            drained.client_event_id,
-            persisted.id,
-        )
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
@@ -2315,7 +2266,7 @@ async def _persist_skipped_kiro_pending_input(
     session_id: str,
     skipped: pending_inputs.DrainedInput,
     conversation_store: ConversationStore,
-) -> str:
+) -> None:
     """Persist a Kiro web input that never appeared in Kiro's JSONL transcript."""
     turn_id = generate_task_id()
     user_item = NewConversationItem(
@@ -2346,7 +2297,6 @@ async def _persist_skipped_kiro_pending_input(
         cleared_pending_id=skipped.pending_id,
     )
     _publish_external_conversation_item(session_id, persisted_items[1])
-    return persisted_items[0].id
 
 
 async def _enrich_terminal_status_with_subagent_output(
@@ -4344,12 +4294,10 @@ async def _forward_native_terminal_message(
             resp.text,
             extra={"session_id": session_id},
         )
-        detail = f"{display_name} terminal message delivery failed ({resp.status_code})"
-        if resp.status_code < 500:
-            from omnigent.server.message_idempotency import DefinitiveDeliveryFailure
-
-            raise DefinitiveDeliveryFailure(status_code=502, detail=detail)
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(
+            status_code=502,
+            detail=f"{display_name} terminal message delivery failed ({resp.status_code})",
+        )
     failure = _extract_claude_native_runner_failure(resp)
     if failure is not None:
         _logger.warning(
@@ -5636,22 +5584,11 @@ async def _dispatch_session_event_to_runner_impl(
         # back on any failure/cancellation so a message the TUI never
         # received doesn't replay as a ghost.
         content = body.data.get("content")
-        pending_id: str | None = None
-        if isinstance(content, list) and content:
-            identity = message_idempotency.current_identity()
-            if identity is not None:
-                pending_id = f"pending_{secrets.token_hex(16)}"
-                await asyncio.to_thread(
-                    conversation_store.record_message_event_pending_input,
-                    session_id,
-                    identity.client_event_id,
-                    identity.fingerprint,
-                    pending_id=pending_id,
-                    content=content,
-                    created_by=created_by,
-                )
-            else:
-                pending_id = pending_inputs.record(session_id, content, created_by=created_by)
+        pending_id: str | None = (
+            pending_inputs.record(session_id, content, created_by=created_by)
+            if isinstance(content, list) and content
+            else None
+        )
         # ── Server-side routing for native terminal sessions ────────
         # Same logic as the SDK path in _forward_event_to_runner: if
         # the toggle is on and no model_override is set, call the
@@ -9642,19 +9579,6 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
-    durable_pending_inputs = await asyncio.to_thread(
-        conv_store.list_message_event_pending_inputs,
-        session_id,
-    )
-    pending_input_events = [
-        {
-            "pending_id": pending.pending_id,
-            "content": pending.content,
-            **({"created_by": pending.created_by} if pending.created_by is not None else {}),
-        }
-        for pending in durable_pending_inputs
-    ]
-    pending_input_events.extend(pending_inputs.snapshot_for(session_id))
     return _build_session_response(
         conv,
         items,
@@ -9677,7 +9601,6 @@ async def _get_session_snapshot(
             conv_store,
             conv,
         ),
-        pending_input_events=pending_input_events,
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
         agent_store=agent_store,

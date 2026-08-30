@@ -74,6 +74,22 @@ describe("uncertain delivery replacement", () => {
     confirm.mockRestore();
   });
 
+  it("requires confirmation when uncertain attachments change", () => {
+    const original = new File(["a"], "original.txt", { type: "text/plain" });
+    const replacement = new File(["b"], "replacement.txt", { type: "text/plain" });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    expect(
+      confirmUncertainDeliveryReplacement(
+        { text: "same", files: [original], deliveryUncertain: true },
+        "same",
+        [replacement],
+      ),
+    ).toBe(false);
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("may duplicate work"));
+    confirm.mockRestore();
+  });
+
   it("safe-retries an unchanged payload without confirmation", () => {
     const confirm = vi.spyOn(window, "confirm");
 

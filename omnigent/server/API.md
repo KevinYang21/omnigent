@@ -999,35 +999,30 @@ Request body matches `SessionEventInput`:
 422 Unprocessable Entity — request body fails Pydantic validation
 ```
 
-The receipt closes duplicate dispatch from response-loss retries and replica
-races. It does not claim end-to-end exactly-once delivery: if a process stops
-after the runner accepted an event but before the receipt outcome commits, the
-receipt becomes `message_event_uncertain`. The server keeps the identity and
-refuses to dispatch it again; a client must reconcile visible history or retry
-the same identity to observe a later outcome.
+The receipt provides at-most-once API-to-runner dispatch for one
+`(session, client_event_id, payload)` across response-loss retries, replicas,
+and AP restarts. It does not claim end-to-end exactly-once transcript
+reconciliation. If AP stops after the runner may have accepted an event but
+before the receipt outcome commits, the receipt fails closed as
+`message_event_uncertain`: the identity is preserved and AP refuses to dispatch
+it again.
 
-Full native pending payload, attachments, and sender metadata expire after
-24 hours. They are stripped immediately after transcript reconciliation or a
-definitive failure, excluded from reconciliation after expiry, and physically
-stripped by the lazy cleanup path on subsequent receipt activity. The minimal
-receipt tombstone (identity, fingerprint, and terminal state/outcome) currently
-remains until its session is deleted.
-Bounding terminal tombstones is explicitly follow-up work: a safe compactor
-must retain them for at least the maximum supported offline/client retry window,
-because deleting one earlier reopens a duplicate-dispatch hole. This API does
-not yet promise a time after which an id may be safely reused.
+Receipts currently remain until their session is deleted. Bounded tombstone
+retention is explicit follow-up work. A safe compactor must retain identity,
+fingerprint, and terminal state for at least the maximum supported
+offline/client retry window; deleting earlier reopens the duplicate-dispatch
+hole. This API does not promise a time after which an id may be safely reused.
 
 **Native-terminal `message` events return `pending_id`.** On
-claude-native / codex-native / kiro-native sessions a web-composer `message`
-is NOT persisted at POST time (the transcript forwarder is the single writer).
-For requests with `client_event_id`, the server records the pending payload and
-sender durably on the receipt, ordered by a per-conversation monotonic sequence,
-and returns its `pending_id`. Older clients without an identity use the legacy
-in-memory fallback. The pending id (a) re-hydrates the bubble from the
-snapshot's `pending_inputs` across server restarts and (b) is dropped by id when
-the matching `session.input.consumed` arrives carrying `cleared_pending_id`.
-After commit, the receipt links to the authoritative conversation item so a
-lost-response replay can reconcile without leaving a second optimistic bubble.
+claude-native / codex-native sessions a web-composer `message` is NOT persisted
+at POST time (the transcript forwarder is the single writer). The existing
+in-memory pending-input index returns a `pending_id`; snapshots and
+`session.input.consumed` use that id to reconcile optimistic bubbles while AP
+remains alive. This PR intentionally does not change that transcript path.
+Pending attachments and authorship do not survive an AP restart. Closing that
+existing limitation safely requires propagating `client_event_id` through the
+runner, terminal, and transcript and atomically appending the transcript item
+with its receipt update in a separate design.
 A client *may* adopt the id onto its live optimistic bubble for id-based
 dedupe; the first-party web client deliberately does NOT (it keeps a
 client temp id for React-key stability and relies on a stable key +

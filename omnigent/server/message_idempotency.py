@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import hashlib
 import json
 import threading
@@ -12,8 +11,6 @@ import uuid
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any
-
-from fastapi import HTTPException
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store import ConversationStore, MessageEventReceipt
@@ -24,14 +21,6 @@ _CROSS_REPLICA_JOIN_SECONDS = 2.0
 _CROSS_REPLICA_POLL_SECONDS = 0.05
 
 
-@dataclass(frozen=True)
-class EventIdentity:
-    """Identity of the durable event currently owned by this task."""
-
-    client_event_id: str
-    fingerprint: str
-
-
 @dataclass
 class _InFlight:
     fingerprint: str
@@ -40,19 +29,6 @@ class _InFlight:
 
 _in_flight: dict[tuple[int, str, str], _InFlight] = {}
 _lock = threading.Lock()
-_current_identity: contextvars.ContextVar[EventIdentity | None] = contextvars.ContextVar(
-    "message_event_identity",
-    default=None,
-)
-
-
-class DefinitiveDeliveryFailure(HTTPException):
-    """Public HTTP error proving the downstream rejected before acceptance."""
-
-
-def current_identity() -> EventIdentity | None:
-    """Return the durable event identity owned by the current dispatch task."""
-    return _current_identity.get()
 
 
 def event_fingerprint(payload: Mapping[str, Any], created_by: str | None) -> str:
@@ -131,9 +107,6 @@ async def _run_durable(
             operation,
         )
 
-    identity_token = _current_identity.set(
-        EventIdentity(client_event_id=client_event_id, fingerprint=fingerprint)
-    )
     try:
         outcome = await operation()
     except asyncio.CancelledError:
@@ -159,9 +132,6 @@ async def _run_durable(
                 outcome=None,
             )
         raise
-    finally:
-        _current_identity.reset(identity_token)
-
     await asyncio.to_thread(
         conversation_store.complete_message_event,
         session_id,
@@ -259,9 +229,7 @@ def _is_definite_pre_dispatch_failure(exc: Exception) -> bool:
 
 def _is_definitive_failure(exc: Exception) -> bool:
     """Return whether the server proved the operation ended without acceptance."""
-    return isinstance(exc, DefinitiveDeliveryFailure) or (
-        isinstance(exc, OmnigentError) and 400 <= exc.http_status < 500
-    )
+    return isinstance(exc, OmnigentError) and 400 <= exc.http_status < 500
 
 
 def _as_replay(outcome: dict[str, bool | str]) -> dict[str, bool | str]:

@@ -1,4 +1,4 @@
-"""Legacy in-process fallback for un-consumed web-composer user messages.
+"""In-process index of un-consumed web-composer user messages.
 
 Backs the optimistic "queued message" bubble for native-terminal
 sessions (claude-native / codex-native) so it survives a client
@@ -11,9 +11,9 @@ client that navigates away and back (or whose SSE pump rebinds
 mid-flight via ``ensureBoundSession``) loses the optimistic bubble it
 rendered locally — it reappears only once the transcript persists it.
 
-Idempotent web sends now store this metadata on their durable message-event
-receipt. This index remains for older clients that omit ``client_event_id`` and
-for focused native paths that cannot yet correlate a durable receipt:
+This index closes that window with the same shape the codebase already
+uses for transient recovery state (:mod:`pending_elicitations`,
+:mod:`inflight_text`):
 
 * populated by the route layer on a native web message POST (via
   :func:`record`, before the runner forward), so the message is known
@@ -47,16 +47,14 @@ entry) drains the oldest web entry, so that web bubble briefly
 disappears and reappears once it persists. It self-heals; the committed
 bubble always renders the just-persisted content regardless.
 
-Limitations of this legacy fallback (durable receipt-backed inputs do not have
-these limitations):
+Limitations (identical to :mod:`pending_elicitations`):
 
 * In-memory only; multi-replica Omnigent deploys would each see their own
   slice. Session events are already process-affine (``session_stream``
   is in-process with no replay, and a session's runner relay + SSE
   subscribers live on one process), so this rides the same affinity.
-* Entries do not survive an AP-server restart. New web clients avoid this path
-  by supplying ``client_event_id``; their pending payload, attachments, sender,
-  and reconciliation id survive in ``message_event_receipts``.
+* Entries do not survive an AP-server restart — acceptable, the loss
+  is one in-flight message, same as every other AP-side transient.
 
 A forwarded message the vendor TUI never accepts (runner crash, dropped
 keystrokes) is never persisted, so :func:`resolve_oldest` never

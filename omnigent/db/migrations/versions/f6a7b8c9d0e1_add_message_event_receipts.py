@@ -36,15 +36,19 @@ def upgrade() -> None:
         sa.Column("fingerprint", digest_type, nullable=False),
         sa.Column("status", sa.String(length=16), nullable=False),
         sa.Column("outcome", sa.Text(), nullable=True),
+        # Nullable so a rolling rollback to a binary that does not know about
+        # ownership can coexist with the upgraded schema.
+        sa.Column("owner_id", sa.String(length=64), nullable=True),
+        sa.Column("lease_expires_at", sa.Integer(), nullable=True),
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=False),
         sa.CheckConstraint(
-            "status IN ('pending', 'completed', 'failed')",
+            "status IN ('pending', 'completed', 'failed', 'uncertain')",
             name="ck_message_event_receipts_status",
         ),
         sa.CheckConstraint(
             "(status = 'completed' AND outcome IS NOT NULL) OR "
-            "(status IN ('pending', 'failed') AND outcome IS NULL)",
+            "(status IN ('pending', 'failed', 'uncertain') AND outcome IS NULL)",
             name="ck_message_event_receipts_outcome",
         ),
         sa.PrimaryKeyConstraint("workspace_id", "conversation_id", "client_event_id"),

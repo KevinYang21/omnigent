@@ -199,26 +199,6 @@ class MessageEventReceipt:
     outcome: dict[str, bool | str] | None
     owner_id: str
     lease_expires_at: int
-    committed_item_id: str | None = None
-
-
-@dataclass(frozen=True)
-class PendingMessageInput:
-    """Durable native-terminal input awaiting transcript reconciliation."""
-
-    client_event_id: str
-    pending_id: str
-    sequence: int
-    content: list[dict[str, Any]]
-    created_by: str | None = None
-
-
-@dataclass(frozen=True)
-class PendingMessageInputMatch:
-    """One matched native input plus earlier Kiro inputs it skipped."""
-
-    matched: PendingMessageInput | None
-    skipped: list[PendingMessageInput]
 
 
 @dataclass(frozen=True)
@@ -704,64 +684,6 @@ class ConversationStore(ABC):
         fingerprint: str,
     ) -> None:
         """Release a claim after a definite pre-dispatch failure."""
-        ...
-
-    @abstractmethod
-    def record_message_event_pending_input(
-        self,
-        conversation_id: str,
-        client_event_id: str,
-        fingerprint: str,
-        *,
-        pending_id: str,
-        content: list[dict[str, Any]],
-        created_by: str | None,
-    ) -> None:
-        """Attach durable native pending-input metadata to an owned receipt."""
-        ...
-
-    @abstractmethod
-    def list_message_event_pending_inputs(
-        self,
-        conversation_id: str,
-    ) -> list[PendingMessageInput]:
-        """List native inputs not yet reconciled by the transcript forwarder."""
-        ...
-
-    @abstractmethod
-    def resolve_oldest_message_event_pending_input(
-        self,
-        conversation_id: str,
-    ) -> PendingMessageInput | None:
-        """Atomically drain the oldest durable native pending input."""
-        ...
-
-    @abstractmethod
-    def resolve_message_event_pending_input_matching_text(
-        self,
-        conversation_id: str,
-        text: str,
-    ) -> PendingMessageInputMatch:
-        """Drain a Kiro text match and all earlier durable inputs."""
-        ...
-
-    @abstractmethod
-    def mark_message_event_committed(
-        self,
-        conversation_id: str,
-        client_event_id: str,
-        item_id: str,
-    ) -> None:
-        """Link a reconciled receipt to its authoritative committed item."""
-        ...
-
-    @abstractmethod
-    def compact_expired_message_event_pending_inputs(
-        self,
-        *,
-        before: int,
-    ) -> int:
-        """Strip expired sensitive pending metadata, retaining tombstones."""
         ...
 
     @abstractmethod

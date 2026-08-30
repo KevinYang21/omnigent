@@ -725,13 +725,7 @@ def register_hooks_routes(
         # is gated here — the hook is its only request-phase gate. The signal
         # is "is a web prompt in flight", not text correlation (the native
         # transcript gives no reliable id channel — see ``pending_inputs``).
-        durable_pending = await asyncio.to_thread(
-            conversation_store.list_message_event_pending_inputs,
-            session_id,
-        )
-        if phase == Phase.REQUEST and (
-            durable_pending or pending_inputs.snapshot_for(session_id)
-        ):
+        if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",

@@ -805,13 +805,6 @@ class SqlConversation(ConversationBase):
     )
     # Monotonic allocator for the next item position in this conversation.
     next_position: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
-    # Durable FIFO allocator for native pending-input reconciliation.
-    next_message_event_sequence: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-        server_default="0",
-        default=0,
-    )
     # Agent bound to this conversation at creation time. NULL for conversations
     # created without an agent binding. Indexed for the agent→conversation
     # reverse lookup and the list filters (agent_id / has_agent_id / agent_name).
@@ -990,12 +983,6 @@ class SqlMessageEventReceipt(ConversationBase):
     # Nullable for mixed-version deploys: the previous binary inserts neither.
     owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    pending_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    pending_payload: Mapped[str | None] = mapped_column(Text, nullable=True)
-    pending_created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    pending_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    pending_metadata_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    committed_item_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
@@ -1008,24 +995,6 @@ class SqlMessageEventReceipt(ConversationBase):
             "(status = 'completed' AND outcome IS NOT NULL) OR "
             "(status IN ('pending', 'failed', 'uncertain') AND outcome IS NULL)",
             name="ck_message_event_receipts_outcome",
-        ),
-        CheckConstraint(
-            "(pending_id IS NULL AND pending_payload IS NULL "
-            "AND pending_sequence IS NULL AND pending_metadata_expires_at IS NULL) OR "
-            "(pending_id IS NOT NULL AND pending_payload IS NOT NULL "
-            "AND pending_sequence IS NOT NULL AND pending_metadata_expires_at IS NOT NULL)",
-            name="ck_message_event_receipts_pending_payload",
-        ),
-        Index(
-            "ix_message_event_receipts_pending_sequence",
-            "workspace_id",
-            "conversation_id",
-            "pending_sequence",
-        ),
-        Index(
-            "ix_message_event_receipts_pending_expiry",
-            "workspace_id",
-            "pending_metadata_expires_at",
         ),
     )
 

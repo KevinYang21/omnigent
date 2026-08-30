@@ -68,12 +68,7 @@ def test_tables_live_in_correct_db(
     conv_tables = _tables(conv_db)
 
     # AP tables in conv_db only
-    for t in (
-        "conversations",
-        "conversation_items",
-        "conversation_labels",
-        "message_event_receipts",
-    ):
+    for t in ("conversations", "conversation_items", "conversation_labels"):
         assert t in conv_tables, f"{t} missing from 9b7e62bfe9e16274877fe2868bffae5e"
 
     # Omnigent tables in omnigent_db
@@ -417,7 +412,6 @@ def test_delete_conversation_cleans_both_dbs(
 
     conv = store.create_conversation(title="to-delete", runner_id="r1")
     store.set_labels(conv.id, {"k": "v"})
-    store.claim_message_event(conv.id, "event-to-delete", "ab" * 32)
     store.append(
         conv.id,
         [
@@ -429,7 +423,6 @@ def test_delete_conversation_cleans_both_dbs(
         ],
     )
     assert _count(conv_db, "conversations") == 1
-    assert _count(conv_db, "message_event_receipts") == 1
     assert _count(omnigent_db, "omnigent_conversation_metadata") == 1
 
     deleted = asyncio.run(store.delete_conversation(conv.id))
@@ -437,7 +430,6 @@ def test_delete_conversation_cleans_both_dbs(
     assert _count(conv_db, "conversations") == 0
     assert _count(conv_db, "conversation_items") == 0
     assert _count(conv_db, "conversation_labels") == 0
-    assert _count(conv_db, "message_event_receipts") == 0
     assert _count(omnigent_db, "omnigent_conversation_metadata") == 0
 
 

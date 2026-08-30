@@ -5018,7 +5018,6 @@ export function Composer({
     // message. The server enforces the same limits authoritatively.
     const { accepted, errors } = validateAttachments(incoming);
     if (accepted.length > 0) {
-      retryDraftRef.current = null;
       setFiles((prev) => [...prev, ...accepted]);
       dirtyRef.current = true;
       // Return focus to the composer so the user can keep typing right
@@ -5057,7 +5056,6 @@ export function Composer({
   };
 
   const removeFile = (index: number) => {
-    retryDraftRef.current = null;
     setFiles((prev) => prev.filter((_, i) => i !== index));
     setAttachmentError(null);
     dirtyRef.current = true;

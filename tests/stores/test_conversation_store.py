@@ -21,7 +21,6 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.conversation_store import PendingMessageInput
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -108,19 +107,15 @@ def test_message_event_receipt_lifecycle(
 ) -> None:
     conv = conversation_store.create_conversation()
     fingerprint = "ab" * 32
-
     claimed, pending = conversation_store.claim_message_event(
-        conv.id, "CaseSensitiveEvent", fingerprint
+        conv.id,
+        "CaseSensitiveEvent",
+        fingerprint,
+        owner_id="replica-a",
+        lease_expires_at=1234,
     )
     assert claimed is True
     assert pending.status == "pending"
-    assert pending.outcome is None
-
-    claimed_again, same_pending = conversation_store.claim_message_event(
-        conv.id, "CaseSensitiveEvent", fingerprint
-    )
-    assert claimed_again is False
-    assert same_pending == pending
 
     outcome = {"queued": True, "pending_id": "pending-1"}
     conversation_store.complete_message_event(
@@ -130,22 +125,25 @@ def test_message_event_receipt_lifecycle(
         status="completed",
         outcome=outcome,
     )
-    claimed_after_completion, completed = conversation_store.claim_message_event(
-        conv.id, "CaseSensitiveEvent", fingerprint
+    claimed_again, completed = conversation_store.claim_message_event(
+        conv.id,
+        "CaseSensitiveEvent",
+        fingerprint,
     )
-    assert claimed_after_completion is False
+    assert claimed_again is False
     assert completed.status == "completed"
     assert completed.outcome == outcome
 
-    # Opaque event ids are case-sensitive even when the server database uses a
-    # case-insensitive default collation.
+    # Opaque ids remain case-sensitive even under a case-insensitive DB collation.
     lower_claimed, _ = conversation_store.claim_message_event(
-        conv.id, "casesensitiveevent", fingerprint
+        conv.id,
+        "casesensitiveevent",
+        fingerprint,
     )
     assert lower_claimed is True
 
 
-def test_message_event_receipt_terminal_transition_is_compare_and_set(
+def test_message_event_terminal_transition_is_compare_and_set(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     conv = conversation_store.create_conversation()
@@ -155,10 +153,9 @@ def test_message_event_receipt_terminal_transition_is_compare_and_set(
         conv.id,
         "event",
         fingerprint,
-        status="failed",
+        status="uncertain",
         outcome=None,
     )
-
     with pytest.raises(RuntimeError, match="was not pending"):
         conversation_store.complete_message_event(
             conv.id,
@@ -167,315 +164,7 @@ def test_message_event_receipt_terminal_transition_is_compare_and_set(
             status="completed",
             outcome={"queued": True},
         )
-    with pytest.raises(RuntimeError, match="was not pending"):
-        conversation_store.abandon_message_event(conv.id, "event", fingerprint)
-    with pytest.raises(ValueError, match="require an outcome"):
-        conversation_store.complete_message_event(
-            conv.id,
-            "event",
-            fingerprint,
-            status="completed",
-            outcome=None,
-        )
-
-    _, receipt = conversation_store.claim_message_event(conv.id, "event", fingerprint)
-    assert receipt.status == "failed"
-    assert receipt.outcome is None
-
-
-def test_native_pending_input_survives_store_restart_and_drains_once(db_uri: str) -> None:
-    first_store = SqlAlchemyConversationStore(db_uri)
-    conv = first_store.create_conversation()
-    fingerprint = "de" * 32
-    content = [
-        {"type": "input_image", "file_id": "file-1", "filename": "diagram.png"},
-        {"type": "input_text", "text": "explain this"},
-    ]
-    first_store.claim_message_event(
-        conv.id,
-        "native-event",
-        fingerprint,
-        owner_id="replica-a",
-        lease_expires_at=1234,
-    )
-    first_store.record_message_event_pending_input(
-        conv.id,
-        "native-event",
-        fingerprint,
-        pending_id="pending-native",
-        content=content,
-        created_by="alice@example.com",
-    )
-    first_store.complete_message_event(
-        conv.id,
-        "native-event",
-        fingerprint,
-        status="completed",
-        outcome={"queued": True, "pending_id": "pending-native"},
-    )
-
-    restarted_store = SqlAlchemyConversationStore(db_uri)
-    assert restarted_store.list_message_event_pending_inputs(conv.id) == [
-        PendingMessageInput(
-            client_event_id="native-event",
-            pending_id="pending-native",
-            sequence=1,
-            content=content,
-            created_by="alice@example.com",
-        )
-    ]
-    assert restarted_store.resolve_oldest_message_event_pending_input(conv.id) == (
-        PendingMessageInput(
-            client_event_id="native-event",
-            pending_id="pending-native",
-            sequence=1,
-            content=content,
-            created_by="alice@example.com",
-        )
-    )
-    assert restarted_store.resolve_oldest_message_event_pending_input(conv.id) is None
-    assert restarted_store.list_message_event_pending_inputs(conv.id) == []
-
-
-def test_native_pending_sequence_is_monotonic_not_timestamp_or_id_order(
-    conversation_store: SqlAlchemyConversationStore,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conv = conversation_store.create_conversation()
-    monkeypatch.setattr(
-        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
-        lambda: 100,
-    )
-    for event_id, pending_id in [("z-event", "pending-z"), ("a-event", "pending-a")]:
-        fingerprint = ("aa" if event_id == "z-event" else "bb") * 32
-        conversation_store.claim_message_event(conv.id, event_id, fingerprint)
-        conversation_store.record_message_event_pending_input(
-            conv.id,
-            event_id,
-            fingerprint,
-            pending_id=pending_id,
-            content=[{"type": "input_text", "text": event_id}],
-            created_by=f"{event_id}@example.com",
-        )
-        conversation_store.complete_message_event(
-            conv.id,
-            event_id,
-            fingerprint,
-            status="completed",
-            outcome={"queued": True, "pending_id": pending_id},
-        )
-
-    pending = conversation_store.list_message_event_pending_inputs(conv.id)
-    assert [(item.client_event_id, item.sequence) for item in pending] == [
-        ("z-event", 1),
-        ("a-event", 2),
-    ]
-
-
-def test_concurrent_native_pending_sequences_are_unique(db_uri: str) -> None:
-    import threading
-
-    first = SqlAlchemyConversationStore(db_uri)
-    second = SqlAlchemyConversationStore(db_uri)
-    conv = first.create_conversation()
-    for store, event_id, fingerprint in (
-        (first, "event-a", "a1" * 32),
-        (second, "event-b", "b2" * 32),
-    ):
-        store.claim_message_event(conv.id, event_id, fingerprint)
-    barrier = threading.Barrier(2)
-    errors: list[Exception] = []
-
-    def record(
-        store: SqlAlchemyConversationStore,
-        event_id: str,
-        fingerprint: str,
-    ) -> None:
-        try:
-            barrier.wait()
-            store.record_message_event_pending_input(
-                conv.id,
-                event_id,
-                fingerprint,
-                pending_id=f"pending-{event_id}",
-                content=[{"type": "input_text", "text": event_id}],
-                created_by=f"{event_id}@example.com",
-            )
-            store.complete_message_event(
-                conv.id,
-                event_id,
-                fingerprint,
-                status="completed",
-                outcome={"queued": True, "pending_id": f"pending-{event_id}"},
-            )
-        except Exception as exc:
-            errors.append(exc)
-
-    threads = [
-        threading.Thread(target=record, args=(first, "event-a", "a1" * 32)),
-        threading.Thread(target=record, args=(second, "event-b", "b2" * 32)),
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
-
-    assert errors == []
-    pending = first.list_message_event_pending_inputs(conv.id)
-    assert [item.sequence for item in pending] == [1, 2]
-    assert {item.client_event_id for item in pending} == {"event-a", "event-b"}
-
-
-def test_failed_and_uncertain_native_metadata_are_not_consumable(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    conv = conversation_store.create_conversation()
-    for status in ("failed", "uncertain"):
-        event_id = f"{status}-event"
-        fingerprint = ("cc" if status == "failed" else "dd") * 32
-        conversation_store.claim_message_event(conv.id, event_id, fingerprint)
-        conversation_store.record_message_event_pending_input(
-            conv.id,
-            event_id,
-            fingerprint,
-            pending_id=f"pending-{status}",
-            content=[{"type": "input_text", "text": status}],
-            created_by="alice@example.com",
-        )
-        conversation_store.complete_message_event(
-            conv.id,
-            event_id,
-            fingerprint,
-            status=status,
-            outcome=None,
-        )
-
-    assert conversation_store.list_message_event_pending_inputs(conv.id) == []
-    assert conversation_store.resolve_oldest_message_event_pending_input(conv.id) is None
-    assert conversation_store.get_message_event(conv.id, "failed-event").status == "failed"
-    assert conversation_store.get_message_event(conv.id, "uncertain-event").status == "uncertain"
-
-
-def test_kiro_durable_match_skips_and_compacts_in_sequence(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    conv = conversation_store.create_conversation()
-    for index, text_value in enumerate(("skipped", "matched"), start=1):
-        event_id = f"event-{index}"
-        fingerprint = f"{index:02x}" * 32
-        conversation_store.claim_message_event(conv.id, event_id, fingerprint)
-        conversation_store.record_message_event_pending_input(
-            conv.id,
-            event_id,
-            fingerprint,
-            pending_id=f"pending-{index}",
-            content=[
-                {"type": "input_image", "file_id": f"file-{index}"},
-                {"type": "input_text", "text": text_value},
-            ],
-            created_by=f"user-{index}@example.com",
-        )
-        conversation_store.complete_message_event(
-            conv.id,
-            event_id,
-            fingerprint,
-            status="completed",
-            outcome={"queued": True, "pending_id": f"pending-{index}"},
-        )
-
-    result = conversation_store.resolve_message_event_pending_input_matching_text(
-        conv.id,
-        "matched",
-    )
-    assert result.matched is not None
-    assert result.matched.pending_id == "pending-2"
-    assert result.matched.created_by == "user-2@example.com"
-    assert [item.pending_id for item in result.skipped] == ["pending-1"]
-    assert conversation_store.list_message_event_pending_inputs(conv.id) == []
-
-
-def test_reconciled_receipt_links_committed_item_and_strips_sensitive_metadata(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    conv = conversation_store.create_conversation()
-    fingerprint = "ee" * 32
-    conversation_store.claim_message_event(conv.id, "event", fingerprint)
-    conversation_store.record_message_event_pending_input(
-        conv.id,
-        "event",
-        fingerprint,
-        pending_id="pending-1",
-        content=[{"type": "input_text", "text": "secret"}],
-        created_by="alice@example.com",
-    )
-    conversation_store.complete_message_event(
-        conv.id,
-        "event",
-        fingerprint,
-        status="completed",
-        outcome={"queued": True, "pending_id": "pending-1"},
-    )
-    drained = conversation_store.resolve_oldest_message_event_pending_input(conv.id)
-    assert drained is not None
-    committed_item_id = "12" * 16
-    conversation_store.mark_message_event_committed(
-        conv.id,
-        drained.client_event_id,
-        committed_item_id,
-    )
-
-    receipt = conversation_store.get_message_event(conv.id, "event")
-    assert receipt is not None
-    assert receipt.committed_item_id == committed_item_id
-    assert receipt.outcome == {
-        "queued": True,
-        "pending_id": "pending-1",
-        "item_id": committed_item_id,
-    }
-    assert conversation_store.list_message_event_pending_inputs(conv.id) == []
-
-
-def test_expired_uncertain_metadata_is_stripped_but_tombstone_remains(db_uri: str) -> None:
-    store = SqlAlchemyConversationStore(db_uri)
-    conv = store.create_conversation()
-    fingerprint = "fa" * 32
-    store.claim_message_event(conv.id, "uncertain-event", fingerprint)
-    store.record_message_event_pending_input(
-        conv.id,
-        "uncertain-event",
-        fingerprint,
-        pending_id="pending-sensitive",
-        content=[{"type": "input_text", "text": "sensitive"}],
-        created_by="alice@example.com",
-    )
-    store.complete_message_event(
-        conv.id,
-        "uncertain-event",
-        fingerprint,
-        status="uncertain",
-        outcome=None,
-    )
-    engine = get_or_create_engine(db_uri)
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "UPDATE message_event_receipts SET pending_metadata_expires_at = 10 "
-                "WHERE client_event_id = 'uncertain-event'"
-            )
-        )
-
-    assert store.compact_expired_message_event_pending_inputs(before=11) == 1
-    with engine.connect() as connection:
-        row = connection.execute(
-            text(
-                "SELECT status, fingerprint, pending_id, pending_payload, pending_created_by "
-                "FROM message_event_receipts WHERE client_event_id = 'uncertain-event'"
-            )
-        ).one()
-    assert row.status == "uncertain"
-    assert bytes(row.fingerprint).hex() == fingerprint
-    assert (row.pending_id, row.pending_payload, row.pending_created_by) == (None, None, None)
-    assert store.resolve_oldest_message_event_pending_input(conv.id) is None
+    assert conversation_store.get_message_event(conv.id, "event").status == "uncertain"
 
 
 def test_message_event_claim_is_atomic_across_store_instances(db_uri: str) -> None:

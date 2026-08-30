@@ -382,6 +382,12 @@ def test_message_event_receipt_migration_round_trip(tmp_path: Path) -> None:
             command.upgrade(config, "f6a7b8c9d0e1")
         inspector = inspect(engine)
         assert "message_event_receipts" in inspector.get_table_names()
+        columns = {
+            column["name"]: column
+            for column in inspector.get_columns("message_event_receipts")
+        }
+        assert columns["owner_id"]["nullable"] is True
+        assert columns["lease_expires_at"]["nullable"] is True
         assert {
             constraint["name"] for constraint in inspector.get_check_constraints(
                 "message_event_receipts"
@@ -390,6 +396,20 @@ def test_message_event_receipt_migration_round_trip(tmp_path: Path) -> None:
             "ck_message_event_receipts_outcome",
             "ck_message_event_receipts_status",
         }
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO message_event_receipts "
+                    "(workspace_id, conversation_id, client_event_id, fingerprint, "
+                    "status, outcome, created_at, updated_at) "
+                    "VALUES (0, :conversation_id, 'old-writer', :fingerprint, "
+                    "'uncertain', NULL, 1, 1)"
+                ),
+                {
+                    "conversation_id": bytes.fromhex("11" * 16),
+                    "fingerprint": bytes.fromhex("22" * 32),
+                },
+            )
 
         with engine.begin() as connection:
             config.attributes["connection"] = connection
