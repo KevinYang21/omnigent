@@ -47,9 +47,15 @@ SUPPORTED_GROK_MODEL = "grok-3-mini"
 
 @pytest.fixture(autouse=True)
 def _fresh_rejection_cache() -> None:
-    """Isolate the learned-rejection cache across tests."""
-    from omnigent.llms.reasoning_effort_support import clear_learned_rejections
+    """Isolate the learned-rejection cache across tests.
 
+    Import-tolerant so the suite still runs — and fails on the observed
+    behavior, not on a missing module — against a tree without the fix.
+    """
+    try:
+        from omnigent.llms.reasoning_effort_support import clear_learned_rejections
+    except ImportError:
+        return
     clear_learned_rejections()
 
 
