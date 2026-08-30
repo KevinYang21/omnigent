@@ -189,11 +189,7 @@ class _SqlCapture:
         assertions can't flake on incidental engine traffic.
         """
         keep = ("conversations", "session_permissions", "conversation_labels")
-        return [
-            (stmt, n)
-            for stmt, n in self.statements
-            if any(table in stmt for table in keep)
-        ]
+        return [(stmt, n) for stmt, n in self.statements if any(table in stmt for table in keep)]
 
     def max_binds(self) -> int:
         return max((n for _, n in self.relevant()), default=0)
@@ -243,9 +239,7 @@ async def test_sessions_list_page_binds_are_bounded(
     """
     await _list_one(acl_client, _USER_MANY, sql_capture)
 
-    offenders = [
-        (stmt, n) for stmt, n in sql_capture.relevant() if n > _MAX_SANE_BINDS
-    ]
+    offenders = [(stmt, n) for stmt, n in sql_capture.relevant() if n > _MAX_SANE_BINDS]
     assert not offenders, (
         f"GET /v1/sessions?limit=1 for a user with {_N_MANY} accessible "
         f"sessions executed statement(s) binding O(all-accessible) "
