@@ -1803,15 +1803,34 @@ async def _resolve_elicitation(
         if _harness_elicitation_owners.get(elicitation_id) == session_id:
             result_payload = {k: v for k, v in data.items() if k != "elicitation_id"}
             try:
-                harness_future.set_result(
-                    ElicitationResult.model_validate(result_payload),
-                )
+                verdict = ElicitationResult.model_validate(result_payload)
             except ValidationError:
                 _logger.warning(
                     "Invalid approval payload for %r",
                     elicitation_id,
                     exc_info=True,
                 )
+            else:
+                harness_future.set_result(verdict)
+                # The settled waiter may be a zombie: a proxy can sever the
+                # long-poll client-side without the server ever observing a
+                # disconnect, so the verdict written to its connection is
+                # read by nobody. For a deterministic harness id (the only
+                # kind a hook retry re-parks), tombstone the verdict too so
+                # the re-park still receives it; a verdict that WAS
+                # delivered just leaves the tombstone to age out (TTL/cap).
+                from omnigent.server.routes import sessions as _facade
+
+                if _facade._HOOK_ELICITATION_ID_RE.fullmatch(elicitation_id):
+                    _prune_pre_resolved_harness_elicitations()
+                    _harness_pre_resolved_elicitations[elicitation_id] = (
+                        _PreResolvedHarnessElicitation(
+                            session_id=session_id,
+                            created_at=time.time(),
+                            result=verdict,
+                        )
+                    )
+                    _prune_pre_resolved_harness_elicitations()
     elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park

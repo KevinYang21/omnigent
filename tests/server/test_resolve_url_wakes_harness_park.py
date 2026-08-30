@@ -79,3 +79,72 @@ async def test_resolve_elicitation_wrong_session_does_not_wake():
     finally:
         S._harness_parked_elicitations.pop(eid, None)
         S._harness_elicitation_owners.pop(eid, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_registered_future_also_tombstones_hook_id():
+    # Zombie-waiter safety net: a proxy can sever a hook long-poll client-side
+    # without the server observing a disconnect, so the resolve finds the
+    # abandoned chunk's Future still registered, sets the verdict on it - and
+    # nobody reads it. For a deterministic hook id (the only kind a retry
+    # re-parks), the resolve must ALSO tombstone the verdict so the re-park
+    # still receives it instead of re-asking the gate.
+    sid = "conv_zombie_waiter"
+    eid = "elicit_codex_33333333333333333333333333333333"
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    S._harness_elicitation_registry[eid] = future
+    S._harness_elicitation_owners[eid] = sid
+    try:
+        await S._resolve_elicitation(sid, {"elicitation_id": eid, "action": "accept"}, None)
+        assert future.done() and future.result().action == "accept"
+        tomb = S._harness_pre_resolved_elicitations.get(eid)
+        assert tomb is not None, (
+            "a resolve landing on a (possibly zombie) registered future must "
+            "also tombstone the verdict for a re-park of the same hook id"
+        )
+        assert tomb.result is not None and tomb.result.action == "accept"
+        assert tomb.session_id == sid
+    finally:
+        S._harness_elicitation_registry.pop(eid, None)
+        S._harness_elicitation_owners.pop(eid, None)
+        S._harness_pre_resolved_elicitations.pop(eid, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_registered_future_random_id_does_not_tombstone():
+    # A randomly minted id (no hook retry will ever re-park it) must not
+    # accumulate tombstones: the delivered Future is the whole story there.
+    sid = "conv_random_id"
+    eid = "elicit_9c2f0e7a4b1d4c6f8e2a5b7c9d1e3f50"  # no harness namespace
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    S._harness_elicitation_registry[eid] = future
+    S._harness_elicitation_owners[eid] = sid
+    try:
+        await S._resolve_elicitation(sid, {"elicitation_id": eid, "action": "accept"}, None)
+        assert future.done()
+        assert eid not in S._harness_pre_resolved_elicitations
+    finally:
+        S._harness_elicitation_registry.pop(eid, None)
+        S._harness_elicitation_owners.pop(eid, None)
+        S._harness_pre_resolved_elicitations.pop(eid, None)
+
+
+@pytest.mark.asyncio
+async def test_resolve_wrong_session_does_not_settle_or_tombstone():
+    # Ownership guard extends to the zombie-waiter tombstone: a resolve from a
+    # different session must neither settle the future nor leave a tombstone.
+    sid = "conv_owner_zombie"
+    eid = "elicit_codex_44444444444444444444444444444444"
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    S._harness_elicitation_registry[eid] = future
+    S._harness_elicitation_owners[eid] = sid
+    try:
+        await S._resolve_elicitation(
+            "conv_other", {"elicitation_id": eid, "action": "accept"}, None
+        )
+        assert not future.done()
+        assert eid not in S._harness_pre_resolved_elicitations
+    finally:
+        S._harness_elicitation_registry.pop(eid, None)
+        S._harness_elicitation_owners.pop(eid, None)
+        S._harness_pre_resolved_elicitations.pop(eid, None)
