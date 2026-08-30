@@ -3586,10 +3586,68 @@ async def test_fresh_host_retries_auth_rejection_before_failing_loud(
     assert spy.call_count == 3
 
 
+async def test_connected_host_rides_out_404_restart_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that already connected retries 404s indefinitely.
+
+    A reverse proxy in front of the server answers 404 for the tunnel
+    route while the backend container restarts (deploy, config change,
+    nightly backup window). A host that has already completed an upgrade
+    is watching a routine restart — killing it would drop its live
+    runners — so it must ride the 404 window out and reconnect when the
+    backend returns, rather than exiting 1 and tearing down its sessions.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    not_found = _invalid_status(404)
+    # Accepted upgrade first (None), then a burst of 404s (the restart
+    # window), then another accepted upgrade, then a cancel to end.
+    spy = _ConnectSpy([None, not_found, not_found, not_found, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally: if the post-connect 404s were misclassified as
+    # fatal this would raise HostConnectError after the first 404 instead
+    # of reconnecting.
+    await host.run()
+
+    # 6 = accepted connect + 3 ridden-out 404s + reconnect + ending
+    # cancel. Fewer means the host died mid-restart (the transient-404 bug).
+    assert spy.call_count == 6
+
+
+async def test_never_connected_host_fails_loud_on_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that has NEVER connected fails loud on 404, first attempt.
+
+    The narrow transient-404 fix rescues only already-connected hosts. A host
+    that never authenticated treats a 404 as a permanent client error — a
+    wrong server URL, or a server too old to expose the tunnel route — and
+    must fail loud immediately (no grace window, no silent looping) so the
+    operator gets instant feedback, exactly as before the fix.
+    """
+    spy = _ConnectSpy([_invalid_status(404)])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError) as excinfo:
+        await host.run()
+
+    message = str(excinfo.value)
+    assert "HTTP 404" in message
+    assert "host tunnel route" in message
+    # A 404 is not an auth failure, so no `omnigent login` remedy.
+    assert "omnigent login" not in message
+    # Exactly one attempt — fails loud immediately, unlike the
+    # already-connected ride-out path above.
+    assert spy.call_count == 1
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [
-        (404, "permanent"),
+        (404, "HTTP 404"),
     ],
 )
 async def test_run_fails_loud_on_permanent_4xx(
@@ -3597,8 +3655,12 @@ async def test_run_fails_loud_on_permanent_4xx(
 ) -> None:
     """A non-auth permanent 4xx upgrade rejection fails loud immediately.
 
-    A wrong or old server cannot recover through reconnecting, so run()
-    must raise HostConnectError rather than backing off.
+    A 404 on a host that has never connected is permanent (wrong URL /
+    route missing) — reconnecting can never succeed, so run() must raise
+    HostConnectError immediately rather than backing off. Its message
+    names the tunnel route rather than the word "permanent", so this
+    asserts on "HTTP 404". An *already-connected* host instead rides a
+    404 out, covered separately above.
     """
     spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
