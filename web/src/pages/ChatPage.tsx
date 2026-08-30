@@ -1389,10 +1389,11 @@ export function ChatPage() {
     });
   }
 
-  function onSendSlashCommand(name: string, args: string) {
+  function onSendSlashCommand(name: string, args: string, clientEventId?: string) {
     if (!agentId) return;
-    // Slash commands aren't replayed (an edge), but still route an unbound
-    // coding clone to the directory picker so it isn't a dead end.
+    // Keep the restored logical identity through reconnect checks and the
+    // store boundary. Still route an unbound coding clone to the directory
+    // picker so it isn't a dead end.
     if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
       setResumeDirDialogOpen(true);
       return;
@@ -1402,6 +1403,7 @@ export function ChatPage() {
       return;
     }
     void useChatStore.getState().sendSlashCommand(name, args, agentId, {
+      clientEventId,
       onConversationCreated: (newId) => {
         navigate(`/c/${newId}`, { replace: true });
       },
@@ -1709,7 +1711,7 @@ interface MainAgentSurfaceProps {
    * is sent as plaintext for the vendor TUI to handle. See
    * `ComposerProps.onSendSlashCommand`.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string, clientEventId?: string) => void;
   onStop: () => void;
   onShowReconnectHelp: () => void;
   agents: Agent[] | undefined;
@@ -2105,9 +2107,9 @@ function MainAgentSurface({
   const handleSendSlashCommand = useMemo(
     () =>
       onSendSlashCommand && !isNativeWrapper
-        ? (name: string, args: string) => {
+        ? (name: string, args: string, clientEventId?: string) => {
             setSendScrollNonce((n) => n + 1);
-            onSendSlashCommand(name, args);
+            onSendSlashCommand(name, args, clientEventId);
           }
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
@@ -3776,7 +3778,7 @@ interface ComposerProps {
    * native-terminal sessions, which always send `/skill` as plaintext so
    * the vendor TUI loads the skill itself.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string, clientEventId?: string) => void;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -5074,6 +5076,35 @@ export function Composer({
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
 
+    const prepareRetry = (
+      messageText: string,
+      messageFiles: File[],
+    ): { confirmed: false } | { confirmed: true; clientEventId?: string } => {
+      const retryDraft = retryDraftRef.current ?? uncertainDelivery;
+      const retryPayloadMatches =
+        retryDraft !== null &&
+        retryDraft.text === messageText &&
+        retryDraft.files.length === messageFiles.length &&
+        retryDraft.files.every((file, index) => file === messageFiles[index]);
+      if (!confirmUncertainDeliveryReplacement(uncertainDelivery, messageText, messageFiles)) {
+        // No send occurred, so a second click must be allowed to reopen the
+        // explicit duplicate-risk decision without requiring another edit.
+        submitGuardRef.current = false;
+        return { confirmed: false };
+      }
+      const replacesUncertainDelivery =
+        uncertainDelivery !== null &&
+        (uncertainDelivery.text !== messageText ||
+          uncertainDelivery.files.length !== messageFiles.length ||
+          uncertainDelivery.files.some((file, index) => file !== messageFiles[index]));
+      if (replacesUncertainDelivery) {
+        useChatStore.setState({ uncertainDelivery: null });
+      }
+      const clientEventId = retryPayloadMatches ? retryDraft.clientEventId : undefined;
+      retryDraftRef.current = null;
+      return { confirmed: true, clientEventId };
+    };
+
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
     // match, while args after the name may carry paths or URLs, e.g.
@@ -5121,8 +5152,10 @@ export function Composer({
       // don't apply to a slash command (no content field) — clear them.
       if (onSendSlashCommand && parts[0] in slashCommands) {
         const skillArgs = trimmed.slice(parts[0].length).trim();
+        const retry = prepareRetry(trimmed, []);
+        if (!retry.confirmed) return;
         appendEntry(trimmed);
-        onSendSlashCommand(parts[0].slice(1), skillArgs);
+        onSendSlashCommand(parts[0].slice(1), skillArgs, retry.clientEventId);
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -5152,37 +5185,17 @@ export function Composer({
     // workspace file/folder from this marker; no upload happens.
     const messageText =
       buildMentionPreamble(mentionedItems, sessionHarness) + quotePreamble + trimmed;
-    const retryDraft = retryDraftRef.current ?? uncertainDelivery;
-    const retryPayloadMatches =
-      retryDraft !== null &&
-      retryDraft.text === messageText &&
-      retryDraft.files.length === files.length &&
-      retryDraft.files.every((file, index) => file === files[index]);
-    if (!confirmUncertainDeliveryReplacement(uncertainDelivery, messageText, files)) {
-      // No send occurred, so a second click must be allowed to reopen the
-      // explicit duplicate-risk decision without requiring another edit.
-      submitGuardRef.current = false;
-      return;
-    }
-    const replacesUncertainDelivery =
-      uncertainDelivery !== null &&
-      (uncertainDelivery.text !== messageText ||
-        uncertainDelivery.files.length !== files.length ||
-        uncertainDelivery.files.some((file, index) => file !== files[index]));
-    if (replacesUncertainDelivery) {
-      useChatStore.setState({ uncertainDelivery: null });
-    }
-    const retryClientEventId = retryPayloadMatches ? retryDraft.clientEventId : undefined;
-    retryDraftRef.current = null;
+    const retry = prepareRetry(messageText, files);
+    if (!retry.confirmed) return;
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
     if (trimmed) appendEntry(trimmed);
-    if (retryClientEventId === undefined) {
+    if (retry.clientEventId === undefined) {
       onSend(messageText, files.length > 0 ? files : undefined);
     } else {
-      onSend(messageText, files.length > 0 ? files : undefined, retryClientEventId);
+      onSend(messageText, files.length > 0 ? files : undefined, retry.clientEventId);
     }
     dirtyRef.current = true;
     setValue("");

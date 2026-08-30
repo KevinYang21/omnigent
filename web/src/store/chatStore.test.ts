@@ -2646,6 +2646,25 @@ describe("chatStore — sendSlashCommand", () => {
     });
   });
 
+  it("gives separate identical skill invocations distinct identities", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+
+    await useChatStore.getState().sendSlashCommand("grill-me", "same request", "agent_xyz");
+    await useChatStore.getState().sendSlashCommand("grill-me", "same request", "agent_xyz");
+
+    const skillEvents = fetchMock.mock.calls
+      .filter(
+        ([input, init]) =>
+          String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST",
+      )
+      .map(([, init]) => JSON.parse(String(init?.body)));
+    expect(skillEvents).toHaveLength(2);
+    expect(skillEvents[0].client_event_id).not.toBe(skillEvents[1].client_event_id);
+  });
+
   it("sends empty arguments when the skill is invoked with no args", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",

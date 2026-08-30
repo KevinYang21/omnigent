@@ -398,6 +398,8 @@ describe("Composer slash-command menu", () => {
     // without invoking store actions like compact().
     useChatStore.setState({
       conversationId: "conv_test",
+      failedSendDraft: null,
+      uncertainDelivery: null,
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
         { name: "deslop", description: "Remove AI slop" },
@@ -556,6 +558,8 @@ describe("Composer slash-command submit routing", () => {
   beforeEach(() => {
     useChatStore.setState({
       conversationId: "conv_test",
+      failedSendDraft: null,
+      uncertainDelivery: null,
       skills: [
         { name: "deep-research", description: "Run a deep research sweep" },
         { name: "deslop", description: "Remove AI slop" },
@@ -580,7 +584,7 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/deslop fix the bug" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug");
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix the bug", undefined);
     // It's a slash_command event, NOT a plaintext message.
     expect(onSend).not.toHaveBeenCalled();
   });
@@ -597,7 +601,7 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/deslop fix src/foo.ts" } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix src/foo.ts");
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "fix src/foo.ts", undefined);
     expect(onSend).not.toHaveBeenCalled();
   });
 
@@ -624,9 +628,92 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/deslop " } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "");
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "", undefined);
     // Took the event path, not the plaintext fallback.
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("reuses the prior identity for an unchanged restored uncertain skill", async () => {
+    const onSendSlashCommand = vi.fn();
+    const confirm = vi.spyOn(window, "confirm");
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_test",
+        text: "/deslop fix the bug",
+        files: [],
+        clientEventId: "skill-logical-submit",
+      },
+      uncertainDelivery: {
+        conversationId: "conv_test",
+        text: "/deslop fix the bug",
+        files: [],
+        clientEventId: "skill-logical-submit",
+      },
+    });
+
+    render(<Composer {...composerProps({ onSendSlashCommand })} />);
+    await waitFor(() => expect(textarea()).toHaveValue("/deslop fix the bug"));
+    fireEvent.submit(textarea().closest("form")!);
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(onSendSlashCommand).toHaveBeenCalledWith(
+      "deslop",
+      "fix the bug",
+      "skill-logical-submit",
+    );
+  });
+
+  it("confirms an edited uncertain skill before sending a fresh identity", async () => {
+    const onSendSlashCommand = vi.fn();
+    const confirm = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    useChatStore.setState({
+      failedSendDraft: {
+        conversationId: "conv_test",
+        text: "/deslop original",
+        files: [],
+        clientEventId: "skill-logical-submit",
+      },
+      uncertainDelivery: {
+        conversationId: "conv_test",
+        text: "/deslop original",
+        files: [],
+        clientEventId: "skill-logical-submit",
+      },
+    });
+
+    render(<Composer {...composerProps({ onSendSlashCommand })} />);
+    await waitFor(() => expect(textarea()).toHaveValue("/deslop original"));
+    fireEvent.change(textarea(), { target: { value: "/deslop replacement" } });
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(useChatStore.getState().uncertainDelivery?.clientEventId).toBe("skill-logical-submit");
+    expect(confirm).toHaveBeenCalledTimes(1);
+
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSendSlashCommand).toHaveBeenCalledTimes(1);
+    expect(onSendSlashCommand).toHaveBeenCalledWith("deslop", "replacement", undefined);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(useChatStore.getState().uncertainDelivery).toBeNull();
+  });
+
+  it("treats separate identical skill submits as distinct actions", async () => {
+    const onSendSlashCommand = vi.fn();
+    render(<Composer {...composerProps({ onSendSlashCommand })} />);
+    const form = textarea().closest("form")!;
+
+    fireEvent.change(textarea(), { target: { value: "/deslop same request" } });
+    fireEvent.submit(form);
+    await Promise.resolve();
+    fireEvent.change(textarea(), { target: { value: "/deslop same request" } });
+    fireEvent.submit(form);
+
+    expect(onSendSlashCommand).toHaveBeenCalledTimes(2);
+    expect(onSendSlashCommand).toHaveBeenNthCalledWith(1, "deslop", "same request", undefined);
+    expect(onSendSlashCommand).toHaveBeenNthCalledWith(2, "deslop", "same request", undefined);
   });
 
   it("falls through to plaintext onSend for an unknown command", () => {
