@@ -4035,10 +4035,13 @@ def _source_id_post_route_unavailable(exc: httpx.HTTPError) -> bool:
         payload = exc.response.json()
     except ValueError:
         return False
-    # Starlette's unmatched-route response is stable and intentionally generic.
-    # Domain 404s from a server that owns source-id-v1 carry Omnigent's error
-    # envelope and must flow through bounded permanent-failure handling.
-    return payload == {"detail": "Not Found"}
+    # Old API-only and bundled-SPA packages expose two stable generic fallback
+    # envelopes. Domain 404s from a server that owns source-id-v1 include a
+    # specific session/access message and must use bounded permanent handling.
+    return payload in (
+        {"detail": "Not Found"},
+        {"error": {"code": "not_found", "message": "Not found"}},
+    )
 
 
 async def _post_external_conversation_item(
