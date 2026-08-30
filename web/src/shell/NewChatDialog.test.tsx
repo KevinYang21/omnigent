@@ -1085,7 +1085,11 @@ describe("NewChatLandingScreen", () => {
         expect(control.compareDocumentPosition(nextControl)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
       }
     }
-    expect(harness).toHaveClass("min-w-0", "w-full");
+    const harnessShell = harness.parentElement;
+    const trailingControls = harnessShell?.parentElement;
+    expect(harness).toHaveClass("min-w-0", "w-full", "md:w-auto");
+    expect(harnessShell).toHaveClass("min-w-0", "flex-1", "md:flex-none");
+    expect(trailingControls).toHaveClass("min-w-0", "flex-1", "md:flex-none");
     expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveClass("size-[18px]");
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
     expect(leftControls).not.toHaveClass("absolute");

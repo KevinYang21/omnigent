@@ -5489,8 +5489,8 @@ export function NewChatLandingScreen() {
                 is shown in the hero heading instead of a tray chip; filing on
                 create still uses `selectedProject`. */}
               </div>
-              <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-0.5 md:gap-2">
-                <div className="flex min-w-0 flex-1 items-center justify-end rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 [&>button]:bg-transparent!">
+              <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-0.5 md:flex-none md:gap-2">
+                <div className="flex min-w-0 flex-1 items-center justify-end rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 md:flex-none [&>button]:bg-transparent!">
                   {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}
                   <AgentHarnessPicker
@@ -5523,7 +5523,7 @@ export function NewChatLandingScreen() {
                     autoHarnessActive={smartRoutingHarnessSelected}
                     onSelectAutoHarness={handleSelectSmartRoutingHarness}
                     contentClassName="w-[17.25rem] min-w-0"
-                    triggerClassName="h-9 min-w-0 w-full max-w-[10rem] pr-2 sm:max-w-[14rem] md:h-8 md:max-w-[17rem]"
+                    triggerClassName="h-9 min-w-0 w-full max-w-[10rem] pr-2 sm:max-w-[14rem] md:h-8 md:w-auto md:max-w-[17rem]"
                   />
                 </div>
                 {selectedAgent && selectedAgentHasKnobs && (
