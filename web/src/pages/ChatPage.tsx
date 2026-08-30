@@ -4648,6 +4648,15 @@ export function Composer({
   const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
   const showInterruptButton = isWorking && !hasDraft;
 
+  // Keep one draft consumed until React commits its changed/cleared state.
+  // A microtask is too short here: browsers can run it between two delivered
+  // form events, before the controlled textarea has committed its empty value.
+  // Once any draft part changes, a new submit is allowed—even with identical
+  // text—so an intentional second entry remains distinct.
+  useEffect(() => {
+    submitGuardRef.current = false;
+  }, [value, files, mentionedItems]);
+
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
   // clear the store queue so they aren't re-applied. Placed after
@@ -4922,9 +4931,6 @@ export function Composer({
     // commits the cleared draft. Treat those re-entrant calls as one submit.
     if (submitGuardRef.current) return;
     submitGuardRef.current = true;
-    queueMicrotask(() => {
-      submitGuardRef.current = false;
-    });
 
     // A send is actually happening: report it for both pointer clicks (which
     // reach here via the form submit) and Enter-key sends. Placed after the
