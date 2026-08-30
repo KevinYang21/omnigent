@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  STREAM_HIDDEN_RECONNECT_MAX_MS,
-  STREAM_RECONNECT_MAX_MS,
+  HIDDEN_RECONNECT_MAX_MS,
+  RECONNECT_MAX_MS,
   awaitReconnectDelay,
   nextReconnectDelay,
 } from "./streamReconnect";
@@ -27,9 +27,9 @@ describe("streamReconnect pacing", () => {
 
   it("caps the saturated delay at the hidden ceiling only while hidden", () => {
     setDocumentHidden(true);
-    expect(nextReconnectDelay(20)).toBe(STREAM_HIDDEN_RECONNECT_MAX_MS);
+    expect(nextReconnectDelay(20)).toBe(HIDDEN_RECONNECT_MAX_MS);
     setDocumentHidden(false);
-    expect(nextReconnectDelay(20)).toBe(STREAM_RECONNECT_MAX_MS);
+    expect(nextReconnectDelay(20)).toBe(RECONNECT_MAX_MS);
   });
 
   it("waits the stretched hidden cadence from the very first failed open", () => {
@@ -37,7 +37,7 @@ describe("streamReconnect pacing", () => {
     // fast foreground cadence until the doubling reaches the hidden cap —
     // that mid-ramp window still wakes the radio every few seconds.
     setDocumentHidden(true);
-    expect(nextReconnectDelay(1)).toBe(STREAM_HIDDEN_RECONNECT_MAX_MS);
+    expect(nextReconnectDelay(1)).toBe(HIDDEN_RECONNECT_MAX_MS);
     setDocumentHidden(false);
     expect(nextReconnectDelay(1)).toBe(250);
   });
@@ -46,11 +46,11 @@ describe("streamReconnect pacing", () => {
     setDocumentHidden(true);
     const controller = new AbortController();
     let resolved = false;
-    void awaitReconnectDelay(STREAM_HIDDEN_RECONNECT_MAX_MS, controller.signal).then(() => {
+    void awaitReconnectDelay(HIDDEN_RECONNECT_MAX_MS, controller.signal).then(() => {
       resolved = true;
     });
 
-    await vi.advanceTimersByTimeAsync(STREAM_HIDDEN_RECONNECT_MAX_MS - 1);
+    await vi.advanceTimersByTimeAsync(HIDDEN_RECONNECT_MAX_MS - 1);
     expect(resolved).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     expect(resolved).toBe(true);
@@ -60,7 +60,7 @@ describe("streamReconnect pacing", () => {
     setDocumentHidden(true);
     const controller = new AbortController();
     let resolved = false;
-    void awaitReconnectDelay(STREAM_HIDDEN_RECONNECT_MAX_MS, controller.signal).then(() => {
+    void awaitReconnectDelay(HIDDEN_RECONNECT_MAX_MS, controller.signal).then(() => {
       resolved = true;
     });
 
@@ -75,11 +75,9 @@ describe("streamReconnect pacing", () => {
     setDocumentHidden(true);
     const controller = new AbortController();
     let resolved = false;
-    void awaitReconnectDelay(STREAM_HIDDEN_RECONNECT_MAX_MS, controller.signal, () => 2_000).then(
-      () => {
-        resolved = true;
-      },
-    );
+    void awaitReconnectDelay(HIDDEN_RECONNECT_MAX_MS, controller.signal, () => 2_000).then(() => {
+      resolved = true;
+    });
 
     await vi.advanceTimersByTimeAsync(1_000);
     setDocumentHidden(false);
@@ -95,11 +93,9 @@ describe("streamReconnect pacing", () => {
     setDocumentHidden(true);
     const controller = new AbortController();
     let resolved = false;
-    void awaitReconnectDelay(STREAM_HIDDEN_RECONNECT_MAX_MS, controller.signal, () => 2_000).then(
-      () => {
-        resolved = true;
-      },
-    );
+    void awaitReconnectDelay(HIDDEN_RECONNECT_MAX_MS, controller.signal, () => 2_000).then(() => {
+      resolved = true;
+    });
 
     // Brief foreground visit at t=10s arms the jittered wake for t=12s...
     await vi.advanceTimersByTimeAsync(10_000);
@@ -115,7 +111,7 @@ describe("streamReconnect pacing", () => {
     // wait resumes and resolves only at the original 60 s deadline.
     await vi.advanceTimersByTimeAsync(1_000);
     expect(resolved).toBe(false);
-    await vi.advanceTimersByTimeAsync(STREAM_HIDDEN_RECONNECT_MAX_MS - 12_000 - 1);
+    await vi.advanceTimersByTimeAsync(HIDDEN_RECONNECT_MAX_MS - 12_000 - 1);
     expect(resolved).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     expect(resolved).toBe(true);
@@ -158,7 +154,7 @@ describe("streamReconnect pacing", () => {
     setDocumentHidden(true);
     const controller = new AbortController();
     let resolved = false;
-    void awaitReconnectDelay(STREAM_HIDDEN_RECONNECT_MAX_MS, controller.signal).then(() => {
+    void awaitReconnectDelay(HIDDEN_RECONNECT_MAX_MS, controller.signal).then(() => {
       resolved = true;
     });
 
@@ -173,7 +169,7 @@ describe("streamReconnect pacing", () => {
     const controller = new AbortController();
     controller.abort();
     let resolved = false;
-    void awaitReconnectDelay(STREAM_HIDDEN_RECONNECT_MAX_MS, controller.signal).then(() => {
+    void awaitReconnectDelay(HIDDEN_RECONNECT_MAX_MS, controller.signal).then(() => {
       resolved = true;
     });
 

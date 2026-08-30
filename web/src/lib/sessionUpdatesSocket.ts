@@ -17,6 +17,7 @@
 // access-checks every watched id against the connection's user.
 
 import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+import { nextReconnectDelay } from "@/lib/reconnectBackoff";
 import { modalHostId } from "@/lib/sessionHost";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
@@ -30,20 +31,11 @@ export type SessionUpdatesFrame =
 
 type FrameListener = (frame: SessionUpdatesFrame) => void;
 
-// Reconnect backoff — mirrors the chat stream pump (chatStore.ts): 250 ms
-// base, doubling, capped at 5 s visible / 60 s hidden, with ±50% jitter so
-// many tabs reconnecting after a server blip don't synchronize into a
-// thundering herd.
-const RECONNECT_BASE_MS = 250;
-// Exported so the backoff tests can assert the exact saturated delay rather
-// than hard-coding the literal (same pattern as HEARTBEAT_WATCHDOG_MS).
-export const RECONNECT_MAX_MS = 5_000;
-
-// A hidden page doesn't need sub-second freshness: while `document.hidden`
-// the retry cap stretches, so a backgrounded tab or mobile WebView facing an
-// unreachable server doesn't wake the CPU/radio every few seconds. Returning
-// to the foreground reconnects immediately (see `onVisibilityChange`).
-export const HIDDEN_RECONNECT_MAX_MS = 60_000;
+// Reconnect backoff — the policy shared with the chat stream pump lives in
+// reconnectBackoff.ts. Re-exported so the backoff tests can assert the exact
+// saturated delays rather than hard-coding literals (same pattern as
+// HEARTBEAT_WATCHDOG_MS).
+export { HIDDEN_RECONNECT_MAX_MS, RECONNECT_MAX_MS } from "@/lib/reconnectBackoff";
 
 // The server pushes a heartbeat every 30 s when a watch-set is idle (see
 // `_SESSION_UPDATES_HEARTBEAT_INTERVAL_S`). If we go appreciably longer than
@@ -57,19 +49,6 @@ export const HIDDEN_RECONNECT_MAX_MS = 60_000;
 // do. Exported so the watchdog test can advance fake timers to the exact
 // threshold rather than hard-coding the literal.
 export const HEARTBEAT_WATCHDOG_MS = 70_000;
-
-function nextReconnectDelay(failedAttempts: number): number {
-  // While hidden, EVERY retry waits the stretched cadence — not only the
-  // saturated one. Ramping up from the 250 ms base while nobody is looking
-  // still wakes the radio every few seconds mid-ramp; a hidden page never
-  // needs a fast retry because returning to the foreground reconnects
-  // immediately (see `onVisibilityChange`).
-  const base =
-    typeof document !== "undefined" && document.hidden
-      ? HIDDEN_RECONNECT_MAX_MS
-      : Math.min(RECONNECT_BASE_MS * 2 ** (failedAttempts - 1), RECONNECT_MAX_MS);
-  return base / 2 + Math.random() * (base / 2);
-}
 
 /**
  * Build the `ws(s)://` URL for the session-updates endpoint.

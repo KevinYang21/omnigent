@@ -1,18 +1,18 @@
 // Reconnect pacing for the session SSE stream pump (chatStore.ts). Split out
 // so the delay/backoff logic is unit-testable without the store's dependency
-// graph. Mirrors sessionUpdatesSocket.ts, which documents the shared policy:
-// 250 ms base, doubling, capped at 5 s visible / 60 s hidden, ±50% jitter.
-
+// graph. The backoff policy itself is shared with sessionUpdatesSocket.ts
+// (see reconnectBackoff.ts): 250 ms base, doubling, capped at 5 s visible /
+// 60 s hidden, ±50% jitter.
+//
 // Databricks Apps' ingress hard-caps a single HTTP/2 stream at ~5 min, so the
 // client must re-subscribe when it's dropped. Backoff applies only between
 // consecutive failed opens (see nextReconnectDelay); a drop after a healthy
 // connection reconnects instantly.
-export const STREAM_RECONNECT_BASE_MS = 250;
-export const STREAM_RECONNECT_MAX_MS = 5_000;
-// Hidden-page retry cap — a hidden tab facing an unreachable server doesn't
-// need to dial every ≤5 s. Returning to the foreground ends a stretched wait
-// promptly (see awaitReconnectDelay).
-export const STREAM_HIDDEN_RECONNECT_MAX_MS = 60_000;
+export {
+  HIDDEN_RECONNECT_MAX_MS,
+  RECONNECT_MAX_MS,
+  nextReconnectDelay,
+} from "@/lib/reconnectBackoff";
 
 // Spread background reconnects over a few seconds so N conversations recycling
 // at the same ingress deadline don't fire N snapshot fetches at once. Small
@@ -46,26 +46,6 @@ export function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
     // (`resolve` is idempotent; this closes any registration-ordering gap.)
     if (signal.aborted) onAbort();
   });
-}
-
-/**
- * Halved-to-full jittered exponential backoff between CONSECUTIVE failed
- * opens. Only called with `failedOpens >= 1` — a drop after a healthy
- * connection reconnects instantly (no delay), so the first attempt
- * (`failedOpens === 1`) backs off from the base, doubling per failure up
- * to the cap.
- */
-export function nextReconnectDelay(failedOpens: number): number {
-  // While hidden, EVERY failed-open retry waits the stretched cadence — not
-  // only the saturated one. Ramping up from the 250 ms base while nobody is
-  // looking still wakes the radio every few seconds mid-ramp; a hidden page
-  // never needs a fast retry because awaitReconnectDelay reconnects promptly
-  // on the visibility flip.
-  const base =
-    typeof document !== "undefined" && document.hidden
-      ? STREAM_HIDDEN_RECONNECT_MAX_MS
-      : Math.min(STREAM_RECONNECT_BASE_MS * 2 ** (failedOpens - 1), STREAM_RECONNECT_MAX_MS);
-  return base / 2 + Math.random() * (base / 2);
 }
 
 /**
