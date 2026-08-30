@@ -124,28 +124,35 @@ def test_non_http_errors_not_matched() -> None:
 # ── strip_rejected_reasoning_effort ──────────────────────────────────
 
 
-def test_strip_returns_copy_without_param_and_learns() -> None:
-    """A matching rejection strips the param and records the pair."""
+def test_strip_returns_copy_without_param() -> None:
+    """A matching rejection strips the param without mutating the input."""
     extra: dict[str, Any] = {"reasoning_effort": "low", "temperature": 0.5}
     exc = _http_error(400, "Argument not supported on this model: reasoning_effort")
 
-    stripped = strip_rejected_reasoning_effort(extra, "xai", "grok-new", exc)
+    stripped = strip_rejected_reasoning_effort(extra, exc)
 
     assert stripped == {"temperature": 0.5}
     assert extra["reasoning_effort"] == "low", "the original dict must not be mutated"
-    assert not accepts_reasoning_effort("xai", "grok-new")
+
+
+def test_strip_does_not_learn() -> None:
+    """Stripping alone learns nothing — the caller records only after a
+    confirmed retry, so a false-positive match self-corrects."""
+    extra: dict[str, Any] = {"reasoning_effort": "low"}
+    exc = _http_error(400, "Argument not supported on this model: reasoning_effort")
+
+    assert strip_rejected_reasoning_effort(extra, exc) is not None
+    assert accepts_reasoning_effort("xai", "grok-new")
 
 
 def test_strip_declines_when_param_absent() -> None:
     """A 400 on a request that never carried the param is not ours."""
     exc = _http_error(400, "Argument not supported on this model: reasoning_effort")
-    assert strip_rejected_reasoning_effort({"temperature": 0.5}, "xai", "grok-new", exc) is None
-    assert accepts_reasoning_effort("xai", "grok-new")
+    assert strip_rejected_reasoning_effort({"temperature": 0.5}, exc) is None
 
 
 def test_strip_declines_on_unrelated_error() -> None:
-    """An unrelated failure re-raises — no retry, nothing learned."""
+    """An unrelated failure re-raises — no retry, nothing stripped."""
     exc = _http_error(500, "internal error")
     extra = {"reasoning_effort": "low"}
-    assert strip_rejected_reasoning_effort(extra, "xai", "grok-new", exc) is None
-    assert accepts_reasoning_effort("xai", "grok-new")
+    assert strip_rejected_reasoning_effort(extra, exc) is None

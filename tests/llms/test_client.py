@@ -1062,6 +1062,39 @@ async def test_param_rejection_strips_and_retries_once(
 
 
 @pytest.mark.asyncio
+async def test_failed_stripped_retry_learns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 400 that matched but whose stripped retry also fails is not learned.
+
+    A false-positive match (an unrelated 400 whose body happens to echo the
+    param and mention support) must self-correct: the retry fails the same
+    way, the error surfaces, and later calls keep sending the param.
+    """
+    captured: list[dict[str, Any]] = []
+    adapter = _CapturingAdapter(
+        captured, side_effects=[_reasoning_effort_400(), _reasoning_effort_400(), None]
+    )
+    _patch_chat_path(monkeypatch, adapter, provider="xai", model="grok-new")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await Client().responses.create(
+            input=[{"role": "user", "content": "hi"}],
+            model="xai/grok-new",
+            reasoning={"effort": "low"},
+        )
+    assert len(captured) == 2, "expected optimistic send + one stripped retry"
+
+    # Nothing was learned — the next call still sends the param.
+    await Client().responses.create(
+        input=[{"role": "user", "content": "hi"}],
+        model="xai/grok-new",
+        reasoning={"effort": "low"},
+    )
+    assert captured[2].get("reasoning_effort") == "low"
+
+
+@pytest.mark.asyncio
 async def test_unrelated_400_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

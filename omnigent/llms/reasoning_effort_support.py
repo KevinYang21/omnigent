@@ -102,22 +102,22 @@ def record_reasoning_effort_rejection(provider: str, model: str) -> None:
 
 def strip_rejected_reasoning_effort(
     extra: dict[str, Any],
-    provider: str,
-    model: str,
     exc: Exception,
 ) -> dict[str, Any] | None:
     """Return a param-stripped copy of *extra* when the fallback applies.
 
+    Nothing is learned here: the caller records the rejection only
+    after the stripped retry is confirmed, so a 400 that merely looked
+    like a param rejection self-corrects instead of durably disabling
+    ``reasoning_effort`` for a model that supports it.
+
     :param extra: The Chat Completions extra-params dict that was sent.
-    :param provider: Provider identifier, e.g. ``"xai"``.
-    :param model: Model id without provider prefix.
     :param exc: The exception the provider call raised.
     :returns: A copy of *extra* without ``reasoning_effort`` when *exc*
         is the provider rejecting that parameter; ``None`` otherwise.
     """
     if "reasoning_effort" not in extra or not is_reasoning_effort_rejection(exc):
         return None
-    record_reasoning_effort_rejection(provider, model)
     return {k: v for k, v in extra.items() if k != "reasoning_effort"}
 
 

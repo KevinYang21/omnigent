@@ -25,6 +25,7 @@ from omnigent.llms.errors import (
 )
 from omnigent.llms.reasoning_effort_support import (
     accepts_reasoning_effort,
+    record_reasoning_effort_rejection,
     strip_rejected_reasoning_effort,
 )
 from omnigent.llms.routing import parse_model_string
@@ -100,9 +101,7 @@ async def _stream_with_reasoning_effort_fallback(
             yield chunk
         return
     except Exception as exc:
-        stripped = (
-            strip_rejected_reasoning_effort(extra, provider, model, exc) if not yielded else None
-        )
+        stripped = strip_rejected_reasoning_effort(extra, exc) if not yielded else None
         if stripped is None:
             raise
     retry_chunks = await adapter.chat_completions(
@@ -115,7 +114,15 @@ async def _stream_with_reasoning_effort_fallback(
         timeout=timeout,
     )
     assert not isinstance(retry_chunks, dict)
+    recorded = False
     async for chunk in retry_chunks:
+        if not recorded:
+            # The stripped retry opened cleanly (a stream-open 400 would
+            # have raised before the first chunk), so the rejection is
+            # real — learn it. A retry that fails learns nothing, so a
+            # 400 that merely looked like a param rejection self-corrects.
+            record_reasoning_effort_rejection(provider, model)
+            recorded = True
         yield chunk
 
 
@@ -331,7 +338,7 @@ class _ResponsesNamespace:
                 timeout=timeout,
             )
         except Exception as exc:
-            stripped = strip_rejected_reasoning_effort(extra, routed.provider, routed.model, exc)
+            stripped = strip_rejected_reasoning_effort(extra, exc)
             if stripped is None:
                 raise
             # One inline retry without the rejected param — a capability
@@ -346,6 +353,10 @@ class _ResponsesNamespace:
                 connection_params=connection_params,
                 timeout=timeout,
             )
+            # Learn the rejection only after the stripped retry succeeded,
+            # so a 400 that merely looked like a param rejection
+            # self-corrects instead of durably disabling the param.
+            record_reasoning_effort_rejection(routed.provider, routed.model)
         assert isinstance(result, dict)
         return chat_response_to_response(result)
 
