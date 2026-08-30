@@ -1223,10 +1223,11 @@ async def forward_claude_transcript_to_session(
                     ):
                         if not gate_engaged:
                             gate_engaged = True
+                            # The bridge dir names the session, so the id
+                            # itself stays out of the log line.
                             _logger.debug(
                                 "Claude transcript forwarder idle; skipping unchanged "
-                                "polls; session=%s bridge_dir=%s",
-                                session_id,
+                                "polls; bridge_dir=%s",
                                 bridge_dir,
                             )
                         await asyncio.sleep(poll_interval_s)
@@ -1234,8 +1235,7 @@ async def forward_claude_transcript_to_session(
                     if gate_engaged:
                         gate_engaged = False
                         _logger.debug(
-                            "Claude transcript forwarder resumed; session=%s bridge_dir=%s",
-                            session_id,
+                            "Claude transcript forwarder resumed; bridge_dir=%s",
                             bridge_dir,
                         )
                     last_full_poll_at = now
