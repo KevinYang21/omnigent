@@ -1989,6 +1989,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         return strip_nul_bytes(extract_search_text(item))
 
+    def get_item_by_source_id(
+        self,
+        conversation_id: str,
+        source_id: str,
+    ) -> ConversationItem | None:
+        """Return the durable item carrying one external producer identity."""
+        with self._conv_session("get_conversation_item_by_source_id") as session:
+            row = session.execute(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.source_id == source_id,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            data_json = self._decode_item_data_batch([row.data])[0]
+            return _to_item(row, data_json)
+
     def append(
         self,
         conversation_id: str,

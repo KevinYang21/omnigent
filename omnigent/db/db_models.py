@@ -947,6 +947,8 @@ class SqlConversationItem(ConversationBase):
             "workspace_id",
             "conversation_id",
             "source_id",
+            sqlite_where=text("source_id IS NOT NULL"),
+            postgresql_where=text("source_id IS NOT NULL"),
         ),
         # Latest-message previews scan one type per conversation ordered by
         # position DESC (list_latest_message_items_for_conversations). Ordering

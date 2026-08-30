@@ -371,6 +371,15 @@ def register_events_routes(
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
+    @router.get(
+        "/native-forwarder-capabilities",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def native_forwarder_capabilities() -> dict[str, bool]:
+        """Advertise retry semantics understood by this server build."""
+        return {"external_conversation_item_source_id_idempotency": True}
+
     def _has_runner_created_by_authority(request: Request, conv: Any) -> bool:
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token:

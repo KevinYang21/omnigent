@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import sqlalchemy as sa
 from sqlalchemy import Engine, create_engine, event, inspect, text
 
 if TYPE_CHECKING:
@@ -35,6 +36,14 @@ NamedManagedSessionMaker = Callable[[str], AbstractContextManager[Session]]
 # A zero-argument callable returning a fresh database password (e.g. a
 # short-lived Lakebase OAuth token). Invoked once per *new* DBAPI connection.
 LakebaseTokenProvider = Callable[[], str]
+
+_CONVERSATION_SCHEMA_METADATA = sa.MetaData()
+_CONVERSATION_SCHEMA_MIGRATIONS = sa.Table(
+    "omnigent_conversation_schema_migrations",
+    _CONVERSATION_SCHEMA_METADATA,
+    sa.Column("version", sa.Integer, primary_key=True),
+)
+_CONVERSATION_SCHEMA_SOURCE_ID_VERSION = 1
 
 
 # ── Lakebase token-aware connections ───────────────────
@@ -324,9 +333,10 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
     """
     Return a cached engine for the Agent Platform DB URI.
 
-    Unlike :func:`get_or_create_engine`, this does NOT run Alembic
-    migrations — the AP DB is expected to be a fresh database that
-    gets its tables created via ``ConversationBase.metadata.create_all()``.
+    Unlike :func:`get_or_create_engine`, this does not run the combined
+    Omnigent Alembic lineage, because a split AP database intentionally
+    contains only conversation tables. It does run the split schema's
+    own versioned upgrades after ``ConversationBase.metadata.create_all()``.
     For the common case where AP DB == Omnigent DB, callers should
     use :func:`get_or_create_engine` directly and share the engine.
 
@@ -346,12 +356,69 @@ def get_or_create_conversation_engine(conv_uri: str) -> Engine:
 
 
 def _ensure_conversation_tables(engine: Engine) -> None:
-    """Create AP tables (conversations, conversation_items, conversation_labels) if absent."""
+    """Create and upgrade the split Agent Platform conversation schema."""
     from omnigent.db.db_models import ConversationBase
 
     with query_name_scope("omnigent.database.ensure_conversation_schema"):
         ConversationBase.metadata.create_all(bind=engine, checkfirst=True)
+        _run_conversation_schema_upgrades(engine)
         ensure_fts_table(engine)
+
+
+def _run_conversation_schema_upgrades(engine: Engine) -> None:
+    """Apply idempotent, split-database-only schema upgrades in version order."""
+    _CONVERSATION_SCHEMA_METADATA.create_all(bind=engine, checkfirst=True)
+    with engine.connect() as connection:
+        applied = set(
+            connection.execute(sa.select(_CONVERSATION_SCHEMA_MIGRATIONS.c.version)).scalars()
+        )
+
+    if _CONVERSATION_SCHEMA_SOURCE_ID_VERSION not in applied:
+        _upgrade_split_conversation_source_id(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                sa.insert(_CONVERSATION_SCHEMA_MIGRATIONS).values(
+                    version=_CONVERSATION_SCHEMA_SOURCE_ID_VERSION
+                )
+            )
+
+
+def _upgrade_split_conversation_source_id(engine: Engine) -> None:
+    """Add the external-source identity column and lookup index when absent."""
+    columns = {column["name"] for column in inspect(engine).get_columns("conversation_items")}
+    if "source_id" not in columns:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE conversation_items ADD COLUMN source_id VARCHAR(512)"
+            )
+
+    indexes = {index["name"] for index in inspect(engine).get_indexes("conversation_items")}
+    if "ix_conversation_items_source_id" in indexes:
+        return
+    columns_sql = "(workspace_id, conversation_id, source_id)"
+    if engine.dialect.name == "postgresql":
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            invalid = connection.execute(
+                sa.text(
+                    "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                    "WHERE c.relname = :name AND NOT i.indisvalid"
+                ),
+                {"name": "ix_conversation_items_source_id"},
+            ).scalar()
+            if invalid:
+                connection.exec_driver_sql("DROP INDEX ix_conversation_items_source_id")
+            connection.exec_driver_sql(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                f"ix_conversation_items_source_id ON conversation_items {columns_sql} "
+                "WHERE source_id IS NOT NULL"
+            )
+        return
+    where = " WHERE source_id IS NOT NULL" if engine.dialect.name == "sqlite" else ""
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            f"CREATE INDEX ix_conversation_items_source_id "
+            f"ON conversation_items {columns_sql}{where}"
+        )
 
 
 def _set_alembic_database_url(config: Config, db_uri: str) -> None:
