@@ -58,22 +58,46 @@ def _response_json_object(response: httpx.Response) -> _JsonObject:
     return result
 
 
-def _input_response(verdict: pending_approvals.Verdict) -> _JsonObject:
+def _input_response(
+    verdict: pending_approvals.Verdict,
+    input_request: _JsonObject | None,
+) -> _JsonObject:
     """
     Build the MRTR ``inputResponses`` entry for one resolved elicitation.
 
     Carries the person's ``content`` when the prompt collected fields, so a
     server that asked "which environment?" is told which one rather than
-    only that someone said yes.
+    only that someone said yes. The content arrives from a browser, so it is
+    validated against the request's ``requestedSchema`` first — an answer
+    that does not fit (undeclared keys, wrong types, values outside an enum)
+    is not forwarded across the trust boundary; the entry declines rather
+    than smuggling unvalidated fields or substituting an answer nobody gave.
 
     :param verdict: The resolved verdict for this elicitation.
+    :param input_request: The ``inputRequests`` entry this verdict answers,
+        carrying ``params.requestedSchema``; ``None`` when unavailable.
     :returns: The wire object for this elicitation id.
     """
+    from omnigent.tools._elicitation_schema import validate_content_against_schema
+
     if not verdict.approved:
         return {"action": "decline"}
+    params = _json_object(input_request.get("params")) if input_request else None
+    schema = _json_object(params.get("requestedSchema")) if params else None
+    content = validate_content_against_schema(
+        verdict.content, cast("dict[str, object]", schema) if schema is not None else None
+    )
+    if content is None and verdict.content:
+        # An answer WAS given but does not conform — fail closed instead of
+        # forwarding it or letting the server act on a value nobody chose.
+        _logger.warning(
+            "MCP proxy elicitation answer does not conform to the "
+            "requestedSchema — declining instead of forwarding it"
+        )
+        return {"action": "decline"}
     response: _JsonObject = {"action": "accept"}
-    if verdict.content is not None:
-        response["content"] = cast(object, verdict.content)
+    if content is not None:
+        response["content"] = cast(object, content)
     return response
 
 
@@ -364,7 +388,9 @@ class ProxyMcpManager:
                         "arguments": arguments,
                         "requestState": request_state,
                         "inputResponses": {
-                            elicitation_id: _input_response(verdict),
+                            elicitation_id: _input_response(
+                                verdict, _json_object(input_requests.get(elicitation_id))
+                            ),
                         },
                     },
                 }

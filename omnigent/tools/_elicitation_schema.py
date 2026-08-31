@@ -10,6 +10,97 @@ from __future__ import annotations
 
 from typing import Any
 
+#: Content values MCP allows in an ``ElicitResult``.
+ElicitContent = dict[str, str | int | float | bool | list[str] | None]
+
+
+def _value_matches_property(value: object, prop: dict[str, Any]) -> bool:
+    """
+    Whether one answered value conforms to one ``requestedSchema`` property.
+
+    Checks the declared ``type``, ``enum`` membership, and ``oneOf`` consts.
+    A property with no declared type accepts any MCP-primitive value.
+
+    :param value: The answered value, e.g. ``"prod"``.
+    :param prop: The property schema, e.g. ``{"type": "string", "enum": [...]}``.
+    :returns: ``True`` when the value fits what the property declared.
+    """
+    if isinstance(value, list) and not all(isinstance(v, str) for v in value):
+        return False
+    if not isinstance(value, str | int | float | bool | list) and value is not None:
+        return False
+
+    prop_type = prop.get("type")
+    # ``bool`` is an ``int`` subclass in Python, so exclude it explicitly
+    # from the numeric types — a boolean is not an answer to a number.
+    if prop_type == "string" and not isinstance(value, str):
+        return False
+    if prop_type == "boolean" and not isinstance(value, bool):
+        return False
+    if prop_type == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
+        return False
+    if prop_type == "number" and (isinstance(value, bool) or not isinstance(value, int | float)):
+        return False
+    if prop_type == "array" and not isinstance(value, list):
+        return False
+
+    allowed = prop.get("enum")
+    if isinstance(allowed, list) and allowed:
+        # Direct membership covers scalars and enum-of-list members alike.
+        if value not in allowed:
+            # A list answer to an array-typed enum selects several members.
+            if not (
+                prop_type == "array"
+                and isinstance(value, list)
+                and all(v in allowed for v in value)
+            ):
+                return False
+
+    one_of = prop.get("oneOf")
+    if isinstance(one_of, list) and one_of:
+        consts = [o.get("const") for o in one_of if isinstance(o, dict) and "const" in o]
+        if consts and value not in consts:
+            return False
+    return True
+
+
+def validate_content_against_schema(
+    content: ElicitContent | None,
+    schema: dict[str, Any] | None,
+) -> ElicitContent | None:
+    """
+    Keep answered ``content`` only when it fits the ``requestedSchema``.
+
+    The resolve payload reaches the runner from a browser, so it is checked
+    rather than trusted: keys must be ones the schema named, values must be
+    the primitives MCP allows and match each property's declared type, an
+    enum must be answered with one of its own members, and every field the
+    schema marks ``required`` must be present. Anything else returns ``None``
+    so the caller can fail closed instead of putting a body on the wire that
+    the server's own schema rejects.
+
+    :param content: The content the person's verdict carried, or ``None``.
+    :param schema: The elicitation's ``requestedSchema``, or ``None``.
+    :returns: The content when it conforms, otherwise ``None``.
+    """
+    if not content:
+        return None
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict):
+        return None
+    for key, value in content.items():
+        prop = properties.get(key)
+        if not isinstance(prop, dict):
+            return None
+        if not _value_matches_property(value, prop):
+            return None
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if isinstance(required, list) and any(
+        isinstance(name, str) and name not in content for name in required
+    ):
+        return None
+    return content
+
 
 def build_accept_content_from_schema(
     schema: dict[str, Any],

@@ -267,21 +267,12 @@ async def test_the_runner_events_endpoint_carries_the_content() -> None:
         pending_approvals.cleanup(ELICIT_ID)
 
 
-async def test_an_unanswerable_schema_declines_rather_than_inventing() -> None:
-    """A free-form field nobody filled in must not become a bare accept.
-
-    ``build_accept_content_from_schema`` cannot guess a string, so the old
-    fallback produced ``accept`` with no content at all — an answer that
-    violates the very schema the server published. Declining is the outcome
-    the server already has a path for.
-    """
+async def _elicit_with_schema(schema: dict[str, Any], resolve: Any) -> Any:
+    """Drive the real inline callback against *schema*, resolving mid-park."""
     manager = RunnerMcpManager(server_client=cast(Any, _StubServerClient()))
     callback = manager._build_elicitation_callback()
     params = ElicitRequestFormParams(
-        message="Name the release branch",
-        requestedSchema=cast(
-            Any, {"type": "object", "properties": {"branch": {"type": "string"}}}
-        ),
+        message="Name the release branch", requestedSchema=cast(Any, schema)
     )
 
     task = asyncio.ensure_future(callback(SESSION, params))
@@ -289,22 +280,106 @@ async def test_an_unanswerable_schema_declines_rather_than_inventing() -> None:
         if ELICIT_ID in pending_approvals._pending:
             break
         await asyncio.sleep(0.001)
-    pending_approvals.resolve(ELICIT_ID, True)
-    result = await task
+    resolve()
+    return await task
+
+
+async def test_an_unanswerable_schema_declines_rather_than_inventing() -> None:
+    """A required free-form field nobody filled in must not become an accept.
+
+    ``build_accept_content_from_schema`` cannot guess a string, so the old
+    fallback produced ``accept`` with no content at all — an answer that
+    violates the very schema the server published. Declining is the outcome
+    the server already has a path for.
+    """
+    result = await _elicit_with_schema(
+        {
+            "type": "object",
+            "properties": {"branch": {"type": "string"}},
+            "required": ["branch"],
+        },
+        lambda: pending_approvals.resolve(ELICIT_ID, True),
+    )
 
     assert result.action == "decline"
 
 
-async def test_an_answer_outside_the_enum_is_not_forwarded() -> None:
+async def test_optional_fields_still_accept_without_an_answer() -> None:
+    """A schema whose fields are all optional legally accepts no content.
+
+    Only a ``required`` list makes an empty accept malformed — converting an
+    optional-field consent into a decline would invert the person's answer.
+    """
+    result = await _elicit_with_schema(
+        {"type": "object", "properties": {"note": {"type": "string"}}},
+        lambda: pending_approvals.resolve(ELICIT_ID, True),
+    )
+
+    assert result.action == "accept"
+
+
+async def test_an_answer_outside_the_enum_declines_rather_than_substituting() -> None:
     """Content arrives from a browser, so it is checked, not trusted.
 
-    A value the schema never offered would make the server act on something
-    it declared impossible; falling back keeps the wire body inside the
-    contract the server published.
+    A value the schema never offered must not reach the server — and
+    substituting a schema guess would repeat the original bug (the server
+    acting on a value nobody chose), so the accept fails closed instead.
     """
     result = await _elicit_with(
         lambda: pending_approvals.resolve(ELICIT_ID, True, {"answer": "production"})
     )
 
-    assert result.action == "accept"
-    assert result.content == build_accept_content_from_schema(ENV_SCHEMA)
+    assert result.action == "decline"
+
+
+async def test_a_wrongly_typed_answer_declines_rather_than_substituting() -> None:
+    """A numeric answer to a string field fails closed, not into a guess."""
+    result = await _elicit_with(lambda: pending_approvals.resolve(ELICIT_ID, True, {"answer": 1}))
+
+    assert result.action == "decline"
+
+
+# ── Proxy (MRTR) path ────────────────────────────────────────────────────────
+
+
+def _mrtr_request(schema: dict[str, Any] | None) -> dict[str, Any]:
+    """Build an ``inputRequests`` entry like the Omnigent server sends."""
+    params: dict[str, Any] = {"message": "Which environment?", "mode": "form"}
+    if schema is not None:
+        params["requestedSchema"] = schema
+    return {"method": "elicitation/create", "params": params}
+
+
+def test_proxy_input_response_carries_the_conforming_answer() -> None:
+    """The MRTR retry forwards the person's answer when it fits the schema."""
+    from omnigent.runner.proxy_mcp_manager import _input_response
+
+    verdict = pending_approvals.Verdict(approved=True, content={"answer": "prod"})
+
+    entry = _input_response(verdict, _mrtr_request(ENV_SCHEMA))
+
+    assert entry == {"action": "accept", "content": {"answer": "prod"}}
+
+
+def test_proxy_input_response_declines_a_nonconforming_answer() -> None:
+    """Browser content that fails schema validation never crosses the wire."""
+    from omnigent.runner.proxy_mcp_manager import _input_response
+
+    verdict = pending_approvals.Verdict(
+        approved=True, content={"answer": "prod", "extra": "smuggled"}
+    )
+
+    entry = _input_response(verdict, _mrtr_request(ENV_SCHEMA))
+
+    assert entry == {"action": "decline"}
+
+
+def test_proxy_input_response_bare_accept_and_decline() -> None:
+    """No content means a bare accept; a refusal is a decline either way."""
+    from omnigent.runner.proxy_mcp_manager import _input_response
+
+    accept = _input_response(pending_approvals.Verdict(approved=True), _mrtr_request(ENV_SCHEMA))
+    decline = _input_response(pending_approvals.Verdict(approved=False), _mrtr_request(ENV_SCHEMA))
+
+    assert accept == {"action": "accept"}
+    assert decline == {"action": "decline"}
