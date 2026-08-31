@@ -3045,10 +3045,13 @@ def _redact_hook_failure_secrets(text: str) -> str:
 # The contract is NOT newline/space parity: a hard newline is a prose
 # boundary by design (``Bearer\nabcdefghijk`` is pinned as preserved), and
 # this pass overrides the boundary only for content too credential-shaped
-# to be prose. Digit-bearing runs use the low floor (prose words rarely mix
-# digits); all-letter runs must exceed plausible prose word length. Short
-# all-letter values after a broken anchor are the accepted residual, same
-# as the pinned prose decision.
+# to be prose. The floors apply solely to the ``bearer`` anchor's value —
+# the one anchor that is itself a prose word, where the collapsed scanner
+# over-absorbs ordinary text. A span carrying its own anchor (``sk-``,
+# ``ghp_``, ``dapi``, …) or sitting as the single-token value of a keyed
+# anchor is a positive identification and redacts at any length. Digit-
+# bearing runs use the low floor (prose words rarely mix digits);
+# all-letter runs must exceed plausible prose word length.
 _HOOK_FAILURE_CROSS_LINE_DIGIT_RUN_FLOOR = 6
 _HOOK_FAILURE_CROSS_LINE_ALPHA_RUN_FLOOR = 16
 
@@ -3125,6 +3128,49 @@ def _has_cross_line_credential_run(
     return False
 
 
+def _word_before(text: str, position: int) -> str:
+    """Return the whitespace-delimited word ending just before *position*."""
+    index = position
+    while index > 0 and (text[index - 1].isspace() or text[index - 1] == "\n"):
+        index -= 1
+    word_end = index
+    while index > 0 and not text[index - 1].isspace():
+        index -= 1
+    return text[index:word_end]
+
+
+def _cross_line_span_leaks(
+    canonical: str,
+    start: int,
+    end: int,
+    covered: list[tuple[int, int]],
+) -> bool:
+    """Whether a collapsed-scan removal at ``canonical[start:end]`` is a leak.
+
+    The prose-shape floors exist for the ``bearer`` anchor only — it is
+    itself a prose word, so its collapsed value absorbs ordinary text. Every
+    other removal is anchored by non-prose (``sk-``, ``ghp_``,
+    ``Authorization:``, keyed env names): a single-token value there, or a
+    span that redacts standalone, is a positive identification at any length.
+    """
+    uncovered = "".join(
+        canonical[index]
+        for index in range(start, end)
+        if not any(span_start <= index < span_end for span_start, span_end in covered)
+    )
+    if not any(char.isascii() and char.isalnum() for char in uncovered):
+        return False
+    if _word_before(canonical, start).casefold() == "bearer":
+        return _has_cross_line_credential_run(canonical, start, end, covered)
+    flattened = uncovered.replace("\r", "").replace("\n", "").strip()
+    if flattened and " " not in flattened:
+        return True
+    spaced = uncovered.replace("\n", " ")
+    if _redact_hook_failure_secrets(spaced) != spaced:
+        return True
+    return _has_cross_line_credential_run(canonical, start, end, covered)
+
+
 def _redact_cross_line_credentials(canonical: str, redacted: str) -> str:
     """
     Contain credentials that a hard line break splits past the per-line pass.
@@ -3153,7 +3199,7 @@ def _redact_cross_line_credentials(canonical: str, redacted: str) -> str:
     leaked = [
         (start, end)
         for start, end in collapsed_spans
-        if _has_cross_line_credential_run(canonical, start, end, per_line_spans)
+        if _cross_line_span_leaks(canonical, start, end, per_line_spans)
     ]
     if not leaked:
         return redacted

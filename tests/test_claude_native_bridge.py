@@ -7754,14 +7754,14 @@ def test_sanitize_hook_failure_detail_contains_short_keyed_cross_line_values(
 
 
 def test_sanitize_hook_failure_detail_treats_short_letter_words_after_newline_as_prose() -> None:
-    """A short all-letter word after a newline-split anchor stays, by design.
+    """A short all-letter word after a newline-split ``Bearer`` stays, by design.
 
-    A hard newline is a prose boundary: ``Bearer`` ending one line followed
-    by an ordinary word is how provider prose looks, and redacting every such
-    word would destroy benign detail (the canonicalizes-before-redaction
-    cases pin the same decision). The accepted residual is that an all-letter
-    value under the prose-word ceiling survives the split; every anchored
-    credential family the scanners target is longer or digit-bearing.
+    ``Bearer`` is the one anchor that is itself a prose word, so a hard
+    newline after it is a prose boundary: redacting every following word
+    would destroy benign detail (the canonicalizes-before-redaction cases
+    pin the same decision). The accepted residual is an all-letter value
+    under the prose-word ceiling after a lone ``Bearer`` line — every other
+    anchor is non-prose and redacts its split value at any length.
     """
     assert _sanitize_hook_failure_detail("Bearer\nabcdef") == "Bearer\nabcdef"
     assert (
@@ -7773,6 +7773,31 @@ def test_sanitize_hook_failure_detail_treats_short_letter_words_after_newline_as
     detail = _sanitize_hook_failure_detail(f"Bearer\n{long_letters}")
     assert detail is not None
     assert long_letters not in detail
+
+
+@pytest.mark.parametrize(
+    ("raw", "leak"),
+    [
+        ("sk-\nabcdefghij", "abcdefghij"),
+        ("dapi\nabcdefghij", "abcdefghij"),
+        ("Authorization:\n12345", "12345"),
+        ("Authorization:\nabcde", "abcde"),
+    ],
+    ids=["sk-letters", "dapi-letters", "keyed-short-digits", "keyed-short-letters"],
+)
+def test_sanitize_hook_failure_detail_redacts_split_values_of_non_prose_anchors(
+    raw: str, leak: str
+) -> None:
+    """A non-prose anchor's newline-split value redacts at any length.
+
+    Fixed-prefix families (``sk-``, ``dapi``) accept short all-letter
+    bodies, and keyed anchors accept any nonzero value — the prose-shape
+    floors are only for the ``bearer`` anchor, so no length games across a
+    newline can save a value that a positive anchor identification covers.
+    """
+    detail = _sanitize_hook_failure_detail(raw)
+    assert detail is not None
+    assert leak not in detail, f"split anchored value survived: {detail!r}"
 
 
 def test_sanitize_hook_failure_detail_never_reintroduces_redacted_bytes() -> None:
