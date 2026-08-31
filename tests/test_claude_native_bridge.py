@@ -7743,14 +7743,36 @@ def test_sanitize_hook_failure_detail_keeps_benign_multiline_line_breaks() -> No
 def test_sanitize_hook_failure_detail_contains_short_keyed_cross_line_values(
     raw: str, leak: str
 ) -> None:
-    """A short keyed value pushed onto the next line still redacts.
+    """A short digit-bearing keyed value pushed onto the next line redacts.
 
-    Keyed anchors (``Bearer``, ``Authorization``) treat any nonzero value as
-    sensitive, so the cross-line pass cannot demand a long run before acting.
+    Mixed alphanumerics are credential-shaped even when short — prose words
+    rarely mix digits — so the cross-line pass acts on them at a low floor.
     """
     detail = _sanitize_hook_failure_detail(raw)
     assert detail is not None
     assert leak not in detail, f"short keyed value survived: {detail!r}"
+
+
+def test_sanitize_hook_failure_detail_treats_short_letter_words_after_newline_as_prose() -> None:
+    """A short all-letter word after a newline-split anchor stays, by design.
+
+    A hard newline is a prose boundary: ``Bearer`` ending one line followed
+    by an ordinary word is how provider prose looks, and redacting every such
+    word would destroy benign detail (the canonicalizes-before-redaction
+    cases pin the same decision). The accepted residual is that an all-letter
+    value under the prose-word ceiling survives the split; every anchored
+    credential family the scanners target is longer or digit-bearing.
+    """
+    assert _sanitize_hook_failure_detail("Bearer\nabcdef") == "Bearer\nabcdef"
+    assert (
+        _sanitize_hook_failure_detail("Bearer\nauthentication failed")
+        == "Bearer\nauthentication failed"
+    )
+    # The ceiling: an all-letter run past plausible prose word length redacts.
+    long_letters = "abcdefghijklmnopqrstuvwxyz"
+    detail = _sanitize_hook_failure_detail(f"Bearer\n{long_letters}")
+    assert detail is not None
+    assert long_letters not in detail
 
 
 def test_sanitize_hook_failure_detail_never_reintroduces_redacted_bytes() -> None:

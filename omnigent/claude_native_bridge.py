@@ -3042,11 +3042,13 @@ def _redact_hook_failure_secrets(text: str) -> str:
 
 
 # Floors for the cross-line pass to call an uncovered run a credential.
-# Digit-bearing runs use the low floor: mixed alphanumerics are
-# credential-shaped, and prose words the collapsed scanner over-absorbs
-# ("FinalCause", "configuration") carry no digits. All-letter runs use the
-# high floor so ordinary long words survive while letter-only secrets past
-# any plausible prose word length are still contained.
+# The contract is NOT newline/space parity: a hard newline is a prose
+# boundary by design (``Bearer\nabcdefghijk`` is pinned as preserved), and
+# this pass overrides the boundary only for content too credential-shaped
+# to be prose. Digit-bearing runs use the low floor (prose words rarely mix
+# digits); all-letter runs must exceed plausible prose word length. Short
+# all-letter values after a broken anchor are the accepted residual, same
+# as the pinned prose decision.
 _HOOK_FAILURE_CROSS_LINE_DIGIT_RUN_FLOOR = 6
 _HOOK_FAILURE_CROSS_LINE_ALPHA_RUN_FLOOR = 16
 
