@@ -1288,6 +1288,106 @@ def seeded_session(
                 respawned_runner.wait(timeout=5)
 
 
+@pytest.fixture
+def long_seeded_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """Like :func:`seeded_session` but with >100 committed items pre-seeded.
+
+    Guarantees ``has_more=True`` on the SPA's initial window fetch
+    (``INITIAL_WINDOW_ITEMS = 100``) by writing all items in a **single**
+    bulk ``append`` call **before** the runner is bound to the session.
+
+    Seeding before binding is essential: if items are written after the
+    runner binds, the runner's polling loop sees them as new events and
+    triggers a spurious recovery turn that races with the real dispatch,
+    causing a harness error.  Seeding before binding means the runner
+    loads them as static history during its first ``_load_history_as_input``
+    call (last item = assistant → no recovery turn), so the user message
+    arrives as the clean next item and only one turn runs.
+
+    :param live_server: Spawned server fixture.
+    :param tmp_path_factory: Pytest temp path factory.
+    :returns: ``(base_url, session_id)``.  The session has 110 committed
+        items (55 user+assistant turns) so the initial window fetch returns
+        ``has_more=True``.
+    """
+    import json as _json
+
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    bundle = _build_hello_world_bundle()
+
+    # 1. Create the session WITHOUT binding the runner.
+    create_resp = httpx.post(
+        f"{live_server}/v1/sessions",
+        data={"metadata": _json.dumps({})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        timeout=30.0,
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+
+    # 2. Seed 55 turns (110 items) in a single append so the DB write is
+    #    atomic and fast.  55 × 2 = 110 items > INITIAL_WINDOW_ITEMS = 100.
+    items: list[NewConversationItem] = []
+    for i in range(55):
+        rid = f"resp_seeded_{i:04d}"
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=rid,
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"seeded prompt {i}"}],
+                ),
+            )
+        )
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=rid,
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": f"seeded reply {i}"}],
+                    agent="hello_world",
+                ),
+            )
+        )
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "long_seeded_session needs the spawned server's database; "
+            "it is unavailable when running against --ui-base-url."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).append(session_id, items)
+
+    # 3. Bind to runner NOW — runner loads all 110 items as static history.
+    httpx.patch(
+        f"{live_server}/v1/sessions/{session_id}",
+        json={"runner_id": runner_id},
+        timeout=10.0,
+    ).raise_for_status()
+
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
+
+
 def _create_runner_bound_session(base_url: str, runner_id: str) -> str:
     """Create a hello_world session and PATCH-bind it to ``runner_id``.
 
