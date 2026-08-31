@@ -6,6 +6,7 @@ from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     NON_CONTENT_ITEM_TYPES,
+    UNTITLED_CONVERSATION_SENTINEL,
     USER_SESSION_TITLE_MAX_CHARS,
     CompactionData,
     Conversation,
@@ -44,6 +45,7 @@ __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
     "DEFAULT_GENERATED_TITLE_MAX_CHARS",
     "NON_CONTENT_ITEM_TYPES",
+    "UNTITLED_CONVERSATION_SENTINEL",
     "USER_SESSION_TITLE_MAX_CHARS",
     "Account",
     "AccountToken",

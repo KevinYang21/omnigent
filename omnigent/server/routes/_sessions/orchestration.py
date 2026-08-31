@@ -108,6 +108,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_title_content,
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
@@ -289,6 +290,7 @@ from omnigent.server.routes._sessions.helpers import (
     _resource_event_item_from_sse,
     _routing_decision_item_from_sse,
     _RunnerForwardResult,
+    _seed_missing_title,
     _seed_missing_title_from_user_message,
     _session_status_from_cache,
     _session_status_with_child_rollup,
@@ -5757,6 +5759,17 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
+        # Seed the deterministic title here, not on the transcript round-trip.
+        # This path is the single-writer bypass: nothing persists the message
+        # in-request, so an untitled native session would keep rendering its
+        # harness fallback ("Claude Code" / "Codex") for the whole first turn,
+        # and the background titler — which waits for this seed before it will
+        # rename anything — could time out and never name the session at all.
+        await _seed_missing_title(
+            conv,
+            background_title_content(body),
+            conversation_store,
+        )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
         session_id,
