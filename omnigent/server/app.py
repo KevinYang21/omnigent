@@ -2291,6 +2291,7 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            project_store=project_store,
             host_registry=host_registry,
             host_store=host_store,
         ),

@@ -2713,19 +2713,27 @@ conversationRegistry.subscribe((id) => {
 type NativeModelFamily = "claude" | "codex";
 
 /**
- * Resolve the native model family from a session wrapper label.
+ * Resolve the native model family from a session snapshot.
+ *
+ * The wrapper label is authoritative. Custom YAML agents carry no
+ * presentation label, so for label-less sessions the resolved harness is the
+ * fallback — mirroring the composer capability gates, so a custom
+ * codex-native session keeps its reported model in the composer label.
  *
  * :param session: Session snapshot from the API.
- * :returns: ``"claude"`` / ``"codex"`` for native wrappers, else ``null``.
+ * :returns: ``"claude"`` / ``"codex"`` for native sessions, else ``null``.
  */
-function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeModelFamily | null {
-  switch (session.labels?.["omnigent.wrapper"]) {
+function nativeModelFamilyForSession(
+  session: Pick<Session, "labels" | "harness">,
+): NativeModelFamily | null {
+  const wrapper = session.labels?.["omnigent.wrapper"];
+  switch (wrapper) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
       return "codex";
     default:
-      return null;
+      return wrapper == null && session.harness === "codex-native" ? "codex" : null;
   }
 }
 
