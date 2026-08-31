@@ -24,6 +24,21 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
         command.downgrade(config, revision)
 
 
+def test_migration_graph_has_a_single_head(tmp_path: Path) -> None:
+    """Adding the elicitations migration must not fork the revision graph.
+
+    A second head makes ``alembic upgrade head`` fail with "multiple heads",
+    which silently skips creating the table on a real deploy — disabling
+    restart survival entirely while every unit test still passes.
+    """
+    from alembic.script import ScriptDirectory
+
+    uri = f"sqlite:///{tmp_path / 'heads.db'}"
+    script = ScriptDirectory.from_config(_build_alembic_config(uri))
+
+    assert len(script.get_heads()) == 1
+
+
 def test_upgrade_creates_the_table_and_its_index(tmp_path: Path) -> None:
     """The table and the one read path's index both land."""
     uri = f"sqlite:///{tmp_path / 'elicitations.db'}"
@@ -69,6 +84,6 @@ def test_downgrade_drops_the_table(tmp_path: Path) -> None:
             {"conv": bytes(16), "event": b"{}"},
         )
 
-    _downgrade(uri, engine, "za1b2c3d4e5f")
+    _downgrade(uri, engine, "e5d9bc8ac650")
 
     assert "elicitations" not in sa.inspect(engine).get_table_names()

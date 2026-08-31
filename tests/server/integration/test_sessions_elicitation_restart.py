@@ -159,3 +159,49 @@ async def test_the_standalone_approval_page_survives_a_restart(
         assert resp.json()["status"] == "pending"
     finally:
         hook_task.cancel()
+
+
+async def test_ancestor_snapshot_replays_a_child_prompt_after_the_index_is_lost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A sub-agent's parked approval is answerable from the parent after a restart.
+
+    A child's prompt mirrors into the ancestor's chat while everything is
+    live. After a restart the index is cold *everywhere*, so the cheap
+    "anything pending anywhere?" gate that protects the descendant walk sees
+    nothing — and without a gate-free first walk, the parent's cold load
+    would render no card for a child approval whose durable row is genuinely
+    parked.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.elicitation_store.sqlalchemy_store import (
+        SqlAlchemyElicitationStore,
+    )
+    from tests.server.integration.test_sessions_elicitation_resolve_url import (
+        _claude_permission_payload,
+        _create_child_session,
+        _park_permission_hook_on,
+    )
+
+    agent = await create_test_agent(client, "test-elicitation-restart-ancestor")
+    parent_id = await _create_session(client, agent["id"])
+    child_id = _create_child_session(db_uri, parent_id=parent_id, agent_id=agent["id"])
+    hook_task, mirrored = await _park_permission_hook_on(
+        client,
+        child_id,
+        parent_id,
+        payload=_claude_permission_payload("Bash"),
+    )
+    elicitation_id = mirrored["elicitation_id"]
+
+    try:
+        assert await _pending_ids(client, parent_id) == [elicitation_id]
+
+        # The restart: index cold for parent and child alike; rows survive.
+        pending_elicitations.reset_for_tests()
+        pending_elicitations.set_store(SqlAlchemyElicitationStore(db_uri))
+
+        assert await _pending_ids(client, parent_id) == [elicitation_id]
+    finally:
+        hook_task.cancel()

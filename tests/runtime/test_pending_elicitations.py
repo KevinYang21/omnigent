@@ -964,3 +964,98 @@ def test_an_ancestor_mirror_does_not_steal_the_child_row() -> None:
     # The ancestor still renders it — the index tracks mirrors, only the
     # durable row is owner-only.
     assert pending_elicitations.count_for("conv_parent") == 1
+
+
+def test_a_failed_delete_does_not_resurrect_the_prompt_on_restore() -> None:
+    """A verdict whose row delete failed must stay answered.
+
+    The in-memory index drops the prompt either way, so if the orphaned row
+    were restored, the user would be shown a card for a question already
+    answered — whose awaiter no longer exists.
+    """
+
+    class _DeleteDownStore(_FakeStore):
+        fail_on_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return super().delete(conversation_id, elicitation_id)
+
+    store = _DeleteDownStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    assert "elicit_1" in store.rows  # the orphan this test is about
+
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert restored == []
+    assert pending_elicitations.count_for("conv_a") == 0
+
+
+def test_a_failed_delete_is_retried_on_the_next_store_call() -> None:
+    """A transient outage must not leave answered rows until the next restart."""
+
+    class _DeleteDownStore(_FakeStore):
+        fail_on_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            self.calls.append(f"delete:{elicitation_id}")
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return self.rows.pop(elicitation_id, None) is not None
+
+    store = _DeleteDownStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    assert "elicit_1" in store.rows
+
+    # The store recovers; the next successful call sweeps the orphan.
+    store.fail_on_delete = False
+    pending_elicitations.resolve("conv_a", "elicit_other")
+
+    assert "elicit_1" not in store.rows
+
+
+def test_a_republished_id_is_restorable_again_after_its_resolve() -> None:
+    """Deterministic harness ids repeat across turns.
+
+    Resolving turn one's prompt must not tombstone turn two's re-publish of
+    the same id out of restart survival.
+    """
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+    pending_elicitations.resolve("conv_a", "elicit_1")
+
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn two"))
+
+    # Restart: index gone, rows kept.
+    rows = dict(store.rows)
+    pending_elicitations.reset_for_tests()
+    store.rows = rows
+    pending_elicitations.set_store(store)
+
+    restored = pending_elicitations.restore_for("conv_a")
+
+    assert [event["params"]["message"] for event in restored] == ["turn two"]
+
+
+def test_descendant_restore_claim_is_granted_once_per_conversation() -> None:
+    """The gate-free descendant walk must stay bounded per process."""
+    pending_elicitations.set_store(_FakeStore())
+
+    assert pending_elicitations.claim_descendant_restore("conv_a") is True
+    assert pending_elicitations.claim_descendant_restore("conv_a") is False
+    assert pending_elicitations.claim_descendant_restore("conv_b") is True
+
+
+def test_descendant_restore_claim_needs_a_store() -> None:
+    """Without durable rows there is nothing a walk could restore."""
+    assert pending_elicitations.claim_descendant_restore("conv_a") is False

@@ -137,6 +137,22 @@ _store: ElicitationStore | None = None
 # after which the index is authoritative for the rest of the process's life.
 _restored: set[str] = set()
 
+# Conversations whose descendant walk has already been granted once by
+# :func:`claim_descendant_restore`. Same one-per-process bound as ``_restored``,
+# for the ancestor-snapshot path that must look below itself after a restart.
+_descendants_probed: set[str] = set()
+
+# Prompts this process has resolved. :func:`restore_for` must never re-surface
+# one: its durable row can outlive the verdict (a delete that failed, or a
+# store read racing the delete), and replaying it would ask an answered
+# question again — the exact defect the mirror exists to prevent.
+_resolved_tombstones: set[tuple[str, str]] = set()
+
+# Deletes that failed and still have a durable row to collect. Retried on
+# later store activity so a transient outage does not leave answered prompts
+# behind to resurrect on the next restart.
+_failed_deletes: set[tuple[str, str]] = set()
+
 
 def set_store(store: ElicitationStore | None) -> None:
     """
@@ -149,6 +165,7 @@ def set_store(store: ElicitationStore | None) -> None:
     _store = store
     with _lock:
         _restored.clear()
+        _descendants_probed.clear()
 
 
 def _owns_elicitation(conversation_id: str, event: dict[str, Any]) -> bool:
@@ -216,6 +233,8 @@ def _persist_add(conversation_id: str, elicitation_id: str, event: dict[str, Any
             elicitation_id,
             exc_info=True,
         )
+        return
+    _retry_failed_deletes(store)
 
 
 def _persist_remove(conversation_id: str, elicitation_id: str) -> None:
@@ -236,11 +255,39 @@ def _persist_remove(conversation_id: str, elicitation_id: str) -> None:
     try:
         store.delete(conversation_id, elicitation_id)
     except Exception:  # never block resolving the prompt
+        # Remember the orphaned row: a restore must not replay it (the
+        # tombstone in :func:`resolve` covers that) and a later successful
+        # store call retries the delete so the row does not sit until the
+        # next restart resurrects it.
+        with _lock:
+            _failed_deletes.add((conversation_id, elicitation_id))
         _logger.warning(
             "Could not delete resolved elicitation %r",
             elicitation_id,
             exc_info=True,
         )
+        return
+    _retry_failed_deletes(store)
+
+
+def _retry_failed_deletes(store: ElicitationStore) -> None:
+    """
+    Retry deletes that failed earlier, now that the store answered a call.
+
+    Stops at the first failure — the store is presumably down again and the
+    remaining entries keep their retry claim.
+
+    :param store: The store that just served a successful call.
+    """
+    with _lock:
+        retry = list(_failed_deletes)
+    for conv_id, elicit_id in retry:
+        try:
+            store.delete(conv_id, elicit_id)
+        except Exception:
+            return
+        with _lock:
+            _failed_deletes.discard((conv_id, elicit_id))
 
 
 def restore_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -298,10 +345,38 @@ def restore_for(conversation_id: str) -> list[dict[str, Any]]:
     if not rows:
         return []
     with _lock:
+        live = [row for row in rows if (conversation_id, row.id) not in _resolved_tombstones]
+        if not live:
+            return []
         ids = _pending.setdefault(conversation_id, {})
-        for row in rows:
+        for row in live:
             ids.setdefault(row.id, row.event)
         return [copy.deepcopy(event) for event in ids.values()]
+
+
+def claim_descendant_restore(conversation_id: str) -> bool:
+    """
+    Claim the one-per-process descendant restore for an ancestor snapshot.
+
+    After a restart the in-memory index is empty everywhere, so the cheap
+    "anything pending anywhere?" pre-check that gates the descendant walk in
+    ``GET /v1/sessions/{id}`` reports nothing — including for a child whose
+    durable row is genuinely parked. The first snapshot of each ancestor per
+    process therefore gets one walk regardless of that gate, letting
+    :func:`restore_for` on each child pull its rows back. Subsequent
+    snapshots return ``False`` and fall back to the in-memory gate.
+
+    :param conversation_id: Ancestor session being snapshotted.
+    :returns: ``True`` exactly once per conversation per process, and only
+        when a store is wired (without one there is nothing to restore).
+    """
+    if _store is None:
+        return False
+    with _lock:
+        if conversation_id in _descendants_probed:
+            return False
+        _descendants_probed.add(conversation_id)
+        return True
 
 
 def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
@@ -348,6 +423,9 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         if _owns_elicitation(conversation_id, event):
             _persist_add(conversation_id, elicitation_id, event)
         with _lock:
+            # A fresh publish reopens the id: deterministic harness ids repeat
+            # across turns, and the new question must be restorable again.
+            _resolved_tombstones.discard((conversation_id, elicitation_id))
             ids = _pending.setdefault(conversation_id, {})
             ids[elicitation_id] = event
             count = len(ids)
@@ -404,6 +482,10 @@ def resolve(conversation_id: str, elicitation_id: str) -> None:
     :param elicitation_id: The elicitation correlation id from the
         approval payload, e.g. ``"elicit_abc123"``.
     """
+    # Tombstone first: an in-flight restore that already read this row must
+    # not re-insert an answered prompt after we drop it below.
+    with _lock:
+        _resolved_tombstones.add((conversation_id, elicitation_id))
     # Unconditional, and before the index drop: this call may be the second
     # resolve for an id the index already forgot (the runner publishes a
     # resolved event on every exit path), and the row must go either way.
@@ -587,5 +669,8 @@ def reset_for_tests() -> None:
     with _lock:
         _pending.clear()
         _restored.clear()
+        _descendants_probed.clear()
+        _resolved_tombstones.clear()
+        _failed_deletes.clear()
     _observer = None
     _store = None

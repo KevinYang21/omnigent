@@ -1524,7 +1524,12 @@ def _pending_elicitation_snapshot_for_session(
     events = pending_elicitations.snapshot_for(conv.id)
     if not events:
         events = pending_elicitations.restore_for(conv.id)
-    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
+    # After a restart the index is cold for every session, so the cheap
+    # "anything pending anywhere?" gate below would also hide a child's
+    # durably-parked prompt from its ancestor. Each ancestor gets one
+    # gate-free walk per process so the children's rows can be restored.
+    walk_for_restore = pending_elicitations.claim_descendant_restore(conv.id)
+    if not walk_for_restore and not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
         return events
     seen = {
         event.get("elicitation_id")
@@ -1532,7 +1537,10 @@ def _pending_elicitation_snapshot_for_session(
         if isinstance(event.get("elicitation_id"), str)
     }
     for child in _descendant_sessions(conv_store, conv.id):
-        for event in pending_elicitations.snapshot_for(child.id):
+        child_events = pending_elicitations.snapshot_for(child.id)
+        if not child_events and walk_for_restore:
+            child_events = pending_elicitations.restore_for(child.id)
+        for event in child_events:
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
                 continue
