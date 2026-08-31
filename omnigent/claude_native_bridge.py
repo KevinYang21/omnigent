@@ -3041,6 +3041,122 @@ def _redact_hook_failure_secrets(text: str) -> str:
     )
 
 
+# Minimum newline-bridged alphanumeric run for the cross-line pass to call a
+# span a credential. Prose the collapsed scanner over-absorbs ("FinalCause",
+# "Next-Line: ok") stays under it; real secrets (20+ chars) clear it.
+_HOOK_FAILURE_CROSS_LINE_RUN_FLOOR = 12
+
+
+def _removed_credential_spans(original: str, redacted: str) -> list[tuple[int, int]] | None:
+    """Map each redaction marker in *redacted* back to its span in *original*.
+
+    :param original: Text before :func:`_redact_hook_failure_secrets`.
+    :param redacted: The same text after redaction.
+    :returns: ``(start, end)`` spans into *original*, or ``None`` when the
+        surviving fragments cannot be aligned unambiguously.
+    """
+    fragments = redacted.split(_HOOK_FAILURE_REDACTION_MARKER)
+    if len(fragments) == 1:
+        return []
+    if not original.startswith(fragments[0]):
+        return None
+    spans: list[tuple[int, int]] = []
+    position = len(fragments[0])
+    for index, fragment in enumerate(fragments[1:], start=1):
+        if not fragment:
+            if index == len(fragments) - 1:
+                spans.append((position, len(original)))
+                position = len(original)
+            continue
+        found = original.find(fragment, position)
+        if found == -1:
+            return None
+        spans.append((position, found))
+        position = found + len(fragment)
+    return spans
+
+
+def _has_cross_line_credential_run(
+    canonical: str,
+    start: int,
+    end: int,
+    covered: list[tuple[int, int]],
+) -> bool:
+    """Whether ``canonical[start:end]`` holds an uncovered credential-length run.
+
+    Counts alphanumeric characters not inside any *covered* span; a newline
+    joins a run (the split this pass exists to catch) while every other
+    non-alphanumeric character breaks it, so multi-word prose never reaches
+    the floor.
+    """
+    run = 0
+    for index in range(start, end):
+        char = canonical[index]
+        if char == "\n":
+            continue
+        if char.isascii() and char.isalnum() and not any(
+            span_start <= index < span_end for span_start, span_end in covered
+        ):
+            run += 1
+            if run >= _HOOK_FAILURE_CROSS_LINE_RUN_FLOOR:
+                return True
+            continue
+        run = 0
+    return False
+
+
+def _redact_cross_line_credentials(canonical: str, redacted: str) -> str:
+    """
+    Contain credentials that a hard line break splits past the per-line pass.
+
+    The credential scanners deliberately stop at newlines so multi-line prose
+    keeps its shape, but the hook payload is provider-controlled: one secret
+    can be presented as two lines, each half below the scanners' floors, or a
+    value can be pushed onto the line after its anchor. The text is re-scanned
+    with newlines collapsed to spaces (positions preserved), and any span that
+    collapsed scan removes which still holds an unredacted newline-bridged
+    credential-length run is redacted in place — trading that span's line
+    breaks for containment while every other line keeps its structure.
+    """
+    if "\n" not in canonical:
+        return redacted
+    collapsed = canonical.replace("\n", " ")
+    collapsed_redacted = _redact_hook_failure_secrets(collapsed)
+    if collapsed_redacted == collapsed:
+        return redacted
+    collapsed_spans = _removed_credential_spans(collapsed, collapsed_redacted)
+    per_line_spans = _removed_credential_spans(canonical, redacted)
+    if collapsed_spans is None or per_line_spans is None:
+        # Alignment failed; fail closed on the collapsed redaction rather
+        # than risk serving a span the per-line pass never saw.
+        return collapsed_redacted
+    leaked = [
+        (start, end)
+        for start, end in collapsed_spans
+        if _has_cross_line_credential_run(canonical, start, end, per_line_spans)
+    ]
+    if not leaked:
+        return redacted
+    # Rebuild from the canonical text: replace every removed region (the
+    # per-line spans plus the leaked cross-line spans, merged) with one
+    # marker each. Redaction is a pure span-for-marker substitution, so this
+    # reproduces the per-line output plus the cross-line containment.
+    merged: list[tuple[int, int]] = []
+    for span in sorted(per_line_spans + leaked):
+        if merged and span[0] <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], span[1]))
+        else:
+            merged.append(span)
+    pieces: list[str] = []
+    position = 0
+    for start, end in merged:
+        pieces.append(canonical[position:start])
+        pieces.append(_HOOK_FAILURE_REDACTION_MARKER)
+        position = end
+    pieces.append(canonical[position:])
+    return "".join(pieces)
+
+
 def _canonicalize_hook_failure_chunk(chunk: str, previous_word: str) -> str:
     """Normalize one hard-whitespace-bounded chunk without mangling prose."""
     compact = chunk.replace(_HOOK_FAILURE_SEPARATOR_MARKER, "")
@@ -3337,6 +3453,7 @@ def _sanitize_hook_failure_detail(text: str) -> str | None:
         _HOOK_FAILURE_REDACTION_MARKER,
     )
     redacted = _redact_hook_failure_secrets(canonical)
+    redacted = _redact_cross_line_credentials(canonical, redacted)
     redacted = redacted.replace(_HOOK_FAILURE_BEARER_SOFT_GAP_MARKER, "")
     if preview_truncated and not raw_preview and redacted == canonical:
         return _HOOK_FAILURE_DETAIL_REMOVED_SENTINEL

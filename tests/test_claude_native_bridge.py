@@ -7691,6 +7691,47 @@ def test_hook_failure_detail_never_exceeds_global_cap(path: str) -> None:
     assert _HOOK_FAILURE_DETAIL_TRUNCATION_MARKER in detail
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "ghp_abcdefghij\nklmnopqrstuvwxyz012345",
+        "Bearer\nabc123secretabc123secretabc123",
+        "Authorization:\nsecretvaluesecretvalue123456",
+        "ghp_abcdefghij\r\nklmnopqrstuvwxyz012345",
+    ],
+    ids=["token-split", "bearer-split", "authorization-split", "crlf-split"],
+)
+def test_sanitize_hook_failure_detail_redacts_credentials_split_by_newlines(
+    raw: str,
+) -> None:
+    """A credential split across hard line breaks cannot dodge redaction.
+
+    The credential scanners stop at a newline, so provider-controlled text
+    can present a secret as two lines and pass each half under the length
+    floor. The sanitizer must catch it on a newline-collapsed shadow pass.
+    """
+    detail = _sanitize_hook_failure_detail(raw)
+    assert detail is not None
+    secret_body = raw.replace("\n", "").replace("\r", "")
+    for fragment in ("klmnopqrstuvwxyz012345", "abc123secret", "secretvaluesecretvalue"):
+        if fragment in secret_body:
+            assert fragment not in detail, (
+                f"credential fragment {fragment!r} survived sanitization: {detail!r}"
+            )
+    assert "(REDACTED)" in detail.replace("[REDACTED]", "(REDACTED)")
+
+
+def test_sanitize_hook_failure_detail_keeps_benign_multiline_line_breaks() -> None:
+    """The collapsed shadow pass must not flatten ordinary multi-line text."""
+    detail = _sanitize_hook_failure_detail(
+        "Traceback (most recent call last):\n  File 'x.py', line 3\n"
+        "RuntimeError: model_not_found"
+    )
+    assert detail is not None
+    assert "\n" in detail
+    assert "model_not_found" in detail
+
+
 def test_sanitize_hook_failure_detail_keeps_traceback_tail() -> None:
     """A capped traceback retains both its framing and final cause."""
     frames = "".join(
@@ -9122,7 +9163,8 @@ def test_submit_verify_budget_reads_environment(value: str | None, expected: str
 @pytest.mark.parametrize("value", ["inf", "nan", "0", "-5", "invalid"])
 def test_invalid_submit_verify_budget_warns_and_uses_default(value: str) -> None:
     variable = "OMNIGENT_CLAUDE_SUBMIT_VERIFY_TIMEOUT_S"
-    env = os.environ | {variable: value}
+    env = os.environ.copy()
+    env[variable] = value
     result = subprocess.run(
         [
             sys.executable,
