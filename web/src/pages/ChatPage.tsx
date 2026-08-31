@@ -108,6 +108,7 @@ import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNat
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  hasQueuedSendInFlight,
   type PendingInitialPrompt,
   type PendingUserMessage,
   type QueuedMessage,
@@ -657,12 +658,13 @@ export function shouldQueueSend(
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
   alwaysSteer = false,
+  queueSendInFlight = false,
 ): boolean {
   if (conversationId === null) return false;
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
-  if (alwaysSteer) return hasQueued;
+  if (alwaysSteer) return hasQueued || queueSendInFlight;
   const isBusy = status === "streaming" || sessionStatus === "running";
-  return isBusy || hasQueued;
+  return isBusy || hasQueued || queueSendInFlight;
 }
 
 // Author labels render only in a shared session; ChatPage provides the
@@ -1265,6 +1267,7 @@ export function ChatPage() {
         chat.sessionStatus,
         chat.queuedMessages,
         readAlwaysSteer(),
+        hasQueuedSendInFlight(chat.conversationId),
       )
     ) {
       chat.enqueueMessage(text, files);
@@ -1281,23 +1284,32 @@ export function ChatPage() {
     });
   }
 
-  function onSendSlashCommand(name: string, args: string) {
-    if (!agentId) return;
+  function onSendSlashCommand(name: string, args: string): boolean {
+    if (!agentId) return false;
     // Slash commands aren't replayed (an edge), but still route an unbound
     // coding clone to the directory picker so it isn't a dead end.
     if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
       setResumeDirDialogOpen(true);
-      return;
+      return false;
     }
     if (urlConvId && isUnreachable) {
       setReconnectDialogOpen(true);
-      return;
+      return false;
+    }
+    const chat = useChatStore.getState();
+    if (
+      chat.conversationId !== null &&
+      (hasQueuedSendInFlight(chat.conversationId) ||
+        chat.queuedMessages.some((message) => message.conversationId === chat.conversationId))
+    ) {
+      return false;
     }
     void useChatStore.getState().sendSlashCommand(name, args, agentId, {
       onConversationCreated: (newId) => {
         navigate(`/c/${newId}`, { replace: true });
       },
     });
+    return true;
   }
 
   function onStop() {
@@ -1601,7 +1613,7 @@ interface MainAgentSurfaceProps {
    * is sent as plaintext for the vendor TUI to handle. See
    * `ComposerProps.onSendSlashCommand`.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string) => boolean | void;
   onStop: () => void;
   onShowReconnectHelp: () => void;
   agents: Agent[] | undefined;
@@ -1999,7 +2011,7 @@ function MainAgentSurface({
       onSendSlashCommand && !isNativeWrapper
         ? (name: string, args: string) => {
             setSendScrollNonce((n) => n + 1);
-            onSendSlashCommand(name, args);
+            return onSendSlashCommand(name, args);
           }
         : undefined,
     [onSendSlashCommand, isNativeWrapper],
@@ -3668,7 +3680,7 @@ interface ComposerProps {
    * native-terminal sessions, which always send `/skill` as plaintext so
    * the vendor TUI loads the skill itself.
    */
-  onSendSlashCommand?: (name: string, args: string) => void;
+  onSendSlashCommand?: (name: string, args: string) => boolean | void;
   onStop: () => void;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
@@ -4728,6 +4740,22 @@ export function Composer({
           setCommandError("/compact is not supported for this agent type");
           return true;
         }
+        {
+          const chat = useChatStore.getState();
+          if (
+            chat.conversationId !== null &&
+            (hasQueuedSendInFlight(chat.conversationId) ||
+              chat.queuedMessages.some((message) => message.conversationId === chat.conversationId))
+          ) {
+            submitGuardRef.current = false;
+            dirtyRef.current = true;
+            setValue(arg ? `${cmd} ${arg}` : cmd);
+            setCommandError(
+              "Wait for the earlier queued message to settle or resolve its delivery first.",
+            );
+            return true;
+          }
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -4984,8 +5012,15 @@ export function Composer({
       // don't apply to a slash command (no content field) — clear them.
       if (onSendSlashCommand && parts[0] in slashCommands) {
         const skillArgs = trimmed.slice(parts[0].length).trim();
+        const accepted = onSendSlashCommand(parts[0].slice(1), skillArgs);
+        if (accepted === false) {
+          submitGuardRef.current = false;
+          setCommandError(
+            "Wait for the earlier queued message to settle or resolve its delivery first.",
+          );
+          return;
+        }
         appendEntry(trimmed);
-        onSendSlashCommand(parts[0].slice(1), skillArgs);
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
