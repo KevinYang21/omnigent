@@ -5155,7 +5155,9 @@ def _transcript_items_equal_ignoring_envelope(
     in payload but differs in the store-assigned ``id`` and ``created_at``.
     Everything else — including ``response_id``, which differs across
     genuine turns — participates in the comparison, so a user legitimately
-    repeating the same message in a later turn is not collapsed.
+    repeating the same message in a later turn is not collapsed. The filter
+    assumes a turn never legitimately emits byte-identical adjacent payloads
+    within the same ``response_id``; such a repeat would be collapsed too.
 
     :param item: Flat API item dict, e.g.
         ``{"type": "message", "role": "user", "content": [...]}``.
