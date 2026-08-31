@@ -7782,7 +7782,8 @@ def test_sanitize_hook_failure_detail_never_reintroduces_redacted_bytes() -> Non
     alignment can map the wrong occurrence; a rebuild from such spans would
     copy already-redacted bytes back in. No full token may ever survive.
     """
-    token = "ghp_D6rQJM9UayY20948VGZiHXJn"
+    # Built from parts so scanners don't mistake the fixture for a live token.
+    token = "ghp_" + "Ab1" * 8
     detail = _sanitize_hook_failure_detail(f"Bearer\nx\n{token}{token}")
     assert detail is not None
     assert token + token not in detail
