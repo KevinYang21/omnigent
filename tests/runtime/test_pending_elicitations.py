@@ -1273,3 +1273,97 @@ def test_a_concurrent_republish_survives_an_in_flight_retry_sweep() -> None:
         "an in-flight retry sweep must not erase a re-published prompt's row"
     )
     assert store.rows["elicit_1"].event["params"]["message"] == "turn two"
+
+
+def test_a_failed_republish_write_keeps_the_stale_rows_retry_claim() -> None:
+    """A re-publish whose durable write fails must not consume the retry claim.
+
+    When a prior delete failed, the answered row is still durable and the
+    claim is what collects it. Superseding the claim is only safe once the
+    fresh write actually replaced that row; dropping it before a write that
+    then fails leaves the answered prompt to resurrect on the next restart
+    with nothing left to collect it.
+    """
+
+    class _FlakyWriteStore(_FakeStore):
+        fail_on_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return super().delete(conversation_id, elicitation_id)
+
+    store = _FlakyWriteStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")  # queues the failed delete
+    store.fail_on_delete = False
+    assert "elicit_1" in store.rows  # the answered orphan awaiting collection
+
+    store.fail_on_put = True
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn two"))
+    store.fail_on_put = False
+
+    # The store recovers; any later successful call triggers the sweep.
+    pending_elicitations.resolve("conv_a", "elicit_other")
+
+    assert "elicit_1" not in store.rows, (
+        "a re-publish whose write failed must leave the retry claim in place "
+        "so the answered row is still collected"
+    )
+
+
+def test_a_direct_resolve_cannot_erase_a_republished_row() -> None:
+    """A resolve's in-flight delete must not erase a re-published fresh row.
+
+    ``resolve`` deletes the durable row on the approval-dispatch thread while
+    the workflow thread may re-publish the same deterministic id for the next
+    turn. Without the persist lock on the direct delete, the interleaving
+    delete-issued -> fresh-row-written -> delete-lands silently costs the new
+    prompt its restart survival — the same race the retry sweep already
+    guards against.
+    """
+    import threading
+
+    delete_entered = threading.Event()
+    release_delete = threading.Event()
+
+    class _SlowDeleteStore(_FakeStore):
+        park_next_elicit_1_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if elicitation_id == "elicit_1" and self.park_next_elicit_1_delete:
+                self.park_next_elicit_1_delete = False
+                delete_entered.set()
+                assert release_delete.wait(5), "test deadlock: delete never released"
+            return super().delete(conversation_id, elicitation_id)
+
+    store = _SlowDeleteStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+
+    # The verdict arrives; its delete parks inside the store mid-flight.
+    store.park_next_elicit_1_delete = True
+    resolver = threading.Thread(target=pending_elicitations.resolve, args=("conv_a", "elicit_1"))
+    resolver.start()
+    assert delete_entered.wait(5), "the resolve never reached the parked delete"
+
+    # Turn two re-publishes the same deterministic id while the delete is in
+    # flight. With the persist lock it waits its turn; without it, its fresh
+    # row is written now and the parked stale delete then erases it.
+    republisher = threading.Thread(
+        target=pending_elicitations.record_publish,
+        args=("conv_a", _request_event("elicit_1", "turn two")),
+    )
+    republisher.start()
+    republisher.join(0.5)  # give the unfixed interleaving time to complete
+    release_delete.set()
+    resolver.join(5)
+    republisher.join(5)
+    assert not resolver.is_alive() and not republisher.is_alive()
+
+    assert "elicit_1" in store.rows, (
+        "a direct resolve's in-flight delete must not erase a re-published prompt's row"
+    )
+    assert store.rows["elicit_1"].event["params"]["message"] == "turn two"

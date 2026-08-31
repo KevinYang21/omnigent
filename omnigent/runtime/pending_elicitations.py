@@ -158,6 +158,10 @@ _resolved_tombstones: set[tuple[str, str]] = set()
 # behind to resurrect on the next restart. Keyed by (workspace_id,
 # conversation_id, elicitation_id): the store scopes deletes to the ambient
 # workspace, and the retry may fire from another tenant's request.
+# Known limitation: this queue (and the tombstones above) is process memory,
+# so a restart *during* a store outage that already failed a delete loses the
+# claim, and the answered row can resurrect once. Closing that double-fault
+# window needs durable tombstones (extra schema); accepted for now.
 _failed_deletes: set[tuple[int, str, str]] = set()
 
 
@@ -228,11 +232,11 @@ def _persist_add(conversation_id: str, elicitation_id: str, event: dict[str, Any
     # retrying that delete after the write below would erase the new row and
     # silently cost the fresh prompt its restart survival. The persist lock
     # keeps the supersede-and-write atomic against an in-flight retry sweep,
-    # whose stale delete could otherwise land between the two.
+    # whose stale delete could otherwise land between the two. The claim is
+    # dropped only after the write succeeds: a failed write leaves the
+    # answered row durable, and only the claim still collects it.
     try:
         with _persist_lock:
-            with _lock:
-                _failed_deletes.discard((current_workspace_id(), conversation_id, elicitation_id))
             store.put(
                 Elicitation(
                     id=elicitation_id,
@@ -242,6 +246,8 @@ def _persist_add(conversation_id: str, elicitation_id: str, event: dict[str, Any
                     event=event,
                 )
             )
+            with _lock:
+                _failed_deletes.discard((current_workspace_id(), conversation_id, elicitation_id))
     except Exception:  # never block raising the prompt
         _logger.warning(
             "Could not persist elicitation %r; it will not survive a restart",
@@ -269,8 +275,13 @@ def _persist_remove(conversation_id: str, elicitation_id: str) -> None:
         return
     from omnigent.db.db_models import current_workspace_id
 
+    # Under the persist lock: a workflow thread may be re-publishing this
+    # deterministic id for the next turn, and this delete landing after that
+    # write would erase the fresh row — the same interleaving the retry sweep
+    # guards against, on the far more common direct path.
     try:
-        store.delete(conversation_id, elicitation_id)
+        with _persist_lock:
+            store.delete(conversation_id, elicitation_id)
     except Exception:  # never block resolving the prompt
         # Remember the orphaned row: a restore must not replay it (the
         # tombstone in :func:`resolve` covers that) and a later successful
@@ -384,8 +395,11 @@ def restore_for(conversation_id: str) -> list[dict[str, Any]]:
     for row in rows:
         if row.created_at >= cutoff:
             continue
+        # Same persist-lock rule as ``_persist_remove``: this age-out delete
+        # must not land on top of a concurrent re-publish's fresh row.
         try:
-            store.delete(conversation_id, row.id)
+            with _persist_lock:
+                store.delete(conversation_id, row.id)
         except Exception:
             with _lock:
                 _failed_deletes.add((row.workspace_id, conversation_id, row.id))

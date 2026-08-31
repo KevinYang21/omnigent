@@ -1536,22 +1536,34 @@ def _pending_elicitation_snapshot_for_session(
         for event in events
         if isinstance(event.get("elicitation_id"), str)
     }
-    for child in _descendant_sessions(conv_store, conv.id):
-        child_events = pending_elicitations.snapshot_for(child.id)
-        if not child_events and walk_for_restore:
-            child_events = pending_elicitations.restore_for(child.id)
-            if not child_events and pending_elicitations.needs_restore(child.id):
-                # The child's restore failed (store outage), not "nothing
-                # there". Hand the walk back so a later snapshot retries it
-                # instead of hiding the child's prompt for the process's life.
-                pending_elicitations.release_descendant_restore(conv.id)
-        for event in child_events:
-            elicitation_id = event.get("elicitation_id")
-            if isinstance(elicitation_id, str) and elicitation_id in seen:
-                continue
-            if isinstance(elicitation_id, str):
-                seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+    # A walk that does not complete cleanly must hand its claim back: a
+    # consumed claim with no completed walk (a child restore hit a store
+    # outage, or listing/reading a child raised) would hide the children's
+    # parked prompts for the process's life.
+    walk_clean = True
+    try:
+        for child in _descendant_sessions(conv_store, conv.id):
+            child_events = pending_elicitations.snapshot_for(child.id)
+            if not child_events and walk_for_restore:
+                child_events = pending_elicitations.restore_for(child.id)
+                if not child_events and pending_elicitations.needs_restore(child.id):
+                    # The child's restore failed (store outage), not "nothing
+                    # there". A later snapshot must retry it instead of hiding
+                    # the child's prompt for the process's life.
+                    walk_clean = False
+            for event in child_events:
+                elicitation_id = event.get("elicitation_id")
+                if isinstance(elicitation_id, str) and elicitation_id in seen:
+                    continue
+                if isinstance(elicitation_id, str):
+                    seen.add(elicitation_id)
+                events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+    except BaseException:
+        walk_clean = False
+        raise
+    finally:
+        if walk_for_restore and not walk_clean:
+            pending_elicitations.release_descendant_restore(conv.id)
     return events
 
 

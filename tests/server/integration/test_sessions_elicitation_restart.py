@@ -13,6 +13,8 @@ HTTP snapshot endpoint on either side of it.
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import pytest
 
@@ -202,6 +204,67 @@ async def test_ancestor_snapshot_replays_a_child_prompt_after_the_index_is_lost(
         pending_elicitations.reset_for_tests()
         pending_elicitations.set_store(SqlAlchemyElicitationStore(db_uri))
 
+        assert await _pending_ids(client, parent_id) == [elicitation_id]
+    finally:
+        hook_task.cancel()
+
+
+async def test_a_crashed_descendant_walk_does_not_consume_the_restore_claim(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A walk that dies mid-flight must not spend the ancestor's only walk.
+
+    The gate-free descendant walk is granted once per ancestor per process.
+    If listing the descendants raises (a transient store hiccup) after the
+    claim was taken, the claim must come back — otherwise the child's parked
+    approval stays invisible from the parent for the process's life.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes._sessions import helpers as session_helpers
+    from omnigent.stores.elicitation_store.sqlalchemy_store import (
+        SqlAlchemyElicitationStore,
+    )
+    from tests.server.integration.test_sessions_elicitation_resolve_url import (
+        _claude_permission_payload,
+        _create_child_session,
+        _park_permission_hook_on,
+    )
+
+    agent = await create_test_agent(client, "test-elicitation-restart-walk-crash")
+    parent_id = await _create_session(client, agent["id"])
+    child_id = _create_child_session(db_uri, parent_id=parent_id, agent_id=agent["id"])
+    hook_task, mirrored = await _park_permission_hook_on(
+        client,
+        child_id,
+        parent_id,
+        payload=_claude_permission_payload("Bash"),
+    )
+    elicitation_id = mirrored["elicitation_id"]
+
+    try:
+        # The restart: index cold everywhere; the child's row survives.
+        pending_elicitations.reset_for_tests()
+        pending_elicitations.set_store(SqlAlchemyElicitationStore(db_uri))
+
+        # The parent's first cold snapshot claims the walk, then the walk dies.
+        real_walk = session_helpers._descendant_sessions
+        crashed = False
+
+        def _crash_once(conv_store: Any, session_id: str) -> Any:
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise RuntimeError("transient store hiccup")
+            return real_walk(conv_store, session_id)
+
+        monkeypatch.setattr(session_helpers, "_descendant_sessions", _crash_once)
+        with pytest.raises(RuntimeError, match="transient store hiccup"):
+            await client.get(f"/v1/sessions/{parent_id}")
+
+        # The next snapshot must get the walk again and surface the child's
+        # parked approval.
         assert await _pending_ids(client, parent_id) == [elicitation_id]
     finally:
         hook_task.cancel()
