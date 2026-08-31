@@ -122,16 +122,21 @@ def forwarder_dedup_server() -> Iterator[str]:
     # vars) would boot the server in login mode and 401 every call.
     env["OMNIGENT_AUTH_PROVIDER"] = "header"
     env["OMNIGENT_LOCAL_SINGLE_USER"] = "1"
-    # Strip credentials/config that would alter server behaviour in CI.
-    for var in (
-        "DATABRICKS_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "OMNIGENT_AUTH_ENABLED",
-        "OMNIGENT_OIDC_ISSUER",
-        "OMNIGENT_ACCOUNTS_COOKIE_SECRET",
-        "OMNIGENT_RUNNER_TUNNEL_TOKEN",
-    ):
-        env.pop(var, None)
+    # Strip ambient credentials/config that would alter server behaviour in
+    # CI: any Databricks or OIDC setting, any cookie/signing secret, and the
+    # specific provider/tunnel vars below.
+    for var in list(env):
+        if (
+            var.startswith(("DATABRICKS_", "OMNIGENT_OIDC_"))
+            or var.endswith("_SECRET")
+            or var
+            in (
+                "ANTHROPIC_API_KEY",
+                "OMNIGENT_AUTH_ENABLED",
+                "OMNIGENT_RUNNER_TUNNEL_TOKEN",
+            )
+        ):
+            env.pop(var, None)
     # Always prepend the worktree so the server imports the branch under test.
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = (
