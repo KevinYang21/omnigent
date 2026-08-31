@@ -3110,8 +3110,10 @@ def _has_cross_line_credential_run(
         char = canonical[index]
         if char == "\n":
             continue
-        if char.isascii() and char.isalnum() and not any(
-            span_start <= index < span_end for span_start, span_end in covered
+        if (
+            char.isascii()
+            and char.isalnum()
+            and not any(span_start <= index < span_end for span_start, span_end in covered)
         ):
             run += 1
             run_has_digit = run_has_digit or char.isdigit()

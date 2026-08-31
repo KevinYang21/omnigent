@@ -7724,8 +7724,7 @@ def test_sanitize_hook_failure_detail_redacts_credentials_split_by_newlines(
 def test_sanitize_hook_failure_detail_keeps_benign_multiline_line_breaks() -> None:
     """The collapsed shadow pass must not flatten ordinary multi-line text."""
     detail = _sanitize_hook_failure_detail(
-        "Traceback (most recent call last):\n  File 'x.py', line 3\n"
-        "RuntimeError: model_not_found"
+        "Traceback (most recent call last):\n  File 'x.py', line 3\nRuntimeError: model_not_found"
     )
     assert detail is not None
     assert "\n" in detail
