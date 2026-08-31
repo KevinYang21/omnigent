@@ -3041,10 +3041,14 @@ def _redact_hook_failure_secrets(text: str) -> str:
     )
 
 
-# Minimum newline-bridged alphanumeric run for the cross-line pass to call a
-# span a credential. Prose the collapsed scanner over-absorbs ("FinalCause",
-# "Next-Line: ok") stays under it; real secrets (20+ chars) clear it.
-_HOOK_FAILURE_CROSS_LINE_RUN_FLOOR = 12
+# Floors for the cross-line pass to call an uncovered run a credential.
+# Digit-bearing runs use the low floor: mixed alphanumerics are
+# credential-shaped, and prose words the collapsed scanner over-absorbs
+# ("FinalCause", "configuration") carry no digits. All-letter runs use the
+# high floor so ordinary long words survive while letter-only secrets past
+# any plausible prose word length are still contained.
+_HOOK_FAILURE_CROSS_LINE_DIGIT_RUN_FLOOR = 6
+_HOOK_FAILURE_CROSS_LINE_ALPHA_RUN_FLOOR = 16
 
 
 def _removed_credential_spans(original: str, redacted: str) -> list[tuple[int, int]] | None:
@@ -3071,6 +3075,11 @@ def _removed_credential_spans(original: str, redacted: str) -> list[tuple[int, i
         found = original.find(fragment, position)
         if found == -1:
             return None
+        if original.find(fragment, found + 1) != -1:
+            # The fragment repeats, so first-match alignment is ambiguous —
+            # a wrong span would let a rebuild reintroduce redacted bytes.
+            # Fail closed and let the caller take its conservative branch.
+            return None
         spans.append((position, found))
         position = found + len(fragment)
     return spans
@@ -3086,10 +3095,12 @@ def _has_cross_line_credential_run(
 
     Counts alphanumeric characters not inside any *covered* span; a newline
     joins a run (the split this pass exists to catch) while every other
-    non-alphanumeric character breaks it, so multi-word prose never reaches
-    the floor.
+    non-alphanumeric character breaks it, so multi-word prose never reaches a
+    floor. A run holding a digit is credential-shaped and uses the low floor;
+    an all-letter run must exceed plausible prose word length.
     """
     run = 0
+    run_has_digit = False
     for index in range(start, end):
         char = canonical[index]
         if char == "\n":
@@ -3098,10 +3109,17 @@ def _has_cross_line_credential_run(
             span_start <= index < span_end for span_start, span_end in covered
         ):
             run += 1
-            if run >= _HOOK_FAILURE_CROSS_LINE_RUN_FLOOR:
+            run_has_digit = run_has_digit or char.isdigit()
+            floor = (
+                _HOOK_FAILURE_CROSS_LINE_DIGIT_RUN_FLOOR
+                if run_has_digit
+                else _HOOK_FAILURE_CROSS_LINE_ALPHA_RUN_FLOOR
+            )
+            if run >= floor:
                 return True
             continue
         run = 0
+        run_has_digit = False
     return False
 
 

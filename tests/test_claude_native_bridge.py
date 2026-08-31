@@ -7732,6 +7732,47 @@ def test_sanitize_hook_failure_detail_keeps_benign_multiline_line_breaks() -> No
     assert "model_not_found" in detail
 
 
+@pytest.mark.parametrize(
+    ("raw", "leak"),
+    [
+        ("Bearer\nabc123", "abc123"),
+        ("Authorization:\nsecret1", "secret1"),
+    ],
+    ids=["bearer", "authorization"],
+)
+def test_sanitize_hook_failure_detail_contains_short_keyed_cross_line_values(
+    raw: str, leak: str
+) -> None:
+    """A short keyed value pushed onto the next line still redacts.
+
+    Keyed anchors (``Bearer``, ``Authorization``) treat any nonzero value as
+    sensitive, so the cross-line pass cannot demand a long run before acting.
+    """
+    detail = _sanitize_hook_failure_detail(raw)
+    assert detail is not None
+    assert leak not in detail, f"short keyed value survived: {detail!r}"
+
+
+def test_sanitize_hook_failure_detail_never_reintroduces_redacted_bytes() -> None:
+    """Ambiguous span alignment must fail closed, not restore removed text.
+
+    When a surviving fragment repeats inside a removed credential, greedy
+    alignment can map the wrong occurrence; a rebuild from such spans would
+    copy already-redacted bytes back in. No full token may ever survive.
+    """
+    token = "ghp_D6rQJM9UayY20948VGZiHXJn"
+    detail = _sanitize_hook_failure_detail(f"Bearer\nx\n{token}{token}")
+    assert detail is not None
+    assert token + token not in detail
+    assert detail.count(token) == 0, f"redacted token reintroduced: {detail!r}"
+
+
+def test_sanitize_hook_failure_detail_keeps_long_benign_words_after_bearer() -> None:
+    """A long prose word after a lone ``Bearer`` line is not a credential."""
+    detail = _sanitize_hook_failure_detail("Bearer\nauthentication failed for selected model")
+    assert detail == "Bearer\nauthentication failed for selected model"
+
+
 def test_sanitize_hook_failure_detail_keeps_traceback_tail() -> None:
     """A capped traceback retains both its framing and final cause."""
     frames = "".join(
