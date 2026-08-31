@@ -4,7 +4,7 @@ Revision ``za2b3c4d5e6f`` runs an unconditional ``ALTER TABLE
 omnigent_conversation_metadata ADD COLUMN task_summary``.  On a real database
 that sits at ``d5e9f1a2b3c4`` (one step before that revision) but already carries
 a ``task_summary`` column — e.g. a database that was patched outside of Alembic
-during a hotfix — the automatic startup upgrade to head (``e5d9bc8ac650``) aborts
+during a hotfix — the automatic startup upgrade to the current head aborts
 with::
 
     sqlite3.OperationalError: duplicate column name: task_summary
@@ -40,8 +40,15 @@ from omnigent.db.utils import (
 
 # Revision one step before ``za2b3c4d5e6f`` (which adds ``task_summary``).
 _REVISION_BEFORE_TASK_SUMMARY = "d5e9f1a2b3c4"
-# Current head at the time this bug was filed; asserted as the reachable target.
-_EXPECTED_HEAD = "e5d9bc8ac650"
+
+
+def _script_head(uri: str) -> str:
+    """The migration graph's single head — the upgrade target at startup."""
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory.from_config(_build_alembic_config(uri)).get_current_head()
+    assert head is not None, "migration graph must have a head"
+    return head
 
 _METADATA_TABLE = "omnigent_conversation_metadata"
 
@@ -107,7 +114,7 @@ def test_upgrade_with_preexisting_task_summary_column(tmp_path: Path) -> None:
     # Drive the real server-startup migration path.
     _initialize_or_verify_schema(engine, uri)
 
-    assert _get_current_db_revision(engine) == _EXPECTED_HEAD, (
+    assert _get_current_db_revision(engine) == _script_head(uri), (
         "database must reach head after reconciling the preexisting column"
     )
     assert _task_summary_present(engine), "task_summary must remain present after upgrade"
@@ -132,5 +139,5 @@ def test_upgrade_adds_missing_task_summary_column(tmp_path: Path) -> None:
 
     _initialize_or_verify_schema(engine, uri)
 
-    assert _get_current_db_revision(engine) == _EXPECTED_HEAD
+    assert _get_current_db_revision(engine) == _script_head(uri)
     assert _task_summary_present(engine), "task_summary must be added when absent"
