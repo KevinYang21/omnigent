@@ -1059,3 +1059,104 @@ def test_descendant_restore_claim_is_granted_once_per_conversation() -> None:
 def test_descendant_restore_claim_needs_a_store() -> None:
     """Without durable rows there is nothing a walk could restore."""
     assert pending_elicitations.claim_descendant_restore("conv_a") is False
+
+
+def test_a_republish_supersedes_its_queued_failed_delete() -> None:
+    """A queued delete retry must not erase a re-published prompt's new row.
+
+    Deterministic harness ids repeat: after turn one's delete fails and turn
+    two re-publishes the same id, retrying the stale delete would silently
+    cost the fresh prompt its restart survival.
+    """
+
+    class _DeleteDownStore(_FakeStore):
+        fail_on_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return self.rows.pop(elicitation_id, None) is not None
+
+    store = _DeleteDownStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")
+    store.fail_on_delete = False
+
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn two"))
+
+    assert "elicit_1" in store.rows, "the re-published prompt's row must survive the retry sweep"
+    assert store.rows["elicit_1"].event["params"]["message"] == "turn two"
+
+
+def test_restore_deletes_rows_too_old_to_have_an_awaiter() -> None:
+    """The table holds only the parked set; no other collector exists."""
+    import time as _time
+
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_stale"))
+    stale = store.rows["elicit_stale"]
+    store.rows["elicit_stale"] = type(stale)(
+        id=stale.id,
+        workspace_id=stale.workspace_id,
+        conversation_id=stale.conversation_id,
+        created_at=int(_time.time()) - 90_000,
+        event=stale.event,
+    )
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_store(store)
+
+    assert pending_elicitations.restore_for("conv_a") == []
+    assert "elicit_stale" not in store.rows
+
+
+def test_restore_reconciles_the_persisted_badge_count() -> None:
+    """A badge count that outlived its prompt must not stay lit forever.
+
+    If the runner timed out while the server was down, the persisted count
+    still says 1 with no restorable prompt behind it. The restore's count
+    hook rewrites it to what is actually answerable.
+    """
+    observed: list[tuple[str, int]] = []
+    store = _FakeStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+    del store.rows["elicit_1"]  # the awaiter died; the row was collected
+
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.set_store(store)
+    pending_elicitations.set_count_persist_hook(lambda conv, count: observed.append((conv, count)))
+    try:
+        assert pending_elicitations.restore_for("conv_a") == []
+        assert observed == [("conv_a", 0)]
+    finally:
+        pending_elicitations.set_count_persist_hook(None)
+
+
+def test_a_released_descendant_claim_can_be_claimed_again() -> None:
+    """A store outage during the walk must not hide a child prompt forever."""
+    pending_elicitations.set_store(_FakeStore())
+
+    assert pending_elicitations.claim_descendant_restore("conv_a") is True
+    pending_elicitations.release_descendant_restore("conv_a")
+
+    assert pending_elicitations.claim_descendant_restore("conv_a") is True
+
+
+def test_needs_restore_reports_a_failed_restore() -> None:
+    """Distinguish "restored, nothing there" from "could not ask"."""
+
+    class _BrokenStore(_FakeStore):
+        def list_for_conversation(self, conversation_id: str, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("store is down")
+
+    pending_elicitations.set_store(_BrokenStore())
+    assert pending_elicitations.needs_restore("conv_a") is True
+    assert pending_elicitations.restore_for("conv_a") == []
+    assert pending_elicitations.needs_restore("conv_a") is True  # failure hands back the claim
+
+    pending_elicitations.set_store(_FakeStore())
+    pending_elicitations.restore_for("conv_a")
+    assert pending_elicitations.needs_restore("conv_a") is False

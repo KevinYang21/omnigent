@@ -217,6 +217,11 @@ def _persist_add(conversation_id: str, elicitation_id: str, event: dict[str, Any
     from omnigent.db.db_models import current_workspace_id
     from omnigent.entities import Elicitation
 
+    # A re-publish supersedes any failed delete still queued for this id:
+    # retrying that delete after the write below would erase the new row and
+    # silently cost the fresh prompt its restart survival.
+    with _lock:
+        _failed_deletes.discard((conversation_id, elicitation_id))
     try:
         store.put(
             Elicitation(
@@ -306,13 +311,15 @@ def restore_for(conversation_id: str) -> list[dict[str, Any]]:
     indexed query per conversation however many times the session is loaded.
     Once the index holds an entry there is nothing to restore anyway.
 
-    Prompts older than :data:`_MAX_PARK_SECONDS` are skipped: nothing can still
-    be parked on them, so surfacing one would offer the user a button that
-    resolves nothing. They are left in the store for a reaper to collect rather
-    than deleted from a read path.
+    Prompts older than :data:`_MAX_PARK_SECONDS` are dropped: nothing can
+    still be parked on them, so surfacing one would offer the user a button
+    that resolves nothing. Their rows are deleted here — the table's contract
+    is to hold only the parked set, and no other collector exists.
 
-    Restoring does not fire the count hook. Whether the count is right or
-    stale, the rows are the truth, and rewriting it here would race the mirror.
+    After a successful read the count hook fires with the index's real count,
+    so a persisted badge count that outlived its prompt (the runner timed out
+    while the server was down) reconciles to what is actually answerable
+    instead of staying lit forever.
 
     :param conversation_id: Session to restore, e.g. ``"conv_abc123"``.
     :returns: The restored event payloads, oldest first. Empty when no store
@@ -326,10 +333,7 @@ def restore_for(conversation_id: str) -> list[dict[str, Any]]:
             return []
         _restored.add(conversation_id)
     try:
-        rows = store.list_for_conversation(
-            conversation_id,
-            not_before=int(time.time()) - _MAX_PARK_SECONDS,
-        )
+        rows = store.list_for_conversation(conversation_id)
     except Exception:  # a failed restore degrades to the pre-mirror behaviour
         # Let the next read try again: a store that was briefly unavailable
         # must not cost this conversation its only restore for the lifetime of
@@ -342,16 +346,31 @@ def restore_for(conversation_id: str) -> list[dict[str, Any]]:
             exc_info=True,
         )
         return []
-    if not rows:
-        return []
+    cutoff = int(time.time()) - _MAX_PARK_SECONDS
+    for row in rows:
+        if row.created_at >= cutoff:
+            continue
+        try:
+            store.delete(conversation_id, row.id)
+        except Exception:
+            with _lock:
+                _failed_deletes.add((conversation_id, row.id))
     with _lock:
-        live = [row for row in rows if (conversation_id, row.id) not in _resolved_tombstones]
-        if not live:
-            return []
+        live = [
+            row
+            for row in rows
+            if row.created_at >= cutoff and (conversation_id, row.id) not in _resolved_tombstones
+        ]
         ids = _pending.setdefault(conversation_id, {})
         for row in live:
             ids.setdefault(row.id, row.event)
-        return [copy.deepcopy(event) for event in ids.values()]
+        restored = [copy.deepcopy(event) for event in ids.values()]
+        count = len(ids)
+        if not ids:
+            _pending.pop(conversation_id, None)
+    # Reconcile the persisted badge count with what is actually answerable.
+    _notify_count_hook(conversation_id, count)
+    return restored
 
 
 def claim_descendant_restore(conversation_id: str) -> bool:
@@ -377,6 +396,39 @@ def claim_descendant_restore(conversation_id: str) -> bool:
             return False
         _descendants_probed.add(conversation_id)
         return True
+
+
+def release_descendant_restore(conversation_id: str) -> None:
+    """
+    Hand back a descendant-restore claim whose walk could not complete.
+
+    A transient store outage during the walk must not permanently consume the
+    ancestor's only gate-free walk — the child prompt it would have surfaced
+    stays hidden for the life of the process otherwise. The next snapshot of
+    this ancestor claims and walks again.
+
+    :param conversation_id: Ancestor whose claim to release.
+    """
+    with _lock:
+        _descendants_probed.discard(conversation_id)
+
+
+def needs_restore(conversation_id: str) -> bool:
+    """
+    Whether a session's durable rows have not yet been (re)loaded.
+
+    ``True`` right after a failed :func:`restore_for` (the failure hands back
+    the one-per-process claim), letting a caller that drove a batch of
+    restores tell "restored, nothing there" apart from "could not ask".
+
+    :param conversation_id: Session to check.
+    :returns: ``True`` when a store is wired and the session has no completed
+        restore recorded for this process.
+    """
+    if _store is None:
+        return False
+    with _lock:
+        return conversation_id not in _restored
 
 
 def record_publish(conversation_id: str, event: dict[str, Any]) -> None:

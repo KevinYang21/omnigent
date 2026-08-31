@@ -1540,6 +1540,11 @@ def _pending_elicitation_snapshot_for_session(
         child_events = pending_elicitations.snapshot_for(child.id)
         if not child_events and walk_for_restore:
             child_events = pending_elicitations.restore_for(child.id)
+            if not child_events and pending_elicitations.needs_restore(child.id):
+                # The child's restore failed (store outage), not "nothing
+                # there". Hand the walk back so a later snapshot retries it
+                # instead of hiding the child's prompt for the process's life.
+                pending_elicitations.release_descendant_restore(conv.id)
         for event in child_events:
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
