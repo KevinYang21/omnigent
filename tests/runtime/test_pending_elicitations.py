@@ -1160,3 +1160,116 @@ def test_needs_restore_reports_a_failed_restore() -> None:
     pending_elicitations.set_store(_FakeStore())
     pending_elicitations.restore_for("conv_a")
     assert pending_elicitations.needs_restore("conv_a") is False
+
+
+def test_a_failed_delete_is_swept_under_its_own_workspace() -> None:
+    """A retry triggered from another tenant must still collect the orphan.
+
+    The store scopes deletes to the ambient workspace, so a sweep that runs
+    during another workspace's request would match nothing — and silently
+    drop its retry claim, leaving the answered row to resurrect on the next
+    restart.
+    """
+    from omnigent.db.db_models import current_workspace_id, workspace_scope
+
+    class _WorkspaceStore(_FakeStore):
+        """Rows keyed by (workspace, id); deletes scoped like the real store."""
+
+        fail_on_delete = False
+
+        def put(self, elicitation: Any) -> None:
+            self.rows[(elicitation.workspace_id, elicitation.id)] = elicitation
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            return self.rows.pop((current_workspace_id(), elicitation_id), None) is not None
+
+        def list_for_conversation(self, conversation_id: str, **kwargs: Any) -> list[Any]:
+            return [
+                row
+                for (ws, _), row in self.rows.items()
+                if ws == current_workspace_id() and row.conversation_id == conversation_id
+            ]
+
+    store = _WorkspaceStore()
+    pending_elicitations.set_store(store)
+    with workspace_scope(7):
+        pending_elicitations.record_publish("conv_a", _request_event("elicit_1"))
+        store.fail_on_delete = True
+        pending_elicitations.resolve("conv_a", "elicit_1")
+        store.fail_on_delete = False
+    assert (7, "elicit_1") in store.rows  # the orphan awaiting collection
+
+    # The store recovers; the sweep fires from a different tenant's request.
+    with workspace_scope(8):
+        pending_elicitations.record_publish("conv_b", _request_event("elicit_2"))
+
+    assert (7, "elicit_1") not in store.rows, (
+        "the sweep must delete the orphan under the workspace that owns it"
+    )
+
+
+def test_a_concurrent_republish_survives_an_in_flight_retry_sweep() -> None:
+    """A re-publish racing the retry sweep must keep its fresh row.
+
+    The sweep snapshots the queue, then deletes outside the index lock. If a
+    re-publish of the same deterministic id lands between the snapshot and
+    the delete — supersede the entry, write a fresh row — the stale delete
+    would erase that row and silently cost the new prompt its restart
+    survival. The persist lock serializes the two, whichever wins.
+    """
+    import threading
+
+    sweep_entered = threading.Event()
+    release_sweep = threading.Event()
+
+    class _SlowSweepStore(_FakeStore):
+        """Parks the sweep's delete of elicit_1 so the race window is open."""
+
+        fail_on_delete = False
+        park_next_elicit_1_delete = False
+
+        def delete(self, conversation_id: str, elicitation_id: str) -> bool:
+            if self.fail_on_delete:
+                raise RuntimeError("store is down")
+            if elicitation_id == "elicit_1" and self.park_next_elicit_1_delete:
+                self.park_next_elicit_1_delete = False
+                sweep_entered.set()
+                assert release_sweep.wait(5), "test deadlock: sweep never released"
+            return self.rows.pop(elicitation_id, None) is not None
+
+    store = _SlowSweepStore()
+    pending_elicitations.set_store(store)
+    pending_elicitations.record_publish("conv_a", _request_event("elicit_1", "turn one"))
+    store.fail_on_delete = True
+    pending_elicitations.resolve("conv_a", "elicit_1")  # queues the failed delete
+    store.fail_on_delete = False
+
+    # A store call from elsewhere triggers the sweep; its delete parks inside
+    # the store with the race window open.
+    store.park_next_elicit_1_delete = True
+    sweeper = threading.Thread(
+        target=pending_elicitations.resolve, args=("conv_a", "elicit_other")
+    )
+    sweeper.start()
+    assert sweep_entered.wait(5), "the sweep never reached the parked delete"
+
+    # The re-publish lands while the sweep is mid-delete. With the persist
+    # lock it waits its turn; without it, it completes now and the parked
+    # stale delete then erases its fresh row.
+    republisher = threading.Thread(
+        target=pending_elicitations.record_publish,
+        args=("conv_a", _request_event("elicit_1", "turn two")),
+    )
+    republisher.start()
+    republisher.join(0.5)  # give the unfixed interleaving time to complete
+    release_sweep.set()
+    sweeper.join(5)
+    republisher.join(5)
+    assert not sweeper.is_alive() and not republisher.is_alive()
+
+    assert "elicit_1" in store.rows, (
+        "an in-flight retry sweep must not erase a re-published prompt's row"
+    )
+    assert store.rows["elicit_1"].event["params"]["message"] == "turn two"

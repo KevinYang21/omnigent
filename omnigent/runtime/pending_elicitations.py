@@ -79,6 +79,11 @@ _MAX_PARK_SECONDS = 86400
 _pending: dict[str, dict[str, dict[str, Any]]] = {}
 _lock = threading.Lock()
 
+# Serializes a prompt's durable write against the failed-delete retry sweep,
+# so a stale queued delete can never erase a re-published prompt's fresh row.
+# Separate from ``_lock`` so the hot index path never waits on store I/O.
+_persist_lock = threading.Lock()
+
 # Optional observer (``subagent_block_notifier``) run synchronously on every
 # tracked event — must be cheap + non-blocking. ``None`` (runner, tests) skips it.
 _observer: Callable[[str, dict[str, Any]], None] | None = None
@@ -150,8 +155,10 @@ _resolved_tombstones: set[tuple[str, str]] = set()
 
 # Deletes that failed and still have a durable row to collect. Retried on
 # later store activity so a transient outage does not leave answered prompts
-# behind to resurrect on the next restart.
-_failed_deletes: set[tuple[str, str]] = set()
+# behind to resurrect on the next restart. Keyed by (workspace_id,
+# conversation_id, elicitation_id): the store scopes deletes to the ambient
+# workspace, and the retry may fire from another tenant's request.
+_failed_deletes: set[tuple[int, str, str]] = set()
 
 
 def set_store(store: ElicitationStore | None) -> None:
@@ -219,19 +226,22 @@ def _persist_add(conversation_id: str, elicitation_id: str, event: dict[str, Any
 
     # A re-publish supersedes any failed delete still queued for this id:
     # retrying that delete after the write below would erase the new row and
-    # silently cost the fresh prompt its restart survival.
-    with _lock:
-        _failed_deletes.discard((conversation_id, elicitation_id))
+    # silently cost the fresh prompt its restart survival. The persist lock
+    # keeps the supersede-and-write atomic against an in-flight retry sweep,
+    # whose stale delete could otherwise land between the two.
     try:
-        store.put(
-            Elicitation(
-                id=elicitation_id,
-                workspace_id=current_workspace_id(),
-                conversation_id=conversation_id,
-                created_at=int(time.time()),
-                event=event,
+        with _persist_lock:
+            with _lock:
+                _failed_deletes.discard((current_workspace_id(), conversation_id, elicitation_id))
+            store.put(
+                Elicitation(
+                    id=elicitation_id,
+                    workspace_id=current_workspace_id(),
+                    conversation_id=conversation_id,
+                    created_at=int(time.time()),
+                    event=event,
+                )
             )
-        )
     except Exception:  # never block raising the prompt
         _logger.warning(
             "Could not persist elicitation %r; it will not survive a restart",
@@ -257,6 +267,8 @@ def _persist_remove(conversation_id: str, elicitation_id: str) -> None:
     store = _store
     if store is None:
         return
+    from omnigent.db.db_models import current_workspace_id
+
     try:
         store.delete(conversation_id, elicitation_id)
     except Exception:  # never block resolving the prompt
@@ -265,7 +277,7 @@ def _persist_remove(conversation_id: str, elicitation_id: str) -> None:
         # store call retries the delete so the row does not sit until the
         # next restart resurrects it.
         with _lock:
-            _failed_deletes.add((conversation_id, elicitation_id))
+            _failed_deletes.add((current_workspace_id(), conversation_id, elicitation_id))
         _logger.warning(
             "Could not delete resolved elicitation %r",
             elicitation_id,
@@ -279,20 +291,42 @@ def _retry_failed_deletes(store: ElicitationStore) -> None:
     """
     Retry deletes that failed earlier, now that the store answered a call.
 
-    Stops at the first failure — the store is presumably down again and the
-    remaining entries keep their retry claim.
+    Each entry's claim is re-checked and its delete performed under the
+    persist lock, which :func:`_persist_add` holds across its supersede and
+    write — so a concurrent re-publish of the same id cannot interleave with a
+    stale delete and lose the fresh row's restart survival. The delete also
+    runs under the workspace that queued it: the store scopes deletes to the
+    ambient tenant, and this sweep may be triggered by another workspace's
+    request, where the delete would match nothing while the entry was
+    unconditionally dropped — leaving the answered row to resurrect on the
+    next restart.
+
+    A delete that raises stops the sweep — the store is presumably down again
+    and the remaining entries keep their retry claim. A delete that returns
+    ``False`` means the row is already gone (collected elsewhere), so the
+    entry is dropped either way.
 
     :param store: The store that just served a successful call.
     """
+    from omnigent.db.db_models import workspace_scope
+
     with _lock:
         retry = list(_failed_deletes)
-    for conv_id, elicit_id in retry:
-        try:
-            store.delete(conv_id, elicit_id)
-        except Exception:
-            return
-        with _lock:
-            _failed_deletes.discard((conv_id, elicit_id))
+    for entry in retry:
+        workspace_id, conv_id, elicit_id = entry
+        with _persist_lock:
+            with _lock:
+                # Superseded by a re-publish while this sweep was running:
+                # the fresh row must not be erased by the stale delete.
+                if entry not in _failed_deletes:
+                    continue
+            try:
+                with workspace_scope(workspace_id):
+                    store.delete(conv_id, elicit_id)
+            except Exception:
+                return
+            with _lock:
+                _failed_deletes.discard(entry)
 
 
 def restore_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -354,7 +388,7 @@ def restore_for(conversation_id: str) -> list[dict[str, Any]]:
             store.delete(conversation_id, row.id)
         except Exception:
             with _lock:
-                _failed_deletes.add((conversation_id, row.id))
+                _failed_deletes.add((row.workspace_id, conversation_id, row.id))
     with _lock:
         live = [
             row
