@@ -50,6 +50,7 @@ def _script_head(uri: str) -> str:
     assert head is not None, "migration graph must have a head"
     return head
 
+
 _METADATA_TABLE = "omnigent_conversation_metadata"
 
 
