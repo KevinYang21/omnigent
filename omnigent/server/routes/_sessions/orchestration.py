@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import secrets
@@ -356,6 +357,28 @@ from omnigent.telemetry.installation_id import get_installation_id as _get_insta
 from omnigent.telemetry.surface import classify_surface as _classify_surface
 
 
+def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
+    """
+    Digest one elicitation's request params for tombstone matching.
+
+    Harness elicitation ids can recur for DIFFERENT questions (e.g. the
+    codex id derives from a JSON-RPC request id that a later request may
+    reuse), so a verdict tombstone written against a possibly-zombie
+    waiter carries this digest and a re-park adopts it only for the same
+    logical question.
+
+    :param params: The elicitation's request params.
+    :returns: A sha256 hex digest of the canonicalized params, e.g.
+        ``"9f86d081..."``.
+    """
+    canonical = json.dumps(
+        params.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def _publish_and_wait_for_harness_elicitation(
     request: Request,
     *,
@@ -421,11 +444,13 @@ async def _publish_and_wait_for_harness_elicitation(
     # ``serverRequest/resolved`` notification. Raced below so the wait
     # ends promptly without relying on the web verdict or on disconnect
     # detection (unreliable behind the Databricks Apps proxy).
+    request_fingerprint = _harness_elicitation_request_fingerprint(params)
     parked = _ParkedHarnessElicitation(
         session_id=session_id,
         tool_name=tool_name,
         tool_input=tool_input,
         resolved_elsewhere=asyncio.Event(),
+        request_fingerprint=request_fingerprint,
     )
     _harness_elicitation_registry[elicitation_id] = future
     _harness_elicitation_owners[elicitation_id] = session_id
@@ -438,7 +463,9 @@ async def _publish_and_wait_for_harness_elicitation(
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
     try:
-        tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
+        tombstone = _consume_pre_resolved_harness_elicitation(
+            session_id, elicitation_id, request_fingerprint
+        )
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
             return tombstone.result
@@ -1820,13 +1847,21 @@ async def _resolve_elicitation(
                 # fires. Tombstone the verdict too, so a re-park of the
                 # same stable id adopts it instead of re-asking; a verdict
                 # that WAS delivered leaves a tombstone that ages out
-                # unconsumed (session-checked, TTL-pruned).
+                # unconsumed (session-checked, TTL-pruned). The parked
+                # waiter's request fingerprint rides along so a LATER,
+                # different question reusing the id can't inherit it.
+                _parked_for_fingerprint = _harness_parked_elicitations.get(elicitation_id)
                 _prune_pre_resolved_harness_elicitations()
                 _harness_pre_resolved_elicitations[elicitation_id] = (
                     _PreResolvedHarnessElicitation(
                         session_id=session_id,
                         created_at=time.time(),
                         result=verdict_result,
+                        request_fingerprint=(
+                            _parked_for_fingerprint.request_fingerprint
+                            if _parked_for_fingerprint is not None
+                            else None
+                        ),
                     )
                 )
                 _prune_pre_resolved_harness_elicitations()
