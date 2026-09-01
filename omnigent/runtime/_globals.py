@@ -29,6 +29,10 @@ if TYPE_CHECKING:
     from omnigent.tools import ToolManager
     from omnigent.tools.base import ToolContext
 
+    # Materialized on first read by ``__getattr__`` below; declared here so
+    # callers still see the concrete type.
+    _caps: RuntimeCaps
+
 _conversation_store: ConversationStore | None = None
 _agent_store: AgentStore | None = None
 _agent_cache: AgentCache | None = None
@@ -36,7 +40,6 @@ _file_store: FileStore | None = None
 _artifact_store: ArtifactStore | None = None
 _comment_store: CommentStore | None = None
 _policy_store: PolicyStore | None = None
-_caps: RuntimeCaps = RuntimeCaps()
 
 # Server-resident tmux terminal registry. Initialized in
 # :func:`init` and accessed via ``get_terminal_registry()`` in
@@ -165,6 +168,23 @@ class DispatchCapability:
 # the entry and must surface a clear error rather than silently
 # dispatching on stale state.
 _dispatch_capabilities: dict[str, DispatchCapability] = {}
+
+
+def __getattr__(name: str) -> RuntimeCaps:
+    """Build the default caps on first read instead of at import time.
+
+    ``RuntimeCaps``' ``routing_settings`` default is supplied by
+    ``omnigent.server.smart_routing``, so constructing one here at module
+    scope dragged that server module — and its import graph — into every
+    process that touches ``omnigent.runtime``, harness subprocesses included.
+    Deferring the construction keeps the read identical while leaving the
+    server import to whoever actually reads the routing knobs.
+    """
+    if name == "_caps":
+        caps = RuntimeCaps()
+        globals()["_caps"] = caps
+        return caps
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def init(
