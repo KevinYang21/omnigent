@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import builtins
-
 from typing import cast
 
 from sqlalchemy import and_, asc, desc, or_, select
