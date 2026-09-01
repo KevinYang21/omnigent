@@ -1,5 +1,7 @@
 """Tests for pagination entity and paginate_in_memory helper."""
 
+# CURSOR-PR-VIEW-TEST: dummy comment for a throwaway PR.
+
 from __future__ import annotations
 
 from omnigent.entities.pagination import PagedList, paginate_in_memory

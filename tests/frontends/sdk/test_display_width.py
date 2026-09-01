@@ -16,6 +16,8 @@ from omnigent_ui_sdk.terminal._host import (
     _term_width,
 )
 
+# CURSOR-PR-VIEW-TEST: dummy comment for a throwaway PR.
+
 # ── _display_width ──────────────────────────────────────────────
 
 
