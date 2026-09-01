@@ -155,6 +155,7 @@ def _serve_edge(cert_dir: Path, mode: str) -> tuple[http.server.HTTPServer, str]
     handler = type("Handler", (_FakeDatabricksEdge,), {"mode": mode})
     httpd = http.server.HTTPServer(("127.0.0.1", 0), handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(cert_dir / "cert.pem", cert_dir / "key.pem")
     httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
