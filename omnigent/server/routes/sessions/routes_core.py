@@ -456,17 +456,33 @@ def register_core_routes(
             # best-effort reverse GET whose failure would silently reintroduce
             # the first-turn respawn. Older runners ignore the extra
             # ``session_init`` key and still read the top-level id fields.
-            try:
-                init_body: dict[str, Any] = build_runner_session_init_payload(
-                    conv, server_version=VERSION
-                )
-            except ValueError:
-                # Not yet bound to an agent — fall back to the id-only body.
-                init_body = {
+            if conv.agent_id is None:
+                # Not yet bound to an agent — the envelope builder requires
+                # one, so fall back to the id-only body.
+                init_body: dict[str, Any] = {
                     "session_id": resp.id,
                     "agent_id": conv.agent_id,
                     "sub_agent_name": conv.sub_agent_name,
                 }
+            else:
+                try:
+                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                except Exception:
+                    # An unexpected envelope failure must not break session
+                    # create, but the degradation loses the seeded overrides —
+                    # surface it instead of silently downgrading.
+                    _logger.warning(
+                        "session-init envelope build failed for %s; falling back "
+                        "to the id-only body (a model-pinned first turn may "
+                        "respawn)",
+                        resp.id,
+                        exc_info=True,
+                    )
+                    init_body = {
+                        "session_id": resp.id,
+                        "agent_id": conv.agent_id,
+                        "sub_agent_name": conv.sub_agent_name,
+                    }
             try:
                 await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
             except (httpx.HTTPError, ConnectionError):

@@ -95,23 +95,43 @@ def _runner_respawn_lines(data_dir: Path, child_id: str) -> list[str]:
     return hits
 
 
-def _child_items(base_url: str, child_id: str, *, timeout: float = 30.0) -> list[dict[str, Any]]:
+def _child_items_after_turn_1(
+    base_url: str, child_id: str, *, timeout: float = 120.0
+) -> list[dict[str, Any]]:
     """
-    Fetch the child session's conversation items, waiting for the first to land.
+    Fetch the child's conversation items once its FIRST TURN has completed.
+
+    ``sys_session_send`` returns a ``"launching"`` handle before the child's
+    turn finishes, so the parent run can exit while the child is still
+    mid-turn. Both failure modes under test (the model-switch respawn and the
+    synthetic interrupted marker) happen *during* that turn — asserting before
+    it completes would pass vacuously. Completion is observed as the child's
+    assistant reply landing in its history (the mock LLM answers every child
+    turn), or an error item as the terminal fallback.
 
     :param base_url: Local server base URL.
     :param child_id: Child conversation id.
-    :param timeout: Seconds to wait for at least one item.
-    :returns: The item rows (possibly empty on timeout — asserted by callers).
+    :param timeout: Seconds to wait for the turn to reach a terminal item.
+    :returns: The item rows recorded by the completed turn.
+    :raises TimeoutError: If the child's first turn never completes.
     """
     deadline = time.monotonic() + timeout
     items: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
         items = _api(base_url, f"/v1/sessions/{child_id}/items").get("data", [])
-        if items:
+        done = any(
+            (i.get("type") == "message" and i.get("role") == "assistant")
+            or i.get("type") == "error"
+            for i in items
+        )
+        if done:
             return items
         time.sleep(1)
-    return items
+    raise TimeoutError(
+        f"child session {child_id} first turn reached no terminal item "
+        f"(assistant reply or error) within {timeout:.0f}s; "
+        f"items so far: {[i.get('type') for i in items]}"
+    )
 
 
 def test_model_pinned_subagent_first_turn_does_not_respawn(
@@ -225,6 +245,11 @@ def test_model_pinned_subagent_first_turn_does_not_respawn(
         f"the model-pinned path this test guards"
     )
 
+    # Wait for the child's first turn to actually COMPLETE before asserting:
+    # the respawn and the interrupted marker both happen mid-turn, so checking
+    # earlier would pass without exercising either acceptance criterion.
+    items = _child_items_after_turn_1(local_polly_server, child_id)
+
     # Acceptance criterion 1: zero harness model-switch respawns on turn 1.
     # The override is in the child's create body, so the first spawn should
     # already be at the pinned model; a "model changed None -> ...; respawning"
@@ -241,7 +266,6 @@ def test_model_pinned_subagent_first_turn_does_not_respawn(
     # turn 1 — the respawn's cancel path must not tell the child the USER
     # abandoned the request (that is what intermittently makes it drop its
     # task).
-    items = _child_items(local_polly_server, child_id)
     assert items, f"child session {child_id} recorded no conversation items"
     interrupted = [i for i in items if _INTERRUPTED_MARKER in json.dumps(i)]
     assert interrupted == [], (
