@@ -10,7 +10,7 @@
 // viewport width: capability, not screen size, is what decides whether a swipe
 // makes sense. Callers pass `enabled` (typically `useIsCoarsePointer()`).
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 // Left-edge band (CSS px) within which a swipe may BEGIN opening the drawer.
 // Wide enough to hit reliably with a thumb, narrow enough not to swallow taps
@@ -22,10 +22,42 @@ const DECIDE_SLOP_PX = 12;
 // Flick speed (CSS px/ms) that settles the drawer in the swipe's direction
 // regardless of how far it travelled — a fast short flick still opens/closes.
 const FLICK_VELOCITY = 0.35;
-// Strip of chat left visible to the right of the mobile drawer (Tailwind
-// `right-14` = 3.5rem). The drawer's own width — the denominator that maps
-// finger travel to a 0→1 open fraction — is the viewport minus this strip.
+// Fallback strip of chat left visible to the right of the mobile drawer
+// (Tailwind `right-14` = 3.5rem). The drawer's own width — the denominator that
+// maps finger travel to a 0→1 open fraction — is normally measured from the
+// drawer element itself (see `measureDrawerWidth`); this is only used when that
+// element can't be found, so the mapping degrades gracefully rather than
+// dividing by a wrong number.
 const PEEK_STRIP_PX = 56;
+
+// The mobile sidebar drawer, matched by its landmark label (see Sidebar.tsx's
+// `<aside aria-label="Conversations">`). Measuring it keeps the finger→progress
+// mapping correct even if the peek-strip width changes, instead of silently
+// drifting off a hardcoded constant.
+function measureDrawerWidth(): number {
+  const el = document.querySelector('aside[aria-label="Conversations"]');
+  const measured = el?.getBoundingClientRect().width ?? 0;
+  // A hidden/zero-width match (e.g. desktop layout) is useless as a denominator;
+  // fall back to the viewport-minus-strip estimate.
+  if (measured > 1) return measured;
+  return Math.max(1, window.innerWidth - PEEK_STRIP_PX);
+}
+
+// True when the touch began inside an element that can itself scroll
+// horizontally. A leftward drag there is the user scrolling that content (a
+// code block, table, carousel), not swiping the drawer shut — so we must not
+// claim the gesture and `preventDefault` its native scroll.
+function startsInHorizontalScroller(target: EventTarget | null): boolean {
+  let node = target instanceof Element ? target : null;
+  while (node) {
+    if (node.scrollWidth > node.clientWidth + 1) {
+      const overflowX = getComputedStyle(node).overflowX;
+      if (overflowX === "auto" || overflowX === "scroll") return true;
+    }
+    node = node.parentElement;
+  }
+  return false;
+}
 
 export interface SidebarEdgeSwipeOptions {
   /** Master switch — pass a touch-capability signal, e.g. `useIsCoarsePointer()`. */
@@ -54,6 +86,15 @@ export function useSidebarEdgeSwipe({
   onDragProgress,
   onSettle,
 }: SidebarEdgeSwipeOptions): void {
+  // Hold the callbacks in a ref the listeners read through, so the effect can
+  // depend only on [enabled, isOpen]. AppShell re-renders on every drag frame
+  // (each onDragProgress drives its state), which would give inline callbacks a
+  // fresh identity and, if they were deps, tear down and re-subscribe the
+  // listeners mid-gesture — resetting the local tracking/dragging state so the
+  // drag freezes after one frame. The ref keeps one stable subscription alive.
+  const callbacks = useRef({ onDragProgress, onSettle });
+  callbacks.current = { onDragProgress, onSettle };
+
   useEffect(() => {
     if (!enabled || typeof window === "undefined") return;
 
@@ -82,6 +123,9 @@ export function useSidebarEdgeSwipe({
       // A closed drawer only opens from the screen's left edge; an open drawer
       // can be swiped shut from anywhere over it.
       if (!isOpen && t.clientX > EDGE_ZONE_PX) return;
+      // A close-swipe (drawer open) that starts inside horizontally-scrollable
+      // content is that content being scrolled, not a dismiss — leave it be.
+      if (isOpen && startsInHorizontalScroller(e.target)) return;
       tracking = true;
       dragging = false;
       startX = t.clientX;
@@ -90,11 +134,18 @@ export function useSidebarEdgeSwipe({
       lastT = e.timeStamp;
       velocity = 0;
       progress = isOpen ? 1 : 0;
-      drawerWidth = Math.max(1, window.innerWidth - PEEK_STRIP_PX);
+      drawerWidth = measureDrawerWidth();
     }
 
     function onTouchMove(e: TouchEvent) {
       if (!tracking) return;
+      // A second finger landing mid-drag (pinch/zoom) is no longer a drawer
+      // swipe. Settle whatever we had so the drawer doesn't hang half-open, and
+      // stop tracking rather than chasing an arbitrary touch point.
+      if (e.touches.length !== 1) {
+        onTouchEnd();
+        return;
+      }
       const t = e.touches[0];
       const dx = t.clientX - startX;
       const dy = t.clientY - startY;
@@ -127,7 +178,7 @@ export function useSidebarEdgeSwipe({
       lastT = now;
 
       progress = clamp01((isOpen ? 1 : 0) + dx / drawerWidth);
-      onDragProgress(progress);
+      callbacks.current.onDragProgress(progress);
       // We own the gesture now — stop the page scrolling under the drawer.
       if (e.cancelable) e.preventDefault();
     }
@@ -138,8 +189,8 @@ export function useSidebarEdgeSwipe({
         // whichever resting state the drawer is closer to.
         const open =
           velocity > FLICK_VELOCITY ? true : velocity < -FLICK_VELOCITY ? false : progress > 0.5;
-        onDragProgress(null);
-        onSettle(open);
+        callbacks.current.onDragProgress(null);
+        callbacks.current.onSettle(open);
       }
       reset();
     }
@@ -157,5 +208,5 @@ export function useSidebarEdgeSwipe({
       window.removeEventListener("touchend", onTouchEnd);
       window.removeEventListener("touchcancel", onTouchEnd);
     };
-  }, [enabled, isOpen, onDragProgress, onSettle]);
+  }, [enabled, isOpen]);
 }
