@@ -31,6 +31,7 @@ from omnigent.cost_plan import (
     reserved_cost_control_keys,
 )
 from omnigent.db.utils import generate_agent_id
+from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
@@ -369,6 +370,9 @@ def register_core_routes(
             result, project_warnings = await _create_bundled_session_from_multipart(
                 request, user_id
             )
+            # Tag the audit envelope with the created session (not in the request
+            # path, so the envelope would otherwise have a null session_id).
+            add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
             if project_warnings:
                 return {
                     **result.model_dump(mode="json"),
@@ -594,6 +598,7 @@ def register_core_routes(
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 
+        add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
         if project_warnings:
             return {
                 **resp.model_dump(mode="json"),
@@ -1274,6 +1279,10 @@ def register_core_routes(
                 reason="authentication required",
             )
         await websocket.accept()
+        _logger.info(
+            "session-updates stream connected",
+            extra=debug_event("session_updates", phase="connected"),
+        )
 
         watched: list[str] = []
         # Last SessionListItem dump sent per id, used to diff. Keyed only
@@ -1495,8 +1504,16 @@ def register_core_routes(
                 # A client disconnect is the normal terminal condition; any
                 # other exception is a real bug worth surfacing in logs.
                 if exc is not None and not isinstance(exc, WebSocketDisconnect):
-                    _logger.warning("session-updates stream task crashed: %r", exc)
+                    _logger.warning(
+                        "session-updates stream task crashed: %r",
+                        exc,
+                        extra=debug_event("session_updates", phase="error"),
+                    )
         finally:
+            _logger.info(
+                "session-updates stream disconnected",
+                extra=debug_event("session_updates", phase="disconnected"),
+            )
             with contextlib.suppress(RuntimeError):
                 await websocket.close()
 

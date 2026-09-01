@@ -67,6 +67,15 @@ _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", defa
 # always wins over this ambient value.
 _session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id", default=None)
 
+# Request-scoped bag of extra audit attributes a handler can attach so they ride
+# the request's audit envelope end-event (e.g. POST /events' event type, a newly
+# created session id) rather than emitting a separate row. Reset per request by
+# the middleware; mutated in place so a handler running in a child context is
+# still visible to the middleware. Unset outside a request.
+_audit_attrs_var: ContextVar[dict[str, str] | None] = ContextVar(
+    "omnigent_audit_attrs", default=None
+)
+
 # Origin deployment identity for the workspace_id/app_name columns. The
 # multi-tenant managed service stamps a per-request ``record.workspace_id`` (via
 # its logging ContextFilter), so the sink prefers that; the values below are the
@@ -267,6 +276,37 @@ def current_session_id() -> str | None:
     this (see :func:`record_to_row`).
     """
     return _session_id_var.get() or None
+
+
+def reset_request_audit_attrs() -> None:
+    """Start a fresh per-request audit-attribute bag (server middleware).
+
+    Called at the top of the request so a handler can attach attributes that
+    ride the request's audit envelope ``ok``/``error`` row instead of emitting
+    a separate row (see :func:`add_audit_attrs`).
+    """
+    _audit_attrs_var.set({})
+
+
+def add_audit_attrs(**attrs: object) -> None:
+    """Merge attributes onto the current request's audit envelope end-event.
+
+    A no-op outside a request (bag unset -> e.g. on the runner). Mutates the
+    bag in place so the value is visible to the middleware even though it runs
+    the downstream app in a child context. Values are coerced to ``str`` and
+    ``None`` dropped, matching the ``MAP<STRING,STRING>`` attributes column.
+    """
+    bag = _audit_attrs_var.get()
+    if bag is None:
+        return
+    for key, value in attrs.items():
+        if value is not None:
+            bag[str(key)] = str(value)
+
+
+def current_request_audit_attrs() -> dict[str, str]:
+    """Return a copy of the current request's accumulated audit attributes."""
+    return dict(_audit_attrs_var.get() or {})
 
 
 def _clean(value: object) -> str | None:

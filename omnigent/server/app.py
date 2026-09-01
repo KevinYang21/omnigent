@@ -29,8 +29,10 @@ from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.debug_logging import (
     audit_event_logger,
+    current_request_audit_attrs,
     debug_event,
     debug_sink_enabled,
+    reset_request_audit_attrs,
     set_current_session_id,
     set_current_user_id,
 )
@@ -1628,6 +1630,7 @@ def create_app(
         # value leaks and no non-session route is mis-attributed).
         operation, audit_route, audit_session_id = _resolve_audit_route(request)
         set_current_session_id(audit_session_id)
+        reset_request_audit_attrs()
         _emit_audit_event(
             operation,
             "start",
@@ -1656,15 +1659,22 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
-            _emit_audit_event(
-                operation,
-                "error" if request_failed else "ok",
-                session_id=audit_session_id,
+            # Handler-attached attributes (e.g. POST /events' event type, a
+            # created session id) ride the end event; base attributes win on any
+            # key collision.
+            end_attributes = current_request_audit_attrs()
+            end_attributes.update(
                 route=audit_route,
                 method=request.method,
                 request_id=request_id,
                 status=str(status_code) if status_code is not None else "none",
                 duration_ms=str(round(duration_seconds * 1000)),
+            )
+            _emit_audit_event(
+                operation,
+                "error" if request_failed else "ok",
+                session_id=audit_session_id,
+                **end_attributes,
             )
             # Per-route tally (low-cardinality template key) for offline
             # request-breakdown analysis, e.g. the benchmark harness's

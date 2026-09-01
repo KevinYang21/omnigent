@@ -243,6 +243,24 @@ def test_record_to_row_session_ambient_beats_primary_but_explicit_wins(
     assert dl.record_to_row(record, source="runner")["session_id"] == "conv_primary"
 
 
+def test_request_audit_attrs_accumulate_and_reset() -> None:
+    # Outside a request (no bag) add_audit_attrs is a no-op and the current
+    # attrs are empty.
+    assert dl.current_request_audit_attrs() == {}
+    dl.add_audit_attrs(event_type="message")
+    assert dl.current_request_audit_attrs() == {}
+    # After a per-request reset, handlers accumulate attrs (coerced to str,
+    # None dropped) that the middleware later reads.
+    dl.reset_request_audit_attrs()
+    dl.add_audit_attrs(event_type="message", item_id="it_1", ignored=None)
+    dl.add_audit_attrs(count=3)
+    assert dl.current_request_audit_attrs() == {
+        "event_type": "message",
+        "item_id": "it_1",
+        "count": "3",
+    }
+
+
 def test_current_session_id_scope_resets() -> None:
     assert dl.current_session_id() is None
     dl.set_current_session_id("outer")
