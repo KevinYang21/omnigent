@@ -18,6 +18,9 @@ import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useSidebarEdgeSwipe } from "@/hooks/useSidebarEdgeSwipe";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -305,6 +308,26 @@ export function AppShell() {
       }),
     [],
   );
+  // In a plain touch browser (Android WebView, mobile web) there's no native
+  // bridge, so drive the same drawer gesture from DOM touch events. Gated on
+  // touch capability (pointer:coarse) so a narrow desktop window with a mouse
+  // stays gesture-free, AND on the mobile drawer layout being active: the
+  // finger-tracking transform only makes sense where the sidebar renders as a
+  // sliding overlay (`max-md`, <768px), not the ≥768px desktop push-panel a
+  // large tablet gets. Skipped inside the iOS shell, which streams the gesture
+  // natively above.
+  const coarsePointer = useIsCoarsePointer();
+  const mobileLayout = useIsMobileViewport();
+  useSidebarEdgeSwipe({
+    enabled: coarsePointer && mobileLayout && !isIOSShell() && !inSettings,
+    isOpen: sidebarOpen,
+    onDragProgress: setSidebarDragProgress,
+    onSettle: (open) => {
+      setSidebarDragProgress(null);
+      setSidebarOpen(open);
+      setSidebarPeek(false);
+    },
+  });
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
