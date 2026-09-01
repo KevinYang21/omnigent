@@ -142,3 +142,67 @@ def test_emit_audit_event_ships_operation_and_phase(monkeypatch: pytest.MonkeyPa
         dl.audit_event_logger().removeHandler(sink)
         dl.sse_event_logger().removeHandler(sink)
         sink.close()
+
+
+def test_handler_audit_attrs_ride_the_envelope_end_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # End-to-end: attrs a handler sets via add_audit_attrs must survive
+    # Starlette's BaseHTTPMiddleware (which runs the handler in a child
+    # context) and land on the envelope end-event the middleware emits in its
+    # finally. This is the propagation the whole enrich mechanism relies on.
+    from fastapi.testclient import TestClient
+
+    from omnigent.server.app import _emit_audit_event, _resolve_audit_route
+
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_active_sink", None)
+    rows: list[dl.DebugLogRow] = []
+    got_end = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        rows.extend(batch)
+        for row in batch:
+            if row["attributes"].get("phase") in ("ok", "error"):
+                got_end.set()
+
+    dl.attach_debug_log_sink([], source="server", level=logging.INFO, send=send)
+    sink = dl._active_sink
+    assert sink is not None
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _audit(request: Request, call_next):  # type: ignore[no-untyped-def]
+        operation, route, session_id = _resolve_audit_route(request)
+        dl.set_current_session_id(session_id)
+        dl.reset_request_audit_attrs()
+        _emit_audit_event(operation, "start", session_id=session_id, route=route)
+        response = await call_next(request)
+        end = dl.current_request_audit_attrs()
+        end.update(route=route, status=str(response.status_code))
+        _emit_audit_event(operation, "ok", session_id=session_id, **end)
+        return response
+
+    @app.post("/v1/sessions/{session_id}/events")
+    def post_event(session_id: str) -> dict[str, bool]:
+        dl.add_audit_attrs(event_type="message", item_id="it_1")
+        return {"queued": True}
+
+    try:
+        with TestClient(app) as client:
+            client.post("/v1/sessions/conv_9/events")
+        assert got_end.wait(timeout=1.0)
+        end_rows = [r for r in rows if r["attributes"].get("phase") == "ok"]
+        assert len(end_rows) == 1
+        end_row = end_rows[0]
+        assert end_row["event_name"] == "post_event"
+        assert end_row["session_id"] == "conv_9"
+        assert end_row["attributes"]["event_type"] == "message"
+        assert end_row["attributes"]["item_id"] == "it_1"
+        assert end_row["attributes"]["status"] == "200"
+    finally:
+        dl.set_current_session_id(None)
+        dl.audit_event_logger().removeHandler(sink)
+        dl.sse_event_logger().removeHandler(sink)
+        sink.close()
