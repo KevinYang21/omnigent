@@ -2297,34 +2297,74 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("defaults to New Sandbox when the server supports managed sandboxes", async () => {
-    // No clicks: the auto-select effect picks the FIRST menu option — the
-    // sandbox — even though an online host (machine-1) exists. If this
-    // regressed to host-first, the chip would read "machine-1".
+  it("defaults to an available online host even when managed sandboxes are enabled", async () => {
+    // No clicks: the auto-select effect prefers a connected online host over
+    // the managed sandbox. The single online host (host_1) reads as "This
+    // machine" on a local single-host server. If this regressed to
+    // sandbox-first, the chip would read "New Sandbox".
+    renderLanding({ managed_sandboxes_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
+    );
+    // Host-mode chrome comes with the default: workspace chip in, sandbox
+    // repository chip out.
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-repo-chip")).toBeNull();
+  });
+
+  it("defaults to New Sandbox when no host is online and sandboxes are enabled", async () => {
+    // An offline host can't run a session, so it must not win the default over
+    // the managed sandbox — the sandbox is the ready-to-run fallback.
+    mockHosts([host("offline")]);
     renderLanding({ managed_sandboxes_enabled: true });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
     );
-    // Sandbox mode chrome comes with the default: repository chip in,
-    // workspace/worktree chips out.
-    expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository");
-    expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
+  });
+
+  it("waits for the host list before falling back to the sandbox default", async () => {
+    // A still-loading host list must not let the sandbox pre-empt a host that
+    // is about to arrive online: once the sandbox is auto-picked this effect
+    // never re-runs to correct it. So the default holds while loading, then
+    // lands on the arriving online host rather than the sandbox.
+    mockHosts([host("online")], { isLoading: true });
+    renderLanding({ managed_sandboxes_enabled: true });
+    // Held: neither the sandbox nor a host is auto-selected yet.
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-host-chip")).toBeTruthy());
+    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain(
+      "New Sandbox",
+    );
+    // The host list resolves with an online host; a re-render re-runs the seed,
+    // which now prefers the host over the sandbox.
+    mockHosts([host("online")], { isLoading: false });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "go" },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
+    );
   });
 
   it("labels the sandbox option with the server's provider name", async () => {
     // sandbox_provider drives the per-provider label. "modal" must read
     // "Modal Sandbox" on both the chip and the dropdown option — if the
     // label regressed to the generic "New Sandbox", the provider name
-    // never reached the UI.
+    // never reached the UI. The online host wins the default now, so pick the
+    // sandbox first.
     renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "modal" });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-sandbox-option").textContent).toContain(
+      "Modal Sandbox",
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
         "Modal Sandbox",
       ),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    expect(screen.getByTestId("new-chat-landing-sandbox-option").textContent).toContain(
-      "Modal Sandbox",
     );
   });
 
@@ -2341,11 +2381,16 @@ describe("NewChatLandingScreen", () => {
 
   it("switching between a host and the sandbox swaps the workspace chrome", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
-    // Sandbox is the default; switch to the host first so the test
-    // exercises both directions of the toggle.
+    // The online host is the default; it comes with the workspace flow
+    // (file-browser chip, worktree chip) and no sandbox repository chip.
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
     );
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-repo-chip")).toBeNull();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     // The sandbox option is pinned FIRST in the menu, above the host list —
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
@@ -2357,26 +2402,28 @@ describe("NewChatLandingScreen", () => {
     expect(
       sandboxOption.compareDocumentPosition(hostItem!) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    // Picking the host restores the workspace flow (file-browser chip,
-    // worktree chip) — the sandbox default doesn't wedge the normal path.
-    fireEvent.click(hostItem!);
+    // Picking the sandbox swaps in the repository chip and drops the
+    // workspace/worktree chips.
+    fireEvent.click(sandboxOption);
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
+    );
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository");
+    expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+    // And back: selecting the host restores the workspace flow. The
+    // auto-select effect must not override this explicit pick either.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(
+      screen.getAllByText("This machine").find((el) => el.closest('[role="menuitem"]') !== null)!,
+    );
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
         "This machine",
       ),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-repo-chip")).toBeNull();
-    // And back: selecting the sandbox clears the host pick and swaps the
-    // chips again. The auto-select effect must not override this either.
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
-    );
-    expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
-    expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
   });
 
   it("creates a managed session without host_id/workspace and no provisioning subtext", async () => {
@@ -2708,6 +2755,10 @@ describe("NewChatLandingScreen", () => {
       docsLinks: { databricksGitCredentials: "Use Databricks Git credentials before cloning." },
     });
     renderLanding({ managed_sandboxes_enabled: true });
+    // The online host is the default now, so pick the sandbox to reach its
+    // repository popover.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
     );
@@ -3484,17 +3535,8 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 
   it("shows 'Create custom agent' on a host and opens the dialog", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
-    // The managed default is the sandbox even with a host present, so switch
-    // to the connected host (machine-1) first.
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    expect(hostItem).toBeTruthy();
-    fireEvent.click(hostItem!);
+    // The connected online host is the default target, so create-agent is
+    // reachable without switching away from the sandbox.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
         "This machine",
@@ -3510,17 +3552,9 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
   });
 
-  // Switch the target to the connected host, then create + submit a pending
-  // custom agent from the dialog so it becomes the selected agent.
+  // On the default connected host, create + submit a pending custom agent from
+  // the dialog so it becomes the selected agent.
   async function createAndSelectPendingAgentOnHost(): Promise<void> {
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    const hostItem = screen
-      .getAllByText("This machine")
-      .find((el) => el.closest('[role="menuitem"]') !== null);
-    fireEvent.click(hostItem!);
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
         "This machine",
@@ -3542,7 +3576,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
   it("drops a selected pending custom agent when the target switches to a sandbox", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
     await createAndSelectPendingAgentOnHost();
-    // Switch back to the sandbox: the pending pick can't run there, so the
+    // Switch to the sandbox: the pending pick can't run there, so the
     // selection falls back to a real agent and the pending row disappears.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));

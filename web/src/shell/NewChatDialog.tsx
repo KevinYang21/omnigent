@@ -2647,11 +2647,11 @@ export function NewChatLandingScreen() {
 
   // Auto-select an option so a session can be started without an explicit
   // pick. Prefer the user's last explicit choice (persisted across visits);
-  // otherwise fall back to the FIRST AVAILABLE option in menu order — the
-  // sandbox when the server supports it (it's pinned first in the picker),
-  // else the first online host. Only fills an empty slot; an explicit choice
-  // already in state (or restored from the in-memory draft) is never
-  // overridden. Holds off while a project prefill is deciding.
+  // otherwise default to an available online host — a connected machine is the
+  // ready-to-run target — and fall back to the managed sandbox only when the
+  // server offers one and no host is online. Only fills an empty slot; an
+  // explicit choice already in state (or restored from the in-memory draft) is
+  // never overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
     if (!prefillSettled) return;
     if (sandboxSelected) return;
@@ -2689,13 +2689,21 @@ export function NewChatLandingScreen() {
       return;
     }
 
+    // No usable persisted pick: default to an available online host, and only
+    // fall back to the managed sandbox when none is online. Wait for the host
+    // list to settle first so a host that is still connecting wins the default
+    // rather than being pre-empted by the sandbox — once the sandbox is picked
+    // this effect won't re-run to correct it.
+    if (hostsLoading) return;
+    const firstOnline = (hosts ?? []).find((h) => h.status === "online");
+    if (firstOnline) {
+      setSelectedHostId(firstOnline.host_id);
+      return;
+    }
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
       setSandboxProvider(defaultSandboxProvider());
-      return;
     }
-    const firstOnline = (hosts ?? []).find((h) => h.status === "online");
-    if (firstOnline) setSelectedHostId(firstOnline.host_id);
   }, [
     hosts,
     hostsLoading,
