@@ -111,6 +111,10 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("sub-agent researcher/auth finished", str(prompt))
         # Prior context replays so the model knows what was dispatched.
         self.assertIn("Dispatch the researcher.", str(prompt))
+        # The wake must NOT be labelled as a user turn: "user: [System: …]"
+        # is exactly the shape a safety-tuned model flags as injection.
+        self.assertNotIn("user: [System:", str(prompt))
+        self.assertIn("system: [System:", str(prompt))
 
     def test_resumed_session_trailing_run_stops_at_assistant(self):
         """Only the trailing run of user messages (after the last non-user) is sent."""
@@ -243,7 +247,7 @@ class TestPromptExtraction(unittest.TestCase):
         # Framing and ordering survive around the replayed image.
         self.assertIn("Conversation so far:", text)
         self.assertIn("What is shown here?", text)
-        self.assertIn("Respond to the latest user message", text)
+        self.assertIn("Respond to the latest message", text)
         self.assertIn("Summarize our conversation.", text)
 
     def test_cold_reload_replays_historical_file_as_structured_document(self):

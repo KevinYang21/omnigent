@@ -1140,7 +1140,14 @@ class GooseExecutor(Executor):
         # first turn of a brand-new conversation). See :meth:`_history_prefix`.
         if fresh_session and latest_user_idx is not None and latest_user_idx > 0:
             history_prefix = self._history_prefix(messages[:latest_user_idx])
-            user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix
+            # Label the tail by its real role: a system wake rendered as
+            # "user: [System: …]" reads as prompt injection to the model.
+            latest_role = messages[latest_user_idx].get("role", "user")
+            user_text = (
+                f"{history_prefix}\n\n{latest_role}: {user_text}"
+                if user_text
+                else history_prefix
+            )
 
         # ACP has no system-prompt field, so fold it into the first turn. The
         # latch flips on any fresh session — even with an empty system prompt —

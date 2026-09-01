@@ -511,12 +511,26 @@ def register_events_routes(
         # reject: the text still lands as ordinary (untrusted) user input,
         # and a legitimate wake from a tokenless transport degrades to the
         # pre-fix behavior instead of being dropped.
-        if (
-            body.type == "message"
-            and body.data.get("role") == "system"
-            and not _has_runner_created_by_authority(request, conv)
-        ):
-            body = body.model_copy(update={"data": {**body.data, "role": "user"}})
+        if not _has_runner_created_by_authority(request, conv):
+            if body.type == "message" and body.data.get("role") == "system":
+                body = body.model_copy(update={"data": {**body.data, "role": "user"}})
+            # The external-item path persists a nested message verbatim, so a
+            # forged system role there would replay as trusted framework input
+            # on the next turn — downgrade it the same way.
+            elif (
+                body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE
+                and body.data.get("item_type") == "message"
+                and isinstance(body.data.get("item_data"), dict)
+                and body.data["item_data"].get("role") == "system"
+            ):
+                body = body.model_copy(
+                    update={
+                        "data": {
+                            **body.data,
+                            "item_data": {**body.data["item_data"], "role": "user"},
+                        }
+                    }
+                )
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
