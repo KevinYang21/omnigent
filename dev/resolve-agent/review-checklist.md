@@ -53,6 +53,19 @@ what to look for, and why it's wrong.
   trips the security exfil scan on added lines; the repo idiom
   `os.environ.copy()` is equivalent and passes.
 
+## Enforcement / gating
+
+- **A gate added at the terminal step must also cover every mid-stream persist
+  point.** When output/content is committed incrementally (segment flushes at
+  tool boundaries, chunked writes), a policy/sanitization gate applied only at
+  the final flush lets earlier segments become durable ungated. Check every
+  call site that persists the same data class, not just the last one.
+- **Session-keyed enforcement markers need write-access gating and
+  lifetime/eviction reasoning.** A marker any read-level caller can set can
+  poison another user's turn; an LRU that can evict a pending enforcement
+  decision silently un-enforces it. Gate writes on edit access and size the
+  bound against the marker's real lifetime window.
+
 ## Rollback / cleanup
 
 - **Cleanup of an adopted resource must not destroy pre-existing user state.**

@@ -60,6 +60,7 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._sessions.common import (
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
+    _llm_response_denied_turns,
     _logger,
     get_server_runner_router,
     set_server_runner_router,
@@ -944,6 +945,15 @@ def register_hooks_routes(
         # not gated on write access.
         if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL:
             _publish_policy_denied(session_id, result.reason or "Blocked by policy.", phase.value)
+        # An LLM_RESPONSE DENY reaches the harness only after the assistant
+        # text already streamed through the runner relay, whose terminal
+        # flush would persist it as a normal assistant message. Mark the
+        # session so the relay substitutes the deny sentinel for the
+        # buffered text instead (see the relay's terminal-flush handling).
+        # Gated on write access: a read-only viewer's evaluate call must not
+        # be able to poison the owner's in-flight turn.
+        if result.action == PolicyAction.DENY and phase == Phase.LLM_RESPONSE and not is_read_only:
+            _llm_response_denied_turns[session_id] = result.reason or "Denied by policy"
         return Response(
             content=json.dumps(resp_body),
             media_type="application/json",

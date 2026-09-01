@@ -165,6 +165,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _deferred_elicitation_clear_tasks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
+    _llm_response_denied_turns,
     _logger,
     _managed_launch_tasks,
     _MirroredToolCall,
@@ -6148,6 +6149,10 @@ async def _relay_runner_stream_once(
                             )
                         if status == "running":
                             text_acc.clear()
+                            # A new turn invalidates any deny marker a prior
+                            # turn left un-consumed (e.g. its terminal event
+                            # never reached the relay across a reconnect).
+                            _llm_response_denied_turns.pop(session_id, None)
                         continue
 
                     # Terminal spin-up status from the runner's auto-create
@@ -6230,13 +6235,29 @@ async def _relay_runner_stream_once(
                         and _item.get("status") == "completed"
                         and text_acc
                     ):
+                        # A deny recorded by a mid-turn LLM_RESPONSE evaluation
+                        # (harnesses that gate per LLM call) marks this segment
+                        # as denied content; consume it the same way the
+                        # terminal flush does.
+                        _boundary_deny = _llm_response_denied_turns.pop(session_id, None)
                         await _flush_relay_text(
                             conversation_store,
                             session_id,
                             text_acc,
                             current_response_id,
                             current_model,
+                            deny_reason=_boundary_deny,
+                            # Gate each segment as it becomes durable: without
+                            # this a RESPONSE-phase policy is bypassed whenever
+                            # the model emits the offending text before a tool
+                            # call (the segment persists here, ahead of the
+                            # terminal-flush evaluation).
+                            evaluate_response_phase=_boundary_deny is None,
                         )
+                        # A failed append leaves text_acc for retry — re-arm
+                        # the marker so the retry persists the sentinel.
+                        if _boundary_deny is not None and text_acc:
+                            _llm_response_denied_turns[session_id] = _boundary_deny
 
                     conv_item = _extract_persistent_item_from_sse(
                         event,
@@ -6267,13 +6288,37 @@ async def _relay_runner_stream_once(
                             if isinstance(_resp_model, str) and _resp_model
                             else current_model
                         )
+                        # An LLM_RESPONSE DENY recorded by the policy-evaluate
+                        # route means this buffered text is the denied content;
+                        # the flush persists the deny sentinel instead. Popped
+                        # here (not merely read) so the marker can never bleed
+                        # into a later turn.
+                        #
+                        # Scope: the LLM_RESPONSE verdict exists only after the
+                        # full stream, so it can sanitize only this final
+                        # buffered segment; text persisted at earlier tool-call
+                        # boundaries is already durable (the turn still fails
+                        # with a persisted deny error item). Segment-complete
+                        # durable gating is the RESPONSE phase's job — the
+                        # boundary flush above evaluates it for every segment.
+                        _deny_reason = _llm_response_denied_turns.pop(session_id, None)
                         await _flush_relay_text(
                             conversation_store,
                             session_id,
                             text_acc,
                             current_response_id,
                             _final_model,
+                            deny_reason=_deny_reason,
+                            # Terminal flush is the only place the runner
+                            # topology can evaluate the spec's RESPONSE-phase
+                            # output policies over the final assistant text.
+                            evaluate_response_phase=_deny_reason is None,
                         )
+                        # A failed append leaves text_acc intact for a retry
+                        # at a later flush — re-arm the marker so the retry
+                        # still persists the sentinel, not the denied text.
+                        if _deny_reason is not None and text_acc:
+                            _llm_response_denied_turns[session_id] = _deny_reason
 
                     error_item = _error_item_from_sse(
                         event,

@@ -639,6 +639,21 @@ _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = 
 _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 
+# Sessions whose in-flight turn's assistant output a PHASE_LLM_RESPONSE
+# policy denied, mapped to the deny reason. Set by the policy-evaluate
+# route when it returns the DENY (the harness only errors the turn AFTER
+# the denied text already streamed and filled the relay's persistence
+# buffer), consumed by the relay's terminal text flush so the buffered
+# text persists as the deny sentinel instead of the denied content.
+# LRU-bounded so a session that never reaches its terminal flush cannot
+# leak an entry. Entries live only for the tail of a turn (DENY verdict →
+# terminal event, typically well under a second), so eviction would need
+# that many sessions in that window simultaneously; the bound is sized
+# far above any realistic concurrency to keep this enforcement state from
+# disappearing under cache pressure.
+_llm_response_denied_turns: cachetools.LRUCache[str, str] = cachetools.LRUCache(maxsize=8192)
+
+
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
@@ -966,6 +981,7 @@ __all__ = [
     "_deferred_elicitation_clear_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
+    "_llm_response_denied_turns",
     "_logger",
     "_managed_launch_tasks",
     "_model_options_cache",
