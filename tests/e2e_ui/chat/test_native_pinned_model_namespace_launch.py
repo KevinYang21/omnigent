@@ -91,9 +91,25 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+#: Ambient provider/credential variables that would otherwise leak into the
+#: rig's provider resolution and catalog probe, making the journey depend on
+#: the developer's or CI box's own configuration rather than the isolated
+#: HOME / OMNIGENT_CONFIG_HOME the rig sets up.
+_AMBIENT_PROVIDER_ENV_PREFIXES = (
+    "OPENAI_",
+    "ANTHROPIC_",
+    "CLAUDE_CODE_",
+    "DATABRICKS_",
+    "CODEX_",
+)
+
+
 def _no_proxy_env() -> dict[str, str]:
-    """Ambient env with loopback excluded from any forced HTTP(S) proxy."""
+    """Ambient env with loopback proxy-exempt and provider config stripped."""
     env = os.environ.copy()
+    for var in list(env):
+        if var.startswith(_AMBIENT_PROVIDER_ENV_PREFIXES):
+            env.pop(var)
     for var in ("NO_PROXY", "no_proxy"):
         existing = env.get(var, "")
         env[var] = ",".join(filter(None, [existing, "127.0.0.1,localhost"]))

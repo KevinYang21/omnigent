@@ -3336,11 +3336,17 @@ async def test_auto_create_codex_terminal_launch_gate_folds_a_gateway_namespace_
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
 
+    # Mirror a generic (key/gateway/local) provider resolution, which bakes
+    # the model into its ``-c`` overrides: the gate must re-resolve with the
+    # folded slug so the app-server's pinned config never carries the
+    # gateway spelling either.
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
         lambda *, model, spec=None: codex_app_mod.NativeCodexLaunch(
-            config_overrides=[], model=model, profile=None
+            config_overrides=[f"model={json.dumps(model)}"] if model else [],
+            model=model,
+            profile=None,
         ),
     )
     monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", REAL_CODEX_LAUNCH_CATALOG)
@@ -3498,6 +3504,13 @@ async def test_auto_create_codex_terminal_launch_gate_folds_a_gateway_namespace_
     assert build_calls[0]["model"] == "gpt-5.5", (
         "the gate must fold the gateway pin onto the catalog's own slug, "
         f"not pass {build_calls[0]['model']!r}"
+    )
+    overrides = build_calls[0]["extra_config_overrides"]
+    assert 'model="gpt-5.5"' in overrides and not any(
+        "databricks-gpt-5-5" in override for override in overrides
+    ), (
+        "the provider's baked model override must carry the folded slug, "
+        f"not the gateway spelling: {overrides}"
     )
 
 

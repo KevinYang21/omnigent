@@ -53,6 +53,14 @@ what to look for, and why it's wrong.
   trips the security exfil scan on added lines; the repo idiom
   `os.environ.copy()` is equivalent and passes.
 
+## Derived / resolved state
+
+- **Rewriting one field of a resolved config must re-derive its dependents.** A
+  value resolved early (a launch config, a provider resolution) often bakes the
+  input into *other* fields (config overrides, summaries, provider ids). Patching
+  just the one field after the fact leaves the baked copies stale — re-run the
+  resolution with the corrected input, or rewrite every derived field.
+
 ## Rollback / cleanup
 
 - **Cleanup of an adopted resource must not destroy pre-existing user state.**

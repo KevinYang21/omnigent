@@ -3826,7 +3826,7 @@ async def _auto_create_codex_terminal(
     ):
         from dataclasses import replace as _dataclass_replace
 
-        from omnigent.codex_model_vocabulary import codex_reachable_model_slug
+        from omnigent.codex_model_vocabulary import codex_catalog_launch_slug
         from omnigent.codex_native_app_server import (
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
@@ -3845,7 +3845,7 @@ async def _auto_create_codex_terminal(
                 # spellings together and launch on the catalog's slug — codex
                 # validates the model client-side, so the gateway spelling
                 # must never reach it either.
-                _folded_slug = codex_reachable_model_slug(
+                _folded_slug = codex_catalog_launch_slug(
                     launch_config.model_override, _codex_catalog
                 )
                 if _folded_slug is None:
@@ -3862,7 +3862,12 @@ async def _auto_create_codex_terminal(
                     session_id,
                     extra={"session_id": session_id},
                 )
-                _codex_launch = _dataclass_replace(_codex_launch, model=_folded_slug)
+                # Re-resolve the launch with the folded slug: a key/gateway/
+                # local provider bakes ``model=`` into its config_overrides at
+                # resolution time, so replacing only ``.model`` would leave
+                # the app-server's pinned config on the gateway spelling.
+                _codex_launch = resolve_native_codex_launch(model=_folded_slug, spec=_launch_spec)
+                _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
             # Same staleness rule as the claude branch: never convert a stale
             # entry's default into an explicit model pin.
