@@ -43,7 +43,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -51,6 +51,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib import error, request
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock.
+    fcntl = None  # type: ignore[assignment]
 
 from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
@@ -133,6 +138,15 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 5.0
+# Cross-process mutex for the pane's keyboard. The harness executor and the
+# runner both type into this pane from different processes, so an in-process
+# lock cannot order them, and every injector below is a multi-step sequence
+# that corrupts if interleaved.
+_PANE_LOCK_FILE = "pane.lock"
+# Above the longest single injection (paste-commit + submit-verify) so a queued
+# writer waits its turn instead of failing while the holder is progressing.
+_PANE_LOCK_TIMEOUT_S = 30.0
+_PANE_LOCK_POLL_INTERVAL_S = 0.05
 # Claude Code renders this prompt glyph in its input box once the TUI
 # is interactive. We poll ``capture-pane`` for it before injecting the
 # first message so keystrokes typed during Claude's boot aren't dropped.
@@ -2957,108 +2971,112 @@ def inject_user_message(
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
-        invocation fails, or if the draft never leaves the input box
-        after repeated submit Enters (message not delivered).
+        invocation fails, if another pane write holds the keyboard too
+        long, or if the draft never leaves the input box after repeated
+        submit Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    # A ctrl+r history search or hand-opened /model picker left covering
-    # the composer swallows everything typed below — and can hide the
-    # prompt glyph, wedging the readiness gate — so reclaim the input box
-    # before waiting on it.
-    _restore_occupied_input(info["socket_path"], info["tmux_target"])
-    # tmux.json only means the tmux session exists; Claude Code's input
-    # box mounts a few seconds later. Block until the prompt renders so
-    # the first message isn't typed into a still-booting TUI and dropped.
-    _wait_for_claude_prompt_ready(
-        info["socket_path"],
-        info["tmux_target"],
-        timeout_s=timeout_s,
-    )
-    # Clear any leftover text in Claude's input field before typing.
-    # After Escape-cancel, Claude Code re-populates the prompt area
-    # with the previous input for re-editing. Without this clear,
-    # the new message appends to the stale buffer (e.g.
-    # "old promptnew prompt" with no separator).
-    # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
-    # Ctrl-U only clears backwards from cursor.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
-    # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
-    # Claude Code TUI treats them as user text instead of invoking a state
-    # that Omnigent cannot drive. Allowed commands (``/clear``,
-    # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
-    injected_text = _escape_unsupported_slash_command(content)
-    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
-    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
-    # client→server command at ~16KB, so per-byte hex argv blew up with
-    # "command too long" on large payloads (a PR diff in a sub-agent
-    # dispatch). ``load-buffer`` streams the file without that cap, and
-    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR below) stay data instead of becoming
-    # per-line submits. See anthropics/claude-code#52126.
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        paste_file.write(_paste_payload_bytes(injected_text + "\n"))
-        paste_path = paste_file.name
-    try:
-        _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
-        _run_tmux(
+    with _pane_write_lock(bridge_dir, what="the web message"):
+        # A ctrl+r history search or hand-opened /model picker left covering
+        # the composer swallows everything typed below — and can hide the
+        # prompt glyph, wedging the readiness gate — so reclaim the input box
+        # before waiting on it.
+        _restore_occupied_input(info["socket_path"], info["tmux_target"])
+        # tmux.json only means the tmux session exists; Claude Code's input
+        # box mounts a few seconds later. Block until the prompt renders so
+        # the first message isn't typed into a still-booting TUI and dropped.
+        _wait_for_claude_prompt_ready(
             info["socket_path"],
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting (no stale copies server-side)
-            "-b",
-            "omnigent-paste",
-            "-t",
             info["tmux_target"],
+            timeout_s=timeout_s,
         )
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
-    # Wait until the TUI has visibly committed the paste into its input
-    # box before submitting. Claude Code coalesces rapid stdin bursts
-    # into a paste; an Enter that arrives while it is still consuming
-    # the paste becomes a newline inside the draft instead of a submit,
-    # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
-    needle = _submit_needle(content)
-    draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(info["socket_path"], info["tmux_target"]), needle):
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-    if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
-    # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
-    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-    last_enter = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(info["socket_path"], info["tmux_target"])
-        if not _draft_in_input_box(pane, needle):
+        # Clear any leftover text in Claude's input field before typing.
+        # After Escape-cancel, Claude Code re-populates the prompt area
+        # with the previous input for re-editing. Without this clear,
+        # the new message appends to the stale buffer (e.g.
+        # "old promptnew prompt" with no separator).
+        # Ctrl-A (Home) + Ctrl-K (kill-to-end) is the safest pair —
+        # Ctrl-U only clears backwards from cursor.
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
+        # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
+        # Claude Code TUI treats them as user text instead of invoking a state
+        # that Omnigent cannot drive. Allowed commands (``/clear``,
+        # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
+        injected_text = _escape_unsupported_slash_command(content)
+        # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
+        # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
+        # client→server command at ~16KB, so per-byte hex argv blew up with
+        # "command too long" on large payloads (a PR diff in a sub-agent
+        # dispatch). ``load-buffer`` streams the file without that cap, and
+        # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
+        # interior newlines (mapped to CR below) stay data instead of becoming
+        # per-line submits. See anthropics/claude-code#52126.
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_file.write(_paste_payload_bytes(injected_text + "\n"))
+            paste_path = paste_file.name
+        try:
+            _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
+            _run_tmux(
+                info["socket_path"],
+                "paste-buffer",
+                "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+                "-d",  # drop the buffer after pasting (no stale copies server-side)
+                "-b",
+                "omnigent-paste",
+                "-t",
+                info["tmux_target"],
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+        # Wait until the TUI has visibly committed the paste into its input
+        # box before submitting. Claude Code coalesces rapid stdin bursts
+        # into a paste; an Enter that arrives while it is still consuming
+        # the paste becomes a newline inside the draft instead of a submit,
+        # and the message sits unsent. A fixed sleep raced this (lost under
+        # load / large payloads); polling is deterministic. Best-effort:
+        # when the draft never becomes identifiable (e.g. whitespace-only
+        # first line, custom statusline containing the glyph), fall through
+        # after the timeout and submit blind, matching the old behavior.
+        needle = _submit_needle(content)
+        draft_seen = False
+        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if _draft_in_input_box(
+                _capture_pane(info["socket_path"], info["tmux_target"]), needle
+            ):
+                draft_seen = True
+                break
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        time.sleep(_PASTE_SETTLE_S)
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+        if not draft_seen:
+            # The draft was never observed, so its absence proves nothing —
+            # verification would trivially "pass". Submit blind as before.
             return
-        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
-            last_enter = time.monotonic()
-    raise RuntimeError(
-        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
-    )
+        # Verify the submit took: a successful Enter clears the input box.
+        # If the draft is still sitting there the Enter was swallowed into
+        # the paste burst as a newline — re-send it (the retry lands well
+        # after the burst, so it submits). Each Enter only fires while the
+        # draft is verifiably still present, so a retry can never hit an
+        # empty prompt or a permission dialog of the started turn.
+        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+        last_enter = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            pane = _capture_pane(info["socket_path"], info["tmux_target"])
+            if not _draft_in_input_box(pane, needle):
+                return
+            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+                _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+                last_enter = time.monotonic()
+        raise RuntimeError(
+            f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
+            "(the draft is still in the input box). The message was not delivered."
+        )
 
 
 def inject_interrupt(
@@ -3086,8 +3104,9 @@ def inject_interrupt(
         time, or if the ``tmux send-keys`` invocation fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    with _pane_write_lock(bridge_dir, what="the interrupt"):
+        # No ``-l``: tmux must interpret ``Escape`` as a key name.
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
 
 
 # Option-1 label in Claude Code's plan-review dialog: proof that dialog is
@@ -3129,11 +3148,12 @@ def inject_plan_verdict(
     if key is None:
         raise ValueError(f"unknown plan verdict {verdict!r}")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    if _PLAN_DIALOG_MARKER not in _capture_pane(info["socket_path"], info["tmux_target"]):
-        return False
-    # No ``-l``: tmux must read ``Escape`` as a key name, not literal text.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], key)
-    return True
+    with _pane_write_lock(bridge_dir, what="the plan verdict"):
+        if _PLAN_DIALOG_MARKER not in _capture_pane(info["socket_path"], info["tmux_target"]):
+            return False
+        # No ``-l``: tmux must read ``Escape`` as a key name, not literal text.
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], key)
+        return True
 
 
 def kill_session(
@@ -3211,8 +3231,9 @@ def inject_slash_command(
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
     :raises RuntimeError: If the tmux target is not advertised in
-        time, if a ``tmux send-keys`` invocation fails, or if the typed
-        command verifiably never left the input box (submit swallowed).
+        time, if a ``tmux send-keys`` invocation fails, if another pane
+        write holds the keyboard too long, or if the typed command
+        verifiably never left the input box (submit swallowed).
     """
     if not command or not command.startswith("/"):
         raise ValueError(f"slash command must start with '/'; got {command!r}")
@@ -3224,58 +3245,59 @@ def inject_slash_command(
             raise ValueError("auto_confirm needs the confirm_hint its dialog renders")
         dialog_hint = confirm_hint
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    socket_path = info["socket_path"]
-    tmux_target = info["tmux_target"]
-    # Same reclaim as inject_user_message: a ctrl+r search or hand-opened
-    # /model picker left covering the composer would swallow the C-u and
-    # the typed command.
-    _restore_occupied_input(socket_path, tmux_target)
-    # ``C-u`` clears any draft the user is mid-typing; otherwise the
-    # paste below concatenates with their text and Enter submits
-    # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
-    # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
-    # Same delivery hazards as inject_user_message: a coalesced or dropped
-    # Enter leaves the command drafted while the persisted session value
-    # claims it applied. Wait for the command to render, submit, verify it
-    # left the box; an unidentifiable draft falls through to a blind submit.
-    needle = _submit_needle(command)
-    draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    if draft_seen:
-        # Re-send only while the command verifiably still sits in the box —
-        # a one-poll-stale retry can at worst hit the empty composer (no-op)
-        # or our own confirm dialog (the intended answer), never a foreign
-        # surface. The command leaving the box is the submit signal; the
-        # dialog replacing the composer counts, since submission pops it.
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        last_enter = time.monotonic()
-        submitted = False
+    with _pane_write_lock(bridge_dir, what="the slash command"):
+        socket_path = info["socket_path"]
+        tmux_target = info["tmux_target"]
+        # Same reclaim as inject_user_message: a ctrl+r search or hand-opened
+        # /model picker left covering the composer would swallow the C-u and
+        # the typed command.
+        _restore_occupied_input(socket_path, tmux_target)
+        # ``C-u`` clears any draft the user is mid-typing; otherwise the
+        # paste below concatenates with their text and Enter submits
+        # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
+        # not interrupt an in-flight generation.
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
+        # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+        # Same delivery hazards as inject_user_message: a coalesced or dropped
+        # Enter leaves the command drafted while the persisted session value
+        # claims it applied. Wait for the command to render, submit, verify it
+        # left the box; an unidentifiable draft falls through to a blind submit.
+        needle = _submit_needle(command)
+        draft_seen = False
+        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
         while time.monotonic() < deadline:
-            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-            if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-                submitted = True
+            if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+                draft_seen = True
                 break
-            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-                last_enter = time.monotonic()
-        if not submitted:
-            raise RuntimeError(
-                f"Claude Code did not accept the slash command within "
-                f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
-                "input box). The command was not delivered."
-            )
-    if dialog_hint is not None:
-        _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint)
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        time.sleep(_PASTE_SETTLE_S)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        if draft_seen:
+            # Re-send only while the command verifiably still sits in the box —
+            # a one-poll-stale retry can at worst hit the empty composer (no-op)
+            # or our own confirm dialog (the intended answer), never a foreign
+            # surface. The command leaving the box is the submit signal; the
+            # dialog replacing the composer counts, since submission pops it.
+            deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
+            last_enter = time.monotonic()
+            submitted = False
+            while time.monotonic() < deadline:
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+                    submitted = True
+                    break
+                if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
+                    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+                    last_enter = time.monotonic()
+            if not submitted:
+                raise RuntimeError(
+                    f"Claude Code did not accept the slash command within "
+                    f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
+                    "input box). The command was not delivered."
+                )
+        if dialog_hint is not None:
+            _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint)
 
 
 def _confirm_tui_dialog(
@@ -3492,6 +3514,55 @@ def post_tools_changed(
                 raise RuntimeError(f"tools-changed POST failed with HTTP {resp.status}")
     except error.URLError as exc:
         raise RuntimeError(f"failed to notify Claude tool list change: {exc}") from exc
+
+
+@contextlib.contextmanager
+def _pane_write_lock(
+    bridge_dir: Path,
+    *,
+    what: str,
+    timeout_s: float = _PANE_LOCK_TIMEOUT_S,
+) -> Iterator[None]:
+    """
+    Hold the pane's keyboard for one whole keystroke sequence.
+
+    An exclusive ``flock`` on ``<bridge_dir>/pane.lock`` — what orders the
+    harness process against the runner process, neither of which can see the
+    other's in-process locks. Held for the whole sequence (draft clear →
+    paste → Enter → verify), since that is what must be atomic. Polls
+    ``LOCK_NB`` so a wedged holder times out instead of hanging a request
+    handler; a no-op where ``fcntl`` is unavailable (Windows).
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :param what: Short description of the sequence being serialized, used
+        in the timeout message, e.g. ``"/compact"``.
+    :param timeout_s: Seconds to wait for the keyboard, e.g. ``30.0``.
+    :yields: None, with the lock held.
+    :raises RuntimeError: If the keyboard is not free within *timeout_s*.
+    """
+    if fcntl is None:
+        yield
+        return
+    _ensure_secure_dir(bridge_dir)
+    fd = os.open(bridge_dir / _PANE_LOCK_FILE, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"another Claude pane write is still in flight after {timeout_s}s; "
+                        f"{what} was not delivered"
+                    ) from None
+                time.sleep(_PANE_LOCK_POLL_INTERVAL_S)
+        yield
+    finally:
+        # Closing the descriptor releases the flock.
+        os.close(fd)
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:

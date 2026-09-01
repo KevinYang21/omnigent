@@ -7934,3 +7934,172 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def _stub_idle_pane_tmux(
+    recorded: list[tuple[str, list[str]]],
+    pane: dict[str, str],
+    lock: threading.Lock,
+    step_delay: float = 0.02,
+) -> Any:
+    """
+    Build a ``subprocess.run`` stub that simulates Claude's input box.
+
+    ``send-keys -l`` drafts the literal text into the simulated box and
+    ``Enter`` clears it, so the paste-committed and submit-verified gates
+    both resolve on the first poll. Every delivery call is recorded with
+    the name of the thread that made it, which is what lets a test assert
+    two concurrent injections did not interleave.
+
+    :param recorded: Accumulator of ``(thread_name, argv)`` for delivery
+        calls. ``capture-pane`` polls are not recorded.
+    :param pane: Single-entry dict holding the simulated pane text —
+        shared across threads, exactly like the real pane.
+    :param lock: Guards ``recorded``/``pane`` against the test's own
+        threads, so a torn list is never mistaken for interleaving.
+    :param step_delay: Seconds to stall inside each call, widening the
+        window an unserialized writer would interleave in.
+    :returns: A callable suitable for ``monkeypatch.setattr``.
+    """
+
+    staged: dict[str, str] = {"draft": ""}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            with lock:
+                return SimpleNamespace(returncode=0, stdout=pane["text"], stderr="")
+        name = threading.current_thread().name
+        with lock:
+            recorded.append((name, list(cmd)))
+            if "load-buffer" in cmd:
+                # The message path pastes via a tmux buffer; remember the
+                # payload's first line so paste-buffer can draft it.
+                payload = Path(cmd[-1]).read_bytes().decode("utf-8", "replace")
+                staged["draft"] = payload.replace("\r", "\n").split("\n")[0]
+            elif "paste-buffer" in cmd:
+                pane["text"] = f"❯ {staged['draft']}"
+            elif "-l" in cmd:
+                # The slash-command path types the text literally.
+                pane["text"] = f"❯ {cmd[-1]}"
+            elif cmd[-1] == "Enter":
+                pane["text"] = "❯ "
+        time.sleep(step_delay)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return _fake_run
+
+
+def test_concurrent_pane_writes_do_not_interleave_keystrokes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Two concurrent injections each own the pane for their whole sequence.
+
+    The harness process delivers web turns while the runner process types
+    ``/compact`` / ``/effort`` / ``/model`` into the same tmux pane, so the
+    executor's in-process ``asyncio.Lock`` cannot order them. Each
+    injection is a multi-step sequence (clear the draft, type, Enter,
+    verify); interleaving two of them merges their keystrokes, which is
+    how a ``/compact`` ends up submitted as part of someone's message.
+
+    Fails if :func:`_pane_write_lock` stops covering the whole sequence:
+    without it the recorded argv stream alternates between the two
+    threads instead of showing one contiguous block each.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    recorded: list[tuple[str, list[str]]] = []
+    pane = {"text": "❯ "}
+    guard = threading.Lock()
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.claude_native_bridge._PASTE_SETTLE_S", 0.01)
+    monkeypatch.setattr("subprocess.run", _stub_idle_pane_tmux(recorded, pane, guard))
+
+    def _deliver_message() -> None:
+        inject_user_message(bridge_dir, content="the web message")
+
+    def _deliver_compact() -> None:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
+
+    threads = [
+        threading.Thread(target=_deliver_message, name="harness"),
+        threading.Thread(target=_deliver_compact, name="runner"),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not any(thread.is_alive() for thread in threads)
+
+    with guard:
+        owners = [name for name, _ in recorded]
+    assert set(owners) == {"harness", "runner"}
+    # One contiguous run per writer: collapse consecutive duplicates and
+    # exactly two blocks must remain. Three or more means the sequences
+    # interleaved on the shared pane.
+    blocks = [name for index, name in enumerate(owners) if index == 0 or owners[index - 1] != name]
+    assert len(blocks) == 2, f"pane writes interleaved: {owners}"
+
+
+def test_pane_write_lock_times_out_when_another_process_holds_the_keyboard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A lock held by another *process* blocks delivery and fails loud.
+
+    The flock is what orders the runner against the harness, so a holder
+    outside this interpreter must be respected. Holding the same lock
+    file on an independent descriptor is exactly what the other process
+    looks like to the kernel. Failing with ``RuntimeError`` keeps the
+    existing contract — the runner's endpoints map it to a 503 and the
+    executor to an ``ExecutorError`` — rather than hanging the caller.
+    """
+    pytest.importorskip("fcntl")
+    import fcntl as _fcntl
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    holder = os.open(bridge_dir / "pane.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        _fcntl.flock(holder, _fcntl.LOCK_EX)
+        with pytest.raises(RuntimeError, match="another Claude pane write"):
+            with claude_native_bridge._pane_write_lock(bridge_dir, what="/compact", timeout_s=0.3):
+                pass
+    finally:
+        _fcntl.flock(holder, _fcntl.LOCK_UN)
+        os.close(holder)
+
+    # Released: the next writer gets the keyboard immediately.
+    with claude_native_bridge._pane_write_lock(bridge_dir, what="/compact"):
+        pass
+
+
+def test_pane_write_lock_is_a_noop_without_fcntl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Where ``fcntl`` is unavailable (Windows) the lock degrades to a no-op.
+
+    Matches the other flock helpers in the codebase: the platform without
+    ``flock`` keeps the old unserialized behavior rather than losing the
+    ability to type into the pane at all.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge.fcntl", None)
+    bridge_dir = tmp_path / "bridge"
+    with claude_native_bridge._pane_write_lock(bridge_dir, what="/compact"):
+        pass
+    # No lock file is created when the mechanism is unavailable.
+    assert not (bridge_dir / "pane.lock").exists()

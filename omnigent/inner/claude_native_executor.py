@@ -62,10 +62,12 @@ class ClaudeNativeExecutor(Executor):
         # conversation), and ``inject_user_message`` is not atomic — it
         # issues several ``tmux send-keys`` calls. Without this lock the
         # two paths interleave their keystrokes and combine messages
-        # (e.g. "1" and "2" land as a single "12" prompt). See
-        # designs/NATIVE_INJECTION_SERIALIZATION.md. Relies on the
+        # (e.g. "1" and "2" land as a single "12" prompt). Relies on the
         # adapter caching one executor per conversation; per-turn
         # construction would regress the lock to per-turn scope.
+        # Orders writers inside this process only; the runner types into
+        # the same pane from its own, so the bridge also holds a
+        # cross-process flock per injection (``_pane_write_lock``).
         self._inject_lock = asyncio.Lock()
         # The model the pane is currently on, so a routing turn only types
         # ``/model`` when the model actually changes. Seeded lazily from the
