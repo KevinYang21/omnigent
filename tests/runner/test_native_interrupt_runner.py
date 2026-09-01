@@ -87,10 +87,15 @@ async def test_no_handler_harnesses_return_none(harness: str | None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_uniform_interrupt_injects_and_wakes_parent(
+async def test_uniform_interrupt_injects_without_terminal_wake(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A uniform interrupt calls the bridge inject fn and wakes the parent."""
+    """A uniform interrupt calls the bridge inject fn but stays non-terminal.
+
+    The inject only REQUESTS a stop; nothing confirms the agent stopped, so
+    no terminal ``cancelled`` may be delivered to the parent at inject time.
+    The real outcome arrives later on the external_session_status edge.
+    """
     import omnigent.goose_native_bridge as goose_bridge
 
     calls: list[Any] = []
@@ -106,7 +111,8 @@ async def test_uniform_interrupt_injects_and_wakes_parent(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert calls == [("dir/conv_g", 1.0)]
-    assert captured["wakes"] == [("conv_g", "cancelled", "[System: sub-agent interrupted]")]
+    # The agent's outcome is unknown at inject time — no premature terminal wake.
+    assert captured["wakes"] == []
 
 
 @pytest.mark.asyncio
@@ -263,7 +269,7 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
 async def test_claude_interrupt_resolves_bridge_id_and_injects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """claude interrupt resolves the bridge id, injects, and wakes the parent."""
+    """claude interrupt resolves the bridge id and injects, with no terminal wake."""
     import omnigent.claude_native_bridge as claude_bridge
     from omnigent.runner.native import interrupt as interrupt_mod
 
@@ -284,4 +290,5 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert injected == [("dir/bid-conv_cl", 1.0)]
-    assert captured["wakes"] == [("conv_cl", "cancelled", "[System: sub-agent interrupted]")]
+    # The agent's outcome is unknown at inject time — no premature terminal wake.
+    assert captured["wakes"] == []

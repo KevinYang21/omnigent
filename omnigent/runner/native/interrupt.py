@@ -310,21 +310,6 @@ class NativeInterruptRunner:
             return None
         return await self._uniform_stop(spec, conv_id)
 
-    def _wake_parent_after_native_interrupt(self, conv_id: str) -> None:
-        delivery_ack = self._mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output="[System: sub-agent interrupted]",
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
-        ):
-            self._logger.warning(
-                "Native interrupt: sub-agent delivery not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-
     async def _teardown_session_terminals(self, conv_id: str) -> None:
         from omnigent.entities.session_resources import terminal_resource_id
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
@@ -375,7 +360,11 @@ class NativeInterruptRunner:
                     "detail": self._client_safe_error_detail(exc, context=spec.context),
                 },
             )
-        self._wake_parent_after_native_interrupt(conv_id)
+        # An interrupt only REQUESTS a stop (a keystroke/queued signal into the
+        # agent); nothing here confirms the agent stopped. The dispatch stays
+        # non-terminal until the agent's real outcome arrives on its
+        # external_session_status edge (or stop_session confirms a kill), so
+        # a surviving agent's genuine result is not discarded.
         return Response(status_code=204)
 
     async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:
@@ -432,7 +421,8 @@ class NativeInterruptRunner:
                     ),
                 },
             )
-        self._wake_parent_after_native_interrupt(conv_id)
+        # Interrupt is only a stop REQUEST; the dispatch stays non-terminal
+        # until the agent's real outcome arrives (see _uniform_interrupt).
         return Response(status_code=204)
 
     async def _claude_stop(self, conv_id: str) -> Response:
@@ -570,5 +560,6 @@ class NativeInterruptRunner:
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        self._wake_parent_after_native_interrupt(conv_id)
+        # Interrupt is only a stop REQUEST; the dispatch stays non-terminal
+        # until the agent's real outcome arrives (see _uniform_interrupt).
         return Response(status_code=204)
