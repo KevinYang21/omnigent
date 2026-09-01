@@ -105,6 +105,37 @@ async def test_reused_id_with_a_different_question_does_not_inherit_the_verdict(
 
 
 @pytest.mark.asyncio
+async def test_gap_resolve_fingerprints_the_tombstone_from_the_pending_prompt():
+    # The nothing-parked (detected-sever gap) branch: the pending index
+    # still holds the answered prompt, so the tombstone must carry its
+    # fingerprint too — a later different question reusing the id within
+    # the TTL must not inherit the verdict from this path either.
+    from omnigent.runtime import pending_elicitations
+
+    sid = "conv_gap_fingerprint"
+    eid = "elicit_codex_88888888888888888888888888888888"
+    params = _params("Overwrite the file?")
+    pending_elicitations.reset_for_tests()
+    pending_elicitations.record_publish(
+        sid,
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": eid,
+            "params": params.model_dump(),
+        },
+    )
+    S._harness_pre_resolved_elicitations.pop(eid, None)
+    try:
+        await S._resolve_elicitation(sid, {"elicitation_id": eid, "action": "accept"}, None)
+        tomb = S._harness_pre_resolved_elicitations.get(eid)
+        assert tomb is not None and tomb.result is not None
+        assert tomb.request_fingerprint == S._harness_elicitation_request_fingerprint(params)
+    finally:
+        S._harness_pre_resolved_elicitations.pop(eid, None)
+        pending_elicitations.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_repark_of_the_same_question_adopts_the_verdict():
     # The intended consumer: a re-park of the SAME envelope (same params,
     # same fingerprint) adopts the gap-landing verdict.

@@ -1875,11 +1875,25 @@ async def _resolve_elicitation(
         except ValidationError:
             pre_resolved = None
         if pre_resolved is not None:
+            # The pending index still holds the answered prompt (the
+            # resolved fan-out below drains it), so fingerprint the
+            # tombstone with the question's params: a later, different
+            # question that reuses this id must not inherit the verdict.
+            gap_fingerprint: str | None = None
+            pending_entry = pending_elicitations.lookup(elicitation_id)
+            if pending_entry is not None and pending_entry[0] == session_id:
+                try:
+                    gap_fingerprint = _harness_elicitation_request_fingerprint(
+                        ElicitationRequestParams.model_validate(pending_entry[1].get("params"))
+                    )
+                except ValidationError:
+                    gap_fingerprint = None
             _prune_pre_resolved_harness_elicitations()
             _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
                 session_id=session_id,
                 created_at=time.time(),
                 result=pre_resolved,
+                request_fingerprint=gap_fingerprint,
             )
             _prune_pre_resolved_harness_elicitations()
     # Wake a currently-parked long-poll via resolved_elsewhere, not only its
