@@ -208,7 +208,9 @@ from omnigent.stores.project_store import ProjectStore
 #: ``conv_`` + 5 hex) — so a user-authored name that merely ends in
 #: ``" (switch prod)"`` or ``" (switch dead)"`` is never mistaken for a
 #: clone and renamed.
-_CLONE_SUFFIX = re.compile(r" \((?:fork|switch) (?:ag_[0-9a-f]{7}|conv_[0-9a-f]{5}|[0-9a-f]{10})\)$")
+_CLONE_SUFFIX = re.compile(
+    r" \((?:fork|switch) (?:ag_[0-9a-f]{7}|conv_[0-9a-f]{5}|[0-9a-f]{10})\)$"
+)
 
 
 def _agent_root_name(name: str) -> str:
