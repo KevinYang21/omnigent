@@ -12,7 +12,14 @@ import {
   TerminalIcon,
   XIcon,
 } from "lucide-react";
-import { type ReactElement, useCallback, useEffect, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type ReactElement,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { cn } from "@/lib/utils";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -143,6 +150,11 @@ function NewTabMenu({
   // Remembered shell type, persisted across remounts/reloads. Seeded from
   // localStorage so the "+" in either strip spot agrees on the current pick.
   const [preferred, setPreferred] = useState<string | null>(() => readPreferredShell());
+  // Controlled so a launch can force the menu closed. The submenu "Shell"
+  // trigger preventDefaults its click (to launch the default without toggling
+  // the submenu), which also suppresses Radix's auto-close — leaving the menu
+  // stuck open until a second click. Closing here fixes that.
+  const [menuOpen, setMenuOpen] = useState(false);
   // Shell access mirrors NewTerminalButton's gate: the agent's spec must
   // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
@@ -157,6 +169,7 @@ function NewTabMenu({
     preferred !== null && declaredTerminals.includes(preferred) ? preferred : declaredTerminals[0];
 
   const launchShell = (name: string) => {
+    setMenuOpen(false);
     // Signal the create is starting so the shell gets focused the moment its
     // tab lands in the list — not only when this POST resolves. On a waking
     // (runner-asleep) session the POST can lag the tab's arrival by seconds;
@@ -205,7 +218,7 @@ function NewTabMenu({
   );
 
   return (
-    <DropdownMenu>
+    <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
       <WorkspaceTabTooltip label="Open new" className={triggerClassName}>
         <DropdownMenuTrigger asChild>
           <button
@@ -221,7 +234,14 @@ function NewTabMenu({
       {/* min-w-44 floors the content wide enough for the longest item label
           ("Reconnecting…" + spinner, and the sub-trigger's chevron) — the
           default min-w-32 tracks the 32px "+" trigger and clips it. */}
-      <DropdownMenuContent align="start" className="min-w-44">
+      <DropdownMenuContent
+        align="start"
+        className="min-w-44"
+        // On close, Radix restores focus to the "+" trigger, which re-opens its
+        // tooltip for a frame before blur dismisses it — a visible flash after a
+        // shell launch. Suppress the focus restore to keep the tooltip closed.
+        onCloseAutoFocus={(e) => e.preventDefault()}
+      >
         {/* Hide the native browser view while this menu is open so it doesn't
             paint over the dropdown (#3980). Only this rail menu needs it. */}
         <SuppressBrowserView />
@@ -511,7 +531,6 @@ function RailTerminalView({
         sessionId={conversationId}
         terminalId={terminal.id}
         readOnly={readOnly}
-        transport={terminal.transport}
         directAttachUrl={terminal.directAttachUrl}
         onStateChange={(state) => setTerminalConnectionState(terminal.id, state)}
         onActivity={() => markTerminalActive(terminal.id)}
@@ -687,6 +706,10 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
+      // The resize hook can starve the rail to width 0 while it stays mounted;
+      // marking it collapsed keeps index.css's safe-area padding off it so a
+      // zero-width rail can't paint a ghost bg-card strip on native shells.
+      data-collapsed={width === 0 || undefined}
       // Full-height desktop surface flush to the window edge, separated from
       // the main content by a left divider — no outer margin, rounding, or
       // shadow (mirrors the left sidebar). AppShell reserves the panel width
@@ -707,8 +730,13 @@ export function WorkspacePanel({
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
-      // stretches to the absolute inset instead.
-      style={maximized ? undefined : { width }}
+      // stretches to the absolute inset instead. The width doubles as the
+      // reservation index.css caps the rail's lateral safe-area insets to.
+      style={
+        maximized
+          ? undefined
+          : ({ width, "--omnigent-reserved-width": `${width}px` } as CSSProperties)
+      }
     >
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
       {!maximized && (
@@ -750,6 +778,7 @@ export function WorkspacePanel({
               : rightRailTab
           }
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
+          componentId="chat.right_rail.tabs"
         >
           <TabsList variant="pill" className="gap-1">
             {showFilesPanel && (

@@ -70,7 +70,14 @@ import type {
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
 import { routingExtrasFromWire } from "./routingDecision";
-import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
+import type {
+  BackgroundTaskInfo,
+  CodexPersistMode,
+  ErrorInfo,
+  ModelUsage,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Out-param for `parseSseStream`: `sawDone` is set when the server's `[DONE]`
@@ -340,6 +347,32 @@ function normalizeEventType(eventType: string): string {
   return eventType;
 }
 
+const BACKGROUND_TASK_KEYS = ["id", "type", "status", "description", "command"] as const;
+
+/**
+ * Parse the `background_tasks` detail off a `session.status` payload.
+ *
+ * Keeps only the string display fields (see {@link BACKGROUND_TASK_KEYS}) and
+ * drops non-object / field-less entries. Returns `undefined` when the value is
+ * not an array or nothing usable survives, so callers can treat "no detail"
+ * uniformly (the count alone still drives the pill).
+ */
+export function parseBackgroundTasks(raw: unknown): BackgroundTaskInfo[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const tasks: BackgroundTaskInfo[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    const info: BackgroundTaskInfo = {};
+    for (const key of BACKGROUND_TASK_KEYS) {
+      const value = record[key];
+      if (typeof value === "string" && value) info[key] = value;
+    }
+    if (Object.keys(info).length > 0) tasks.push(info);
+  }
+  return tasks.length > 0 ? tasks : undefined;
+}
+
 /**
  * Parse one raw SSE-shaped event payload (e.g. an entry from the
  * snapshot's `pending_elicitations` field) into a typed
@@ -520,6 +553,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         typeof data.background_task_count === "number" && data.background_task_count >= 0
           ? data.background_task_count
           : undefined;
+      const backgroundTasks = parseBackgroundTasks(data.background_tasks);
       const rawError = data.error;
       // Parse via parseErrorInfo so a classified failure's optional
       // title/cause/remediation flow through, but keep the guard that both
@@ -541,6 +575,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         status,
         responseId,
         backgroundTaskCount,
+        ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
@@ -985,6 +1020,23 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 : undefined,
           }
         : null;
+    const codexMetaRaw = p["_meta"];
+    const codexMeta =
+      codexMetaRaw && typeof codexMetaRaw === "object" && !Array.isArray(codexMetaRaw)
+        ? (codexMetaRaw as Record<string, unknown>)
+        : null;
+    const codexPersistRaw =
+      codexMeta?.codex_approval_kind === "mcp_tool_call" ? codexMeta.persist : null;
+    const codexPersistCandidates = Array.isArray(codexPersistRaw)
+      ? codexPersistRaw
+      : [codexPersistRaw];
+    const codexPersistModes = [
+      ...new Set(
+        codexPersistCandidates.filter(
+          (value): value is CodexPersistMode => value === "session" || value === "always",
+        ),
+      ),
+    ];
     return {
       type: "elicitation_request",
       elicitationId,
@@ -1025,6 +1077,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           : null,
       allowAllEdits,
       rememberScope,
+      codexPersistModes,
     } satisfies ElicitationRequest;
   }
 

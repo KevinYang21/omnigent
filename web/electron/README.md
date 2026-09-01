@@ -34,6 +34,11 @@ adds native niceties:
   window can also be opened against a **different server** (see "Multiple
   servers" below). Notifications and the dock badge are app-wide (one badge
   for all windows); a notification click focuses the window that fired it.
+- **macOS Managed Preferences for MDM-provided servers.** Administrators can
+  publish an HTTPS `serverUrls` list in the `ai.omnigent.desktop` preference
+  domain. The connect screen and in-app switcher show those choices under
+  **Provided by your organization** without auto-connecting or preventing a
+  manually entered server. See [Managed Preferences](docs/managed-preferences.md).
 - **A dock / taskbar badge showing the number of unread sessions** at all
   times (macOS dock badge, Linux Unity launcher count, via
   `app.setBadgeCount`). A session becomes "unread" when it finishes a turn
@@ -42,8 +47,10 @@ adds native niceties:
   the badge.
 - **The standard native menu** (App / Edit / View / Window / Help) built from
   Electron's menu roles, so the usual text-editing shortcuts — Cmd/Ctrl-A,
-  C, V, X, Z — work inside the webview's text fields. Our custom actions —
-  **New Window**, **New Window on Different Server…**, and
+  C, V, X, Z — work inside the webview's text fields. **Settings…** uses the
+  native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
+  focused connected window through the SPA without reloading it. Our other
+  custom actions — **New Window**, **New Window on Different Server…**, and
   **Change Server…** — live in a dedicated **Server** submenu. On macOS a
   **Notifications** submenu turns the notification sound on/off (**Play
   Notification Sound**, **off by default** — the user opts in) and picks which
@@ -144,6 +151,7 @@ electron/
   package.json             # Electron + electron-builder deps and build config
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
   src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
+  src/managed_preferences.js # read/validate macOS MDM server choices
   src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
@@ -151,6 +159,7 @@ electron/
   setup/index.html         # the bundled "connect to server" setup page
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
+  docs/managed-preferences.md # public MDM configuration contract
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -265,6 +274,10 @@ against its local Chromium, and the result is posted back.
   conversation's page keeps running when the user switches away; views are
   destroyed only on explicit close or window teardown. Each child view keeps
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
+  Page-initiated `window.open` / `target=_blank` never spawns a window: an
+  http(s) target navigates the same view in place (still allowlist-checked on
+  an agent-locked view), and right-click offers "Open Link in Browser" /
+  "Copy Link Address".
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it
