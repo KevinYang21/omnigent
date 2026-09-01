@@ -31,7 +31,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -162,10 +162,19 @@ _RELEASE_GRACE_S = 5.0
 # forever.
 _SPAWN_READY_TIMEOUT_S = 30.0
 
-# Polling interval while waiting for the socket to appear. Short
-# enough that fast spawns return quickly; not so short that we
-# hammer the filesystem.
+# Steady polling interval while waiting for the socket to appear.
+# Short enough that a slow spawn returns quickly; not so short that we
+# hammer the filesystem for the whole ready timeout.
 _SPAWN_POLL_INTERVAL_S = 0.05
+
+# Bind is the longest stage of session init, and it lands somewhere in a
+# few hundred milliseconds — a window the steady cadence quantizes, so
+# readiness is seen up to a full interval after it happened. Probe
+# tightly across that window instead (a local socket probe is a syscall,
+# not a request), then ease off to the steady cadence for the tail.
+_SPAWN_POLL_TIGHT_INTERVAL_S = 0.01
+_SPAWN_POLL_TIGHT_WINDOW_S = 1.0
+_SPAWN_POLL_BACKOFF_FACTOR = 1.5
 
 # httpx's default read timeout (5s) is too short for SSE streams
 # that pause for tens of seconds during tool dispatch round-trips
@@ -271,6 +280,28 @@ def _resolve_module_path(harness: str) -> str:
     )
 
 
+def _spawn_poll_intervals() -> Iterator[float]:
+    """
+    Yield successive sleeps between harness bind probes.
+
+    Holds :data:`_SPAWN_POLL_TIGHT_INTERVAL_S` across the window where
+    bind normally lands, then grows geometrically to the steady
+    :data:`_SPAWN_POLL_INTERVAL_S` cadence, so a spawn that is stuck
+    rides out its ready timeout without a hot loop. Infinite: the caller
+    stops on its own deadline.
+
+    :returns: Iterator of sleep durations in seconds, e.g.
+        ``0.01, 0.01, ... 0.015, 0.0225, ... 0.05, 0.05``.
+    """
+    interval = _SPAWN_POLL_TIGHT_INTERVAL_S
+    elapsed = 0.0
+    while True:
+        yield interval
+        elapsed += interval
+        if elapsed >= _SPAWN_POLL_TIGHT_WINDOW_S:
+            interval = min(interval * _SPAWN_POLL_BACKOFF_FACTOR, _SPAWN_POLL_INTERVAL_S)
+
+
 async def _wait_for_bind(
     process: asyncio.subprocess.Process,
     endpoint: _HarnessEndpoint,
@@ -298,6 +329,7 @@ async def _wait_for_bind(
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _SPAWN_READY_TIMEOUT_S
+    intervals = _spawn_poll_intervals()
     while True:
         if process.returncode is not None:
             # Subprocess inherits stderr so the failure message
@@ -324,7 +356,7 @@ async def _wait_for_bind(
                 f"{conversation_id!r} did not bind its endpoint "
                 f"within {_SPAWN_READY_TIMEOUT_S:.0f}s"
             )
-        await asyncio.sleep(_SPAWN_POLL_INTERVAL_S)
+        await asyncio.sleep(next(intervals))
 
 
 async def _can_connect_uds(socket_path: Path) -> bool:

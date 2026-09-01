@@ -1595,3 +1595,104 @@ async def test_shutdown_during_spawn_leaves_no_live_process(
         await _cancel_pending(get_task, shutdown_task)
         # Idempotent if the test already shut down; still safe if it failed early.
         await manager.shutdown()
+
+
+def test_spawn_poll_intervals_probe_the_bind_window_tightly() -> None:
+    """
+    Bind probes stay tight across the window where bind lands, then ease off.
+
+    Harness bind is the longest stage of session init and completes a few
+    hundred milliseconds in, so a flat cadence reports readiness up to a
+    full interval late. The schedule must therefore hold a sub-cadence
+    interval across that whole window — not merely open tight and ramp
+    past it — while still bounding the probe count over the full ready
+    timeout, so a stuck spawn never degenerates into a hot loop.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    intervals = pm_mod._spawn_poll_intervals()
+    tight = pm_mod._SPAWN_POLL_TIGHT_INTERVAL_S
+    steady = pm_mod._SPAWN_POLL_INTERVAL_S
+
+    assert tight < steady
+
+    # Probe the schedule out to the ready timeout, recording when each
+    # probe would happen and how long the caller waits at that point.
+    elapsed = 0.0
+    probes: list[tuple[float, float]] = []
+    while elapsed < pm_mod._SPAWN_READY_TIMEOUT_S:
+        interval = next(intervals)
+        probes.append((elapsed, interval))
+        elapsed += interval
+
+    waits = [interval for _, interval in probes]
+    assert waits[0] == tight
+    assert waits == sorted(waits)
+    assert max(waits) == steady
+
+    # Readiness anywhere inside the tight window costs at most one tight
+    # interval of dead time, instead of up to a full steady cadence.
+    in_window = [interval for at, interval in probes if at < pm_mod._SPAWN_POLL_TIGHT_WINDOW_S]
+    assert max(in_window) == tight
+
+    # The tail must not keep paying the tight price: covering the ready
+    # timeout stays within a small factor of the flat cadence's probe
+    # count, so a future edit cannot turn this into a hot loop.
+    flat_probes = pm_mod._SPAWN_READY_TIMEOUT_S / steady
+    assert len(probes) < 2 * flat_probes
+
+
+async def test_wait_for_bind_sees_a_late_bind_without_a_cadence_delay() -> None:
+    """
+    A bind that lands mid-window is observed promptly, not on a coarse tick.
+
+    The stub becomes connectable partway through the bind window — the
+    shape of a real harness spawn, and deliberately not on a multiple of
+    the steady cadence. The waiter must probe many times across that
+    window (so readiness is seen within one tight interval of happening)
+    rather than a handful of times at the steady cadence, which used to
+    add up to a full interval of dead time to every session init.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    bind_delay_s = 0.28
+    ready_at = time.monotonic() + bind_delay_s
+
+    class _StubProcess:
+        """Stands in for a runner subprocess that is still starting up."""
+
+        returncode = None
+
+    class _StubEndpoint:
+        """Endpoint that starts accepting connections at ``ready_at``."""
+
+        def __init__(self) -> None:
+            self.probes = 0
+            self.hardened = False
+
+        async def can_connect(self) -> bool:
+            self.probes += 1
+            return time.monotonic() >= ready_at
+
+        def harden(self) -> None:
+            self.hardened = True
+
+    endpoint = _StubEndpoint()
+    await pm_mod._wait_for_bind(
+        _StubProcess(),  # type: ignore[arg-type]
+        endpoint,  # type: ignore[arg-type]
+        _TEST_HARNESS_NAME,
+        "conv_bind_latency",
+    )
+
+    lateness = time.monotonic() - ready_at
+    assert endpoint.hardened
+    assert lateness < pm_mod._SPAWN_POLL_INTERVAL_S
+    # Half the probes the tight cadence allows for, so an overloaded CI box
+    # oversleeping every interval still passes — but the steady cadence
+    # (which would probe ~6 times here) cannot.
+    steady_probes = bind_delay_s / pm_mod._SPAWN_POLL_INTERVAL_S
+    assert endpoint.probes > 2 * steady_probes, (
+        f"only {endpoint.probes} probes across a {bind_delay_s * 1000:.0f}ms bind — "
+        "the wait is back on a coarse tick"
+    )
