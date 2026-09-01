@@ -2939,33 +2939,12 @@ describe("NewChatLandingScreen skills menu", () => {
     );
   });
 
-  it("does not ask the host for a native terminal agent", () => {
-    // The vendor CLI owns slash commands there, so the web menu stays hidden
-    // — and a request whose answer can't be shown is pure round-trip.
-    mockAgents([
-      {
-        id: "a_native",
-        name: "claude-native-ui",
-        display_name: "Claude Code",
-        description: null,
-        harness: "claude-native",
-        skills: [],
-      },
-    ]);
-    renderLanding();
-    // Last arg is the `enabled` gate — false keeps the query from firing.
-    expect(useHostAgentSkillsMock).toHaveBeenLastCalledWith(
-      expect.anything(),
-      expect.anything(),
-      expect.anything(),
-      false,
-    );
-  });
-
-  it("shows no menu for native terminal agents even if skills are listed", () => {
-    // A native agent with (hypothetical) bundled skills: the gate is the
-    // agent kind, not an empty skill list — the vendor CLI interprets
-    // slash commands itself, so the web menu must stay out of the way.
+  it("offers skills for native terminal agents too, completing the name only", () => {
+    // Claude Code is what auto-selects for most people, and its
+    // host-discovered skills ARE its own slash commands — so the landing menu
+    // lists them, matching the in-session composer (which never gated on the
+    // harness). The first message reaches the CLI as text, which interprets
+    // the completed "/name" itself.
     mockAgents([
       {
         id: "a1",
@@ -2976,9 +2955,38 @@ describe("NewChatLandingScreen skills menu", () => {
         skills: [{ name: "review-pr", description: "Review a pull request" }],
       },
     ]);
+    useHostAgentSkillsMock.mockReturnValue({
+      data: [{ name: "dev-productivity:deslop", description: "Remove AI slop" }],
+    } as unknown as ReturnType<typeof useHostAgentSkills>);
     renderLanding();
     typeMessage("/");
-    expect(screen.queryByTestId("slash-menu-item-review-pr")).toBeNull();
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toBeTruthy();
+    expect(screen.getByTestId("slash-menu-item-dev-productivity:deslop")).toBeTruthy();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Tab" });
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "/review-pr ",
+    );
+  });
+
+  it("asks the host for a native terminal agent's skills as well", () => {
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    // Last arg is the `enabled` gate — the harness no longer suppresses it.
+    expect(useHostAgentSkillsMock).toHaveBeenLastCalledWith(
+      "host_1",
+      "a1",
+      "/Users/corey/repo",
+      true,
+    );
   });
 });
 

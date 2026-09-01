@@ -42,19 +42,26 @@ def _fulfill(route: Route, body: dict[str, object]) -> None:
 
 
 def _stub_landing(
-    page: Page, *, bundled: list[dict[str, str]], host: list[dict[str, str]]
+    page: Page,
+    *,
+    bundled: list[dict[str, str]],
+    host: list[dict[str, str]],
+    harness: str = "claude-sdk",
+    agent_name: str = "helper",
 ) -> None:
     """Stub the landing screen's edges: one host, one agent, its skills.
 
-    ``harness: "claude-sdk"`` keeps the ``/`` menu enabled (native-terminal
-    agents suppress it, since their CLI owns slash commands) and makes the
-    agent auto-select as the only row. The session list is stubbed empty so no
-    agent discovered by the ``kind=any`` scan sorts ahead and steals that
-    auto-selection.
+    The agent is the only row, so it auto-selects. The session list is stubbed
+    empty so no agent discovered by the ``kind=any`` scan sorts ahead and
+    steals that auto-selection.
 
     :param page: The Playwright page to install routes on.
     :param bundled: Skills reported by ``GET /v1/agents`` for the agent.
     :param host: Skills the host reports for it (the pre-launch endpoint).
+    :param harness: The agent's harness — drives whether the frontend treats it
+        as a native terminal agent.
+    :param agent_name: The agent's name, which the native-agent mapping also
+        keys on.
     """
     page.route(
         "**/v1/hosts",
@@ -80,10 +87,10 @@ def _stub_landing(
                 "data": [
                     {
                         "id": "ag_helper_e2e",
-                        "name": "helper",
+                        "name": agent_name,
                         "display_name": "Helper",
                         "description": "A helper agent",
-                        "harness": "claude-sdk",
+                        "harness": harness,
                         "skills": bundled,
                     }
                 ]
@@ -157,6 +164,44 @@ def test_landing_composer_lists_a_skill_only_the_host_can_see(
     expect(host_row).to_have_attribute("data-active", "true")
 
     landing_input.press("Tab")
+    expect(landing_input).to_have_value("/dev-productivity:deslop ")
+
+
+def test_landing_composer_offers_skills_for_a_native_terminal_agent(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Claude Code — what auto-selects for most people — offers its skills too.
+
+    The landing menu used to suppress itself for every native terminal agent on
+    the theory that the vendor CLI owns slash commands. But the host-discovered
+    skills *are* that CLI's own commands, and the in-session composer never
+    gated on the harness — so the new-chat screen was the one place a Claude
+    Code user's own skills were invisible.
+
+    :param page: Playwright page (fresh context per test).
+    :param live_server: Base URL of the spawned server serving the SPA.
+    """
+    _stub_landing(
+        page,
+        bundled=[],
+        host=[_HOST_SKILL],
+        harness="claude-native",
+        agent_name="claude-native-ui",
+    )
+    page.goto(f"{live_server}/")
+    landing_input = page.get_by_test_id("new-chat-landing-input")
+    expect(landing_input).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
+        "Claude Code", timeout=30_000
+    )
+
+    landing_input.fill("/deslop")
+    host_row = page.get_by_test_id("slash-menu-item-dev-productivity:deslop")
+    expect(host_row).to_be_visible(timeout=15_000)
+
+    landing_input.press("Tab")
+    # Completing the name is all this does — the CLI interprets it from there.
     expect(landing_input).to_have_value("/dev-productivity:deslop ")
 
 

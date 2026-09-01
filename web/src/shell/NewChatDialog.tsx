@@ -3588,8 +3588,16 @@ export function NewChatLandingScreen() {
   // Slash-command suggestions for the chosen agent's skills. Mirrors the
   // in-session composer's menu mechanics (open on the "/" token at the caret,
   // wherever in the draft it sits), but lists skills only — built-ins like
-  // /model need a live session. Hidden for native-terminal agents (their CLI
-  // owns slash commands) and for agents with no skills at all.
+  // /model need a live session.
+  //
+  // Native terminal agents are included: their host-discovered skills ARE the
+  // vendor CLI's own slash commands (~/.claude/skills and enabled plugins are
+  // exactly what Claude Code registers), and the first message reaches that CLI
+  // as text, so it interprets the completed "/name" itself. The in-session
+  // composer has never gated on the harness either — hiding them here only on
+  // the landing screen made the default agent look like it had no skills.
+  // Completing a name is all this does; `matchSkillInvocation` still declines to
+  // route natives as a `slash_command` (see handleCreate).
   const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
   // Skills the chosen host would add on top of the bundled ones —
   // ~/.claude/skills, enabled Claude Code plugins, the workspace's own
@@ -3604,17 +3612,16 @@ export function NewChatLandingScreen() {
     sandboxSelected ? null : selectedHostId,
     skillsAgentId,
     workspaceValid ? workspaceTrimmed : null,
-    !isNativeTerminalAgent && skillsAgentId !== null,
+    skillsAgentId !== null,
   );
   const skillCommands = useMemo(() => {
-    if (isNativeTerminalAgent) return {};
     const m: Record<string, string> = {};
     for (const s of selectedAgent?.skills ?? []) m[`/${s.name}`] = s.description;
     // Host skills come after the bundled ones (the endpoint already drops
     // names the bundle claims), so a bundled skill keeps its own description.
     for (const s of hostSkills ?? []) m[`/${s.name}`] ??= s.description;
     return m;
-  }, [selectedAgent, isNativeTerminalAgent, hostSkills]);
+  }, [selectedAgent, hostSkills]);
   // Caret offset + dismissal, exactly as the in-session composer tracks them:
   // ``null`` reads the token at the end of the draft (a prefilled message the
   // user hasn't typed into yet), Escape/blur closes without editing the draft.
