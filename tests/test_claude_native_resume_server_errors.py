@@ -9,6 +9,8 @@ letting the raw client error escape to the crash handler.
 
 from __future__ import annotations
 
+import re
+
 import click
 import httpx
 import pytest
@@ -17,11 +19,13 @@ from omnigent_client._errors import OmnigentError, ServerError
 from omnigent import claude_native
 from omnigent.repl import _resume_picker
 
+_BASE_URL = "http://server.example"
+
 
 def _run_picker() -> str | None:
     """Invoke the resolver on the bare ``--resume`` (picker) path."""
     return claude_native._resolve_session_id_for_resume(
-        base_url="http://server.example",
+        base_url=_BASE_URL,
         headers={},
         session_id=None,
         resume_picker=True,
@@ -42,14 +46,13 @@ def test_gateway_5xx_on_session_listing_raises_actionable_error(
 
     monkeypatch.setattr(_resume_picker, "pick_conversation_by_wrapper_label_from_sdk", _boom)
 
-    with pytest.raises(click.ClickException) as exc_info:
+    with pytest.raises(
+        click.ClickException,
+        match=re.escape(f"at {_BASE_URL}: Bad Gateway (HTTP 502)"),
+    ) as exc_info:
         _run_picker()
 
-    message = str(exc_info.value)
-    assert "http://server.example" in message
-    assert "Bad Gateway" in message
-    assert "502" in message
-    assert "retry" in message.lower()
+    assert "retry" in str(exc_info.value).lower()
 
 
 def test_auth_4xx_on_session_listing_is_not_framed_as_transient(
@@ -62,12 +65,13 @@ def test_auth_4xx_on_session_listing_is_not_framed_as_transient(
 
     monkeypatch.setattr(_resume_picker, "pick_conversation_by_wrapper_label_from_sdk", _boom)
 
-    with pytest.raises(click.ClickException) as exc_info:
+    with pytest.raises(
+        click.ClickException,
+        match=re.escape(f"at {_BASE_URL}: Unauthorized (HTTP 401)"),
+    ) as exc_info:
         _run_picker()
 
     message = str(exc_info.value)
-    assert "http://server.example" in message
-    assert "401" in message
     assert "credentials" in message.lower()
     assert "transient" not in message.lower()
 
@@ -82,12 +86,11 @@ def test_transport_failure_on_session_listing_raises_actionable_error(
 
     monkeypatch.setattr(_resume_picker, "pick_conversation_by_wrapper_label_from_sdk", _boom)
 
-    with pytest.raises(click.ClickException) as exc_info:
+    with pytest.raises(
+        click.ClickException,
+        match=re.escape(f"Could not reach the omnigent server at {_BASE_URL}"),
+    ):
         _run_picker()
-
-    message = str(exc_info.value)
-    assert "http://server.example" in message
-    assert "Could not reach" in message
 
 
 def test_explicit_session_id_bypasses_picker_and_server(
@@ -101,7 +104,7 @@ def test_explicit_session_id_bypasses_picker_and_server(
     monkeypatch.setattr(_resume_picker, "pick_conversation_by_wrapper_label_from_sdk", _boom)
 
     resolved = claude_native._resolve_session_id_for_resume(
-        base_url="http://server.example",
+        base_url=_BASE_URL,
         headers={},
         session_id="conv_123",
         resume_picker=True,
