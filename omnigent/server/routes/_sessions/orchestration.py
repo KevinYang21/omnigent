@@ -1364,7 +1364,6 @@ def _persist_native_cumulative_usage(
     session_id: str,
     data: dict[str, Any],
     conversation_store: ConversationStore,
-    conv: Conversation | None = None,
 ) -> float | None:
     """
     Persist cumulative cost / token usage reported by a native harness.
@@ -1415,13 +1414,6 @@ def _persist_native_cumulative_usage(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param data: The ``external_session_usage`` event ``data`` dict.
     :param conversation_store: Store for reading and writing ``session_usage``.
-    :param conv: The session's already-loaded conversation row, when the
-        caller holds one (the events route's access check just read it), so
-        this persist doesn't re-read the same row. The read-then-write on
-        ``session_usage`` is non-transactional with or without an internal
-        read, so a supplied row keeps the same race class (the window merely
-        starts at the caller's read); the monotonic clamps below still apply
-        against whatever baseline was read. ``None`` reads the row here.
     :returns: The session's cumulative priced cost in USD after this
         update (for the caller to broadcast on a ``session.usage``
         event), or ``None`` when the session is unpriced or no
@@ -1436,8 +1428,12 @@ def _persist_native_cumulative_usage(
     if cost is None and policy_cost is None and cin is None and cout is None:
         return None
 
-    if conv is None:
-        conv = conversation_store.get_conversation(session_id)
+    # Deliberately a FRESH read — never a caller-supplied row. This row is the
+    # baseline for the monotonic clamps and the daily-rollup delta below, and
+    # ``set_session_usage`` rewrites the whole usage JSON; a row read earlier
+    # in the request would widen the forged-low-report race window and could
+    # overwrite a concurrent report's growth with stale state.
+    conv = conversation_store.get_conversation(session_id)
     current: dict[str, Any] = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
@@ -1587,10 +1583,13 @@ async def _persist_external_session_usage(
     :param body: External session-usage event body.
     :param conversation_store: Store used to upsert the labels.
     :param conv: The session's already-loaded conversation row, when the
-        caller holds one (the events route's access check reads it). Threaded
-        to the own-usage persist, the subtree roll-up, and the ancestor
-        publish so one flush shares one row read instead of re-reading it
-        per step. ``None`` makes each step resolve the row itself.
+        caller holds one (the events route's access check reads it). Supplies
+        the tree root to the subtree roll-up and the ancestor publish — both
+        read-only, and both verify a supplied root against the tree it
+        produces — so those steps don't re-read the row. NOT passed to the
+        own-usage persist: its monotonic-clamp baseline must be a fresh read
+        (see :func:`_persist_native_cumulative_usage`). ``None`` makes each
+        step resolve the row itself.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
     :raises OmnigentError: On missing / malformed fields.
     """
@@ -1632,7 +1631,6 @@ async def _persist_external_session_usage(
         session_id,
         body.data,
         conversation_store,
-        conv,
     )
     _n_in = body.data.get("cumulative_input_tokens")
     _n_out = body.data.get("cumulative_output_tokens")

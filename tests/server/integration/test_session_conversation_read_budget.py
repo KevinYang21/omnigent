@@ -10,7 +10,9 @@ the same conversation row the handler already holds. The same
 "redundant read before a tree walk" shape recurs in the usage report
 (per listed session) and in the turn-completion usage flush
 (``external_session_usage`` → own-usage persist, subtree roll-up, and
-ancestor publish each re-read the row).
+ancestor publish each re-read the row). The flush keeps ONE extra read
+by design: the own-usage persist's monotonic anti-forgery clamp must
+baseline against a fresh row, not the request-start authorization row.
 
 These tests pin the number of conversation POINT READS (statements
 whose WHERE clause filters on ``conversations.id = ?``) each route
@@ -171,20 +173,32 @@ async def test_usage_report_does_not_reread_listed_conversations(
     )
 
 
-async def test_usage_flush_reads_conversation_once(
+async def test_usage_flush_reads_conversation_twice(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
     """
-    A turn-completion usage flush must point-read the conversation once.
+    A turn-completion usage flush point-reads the conversation exactly twice.
 
     ``POST /v1/sessions/{id}/events`` with ``external_session_usage`` (the
-    native harnesses' turn-completion usage report) currently reads the
-    same conversation row several times: the route's own access check, the
+    native harnesses' turn-completion usage report) previously read the
+    same conversation row four times: the route's access check, the
     own-usage persist (``_persist_native_cumulative_usage``), the subtree
     roll-up (``load_session_usage`` without a root), and the ancestor
-    publish (``_publish_subtree_cost_to_ancestors`` without the row). All
-    should share one read.
+    publish (``_publish_subtree_cost_to_ancestors`` without the row).
+
+    Two reads are each independently required and stay:
+
+    - the route's access check (authorization);
+    - the own-usage persist's read — its baseline for the monotonic
+      forged-low-report clamp and the daily-rollup delta MUST be fresh,
+      not the request-start row, or a replayed low report racing a real
+      one gets a wider window to lower the persisted/enforced cost and
+      double-count the daily rollup.
+
+    The read-only tree walks (subtree roll-up, ancestor publish) reuse the
+    access-check row's immutable ``root_conversation_id`` (verified against
+    the tree it produces), so they cost no extra row read.
     """
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -203,9 +217,10 @@ async def test_usage_flush_reads_conversation_once(
 
     assert resp.status_code == 202, resp.text
     point_reads = _conversation_point_reads(statements)
-    assert len(point_reads) == 1, (
+    assert len(point_reads) == 2, (
         f"usage flush issued {len(point_reads)} conversation point reads "
-        f"(expected 1 shared read); the own-usage persist, the subtree "
-        f"roll-up, and the ancestor publish are each re-reading the row. "
+        f"(expected 2: the access check + the persist's fresh clamp "
+        f"baseline); the subtree roll-up and the ancestor publish must "
+        f"reuse the access-check row's root instead of re-reading the row. "
         f"statements={point_reads}"
     )
