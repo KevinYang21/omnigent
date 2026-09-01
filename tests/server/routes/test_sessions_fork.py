@@ -1445,20 +1445,33 @@ async def test_fork_of_switched_session_roots_the_clone_name() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fork_preserves_user_authored_suffix_looking_name() -> None:
+@pytest.mark.parametrize(
+    "user_authored_name",
+    [
+        # Non-hex word: never matches any id shape.
+        "release (switch prod)",
+        # Hex-only English word, but 4 chars — not the exact 10-hex width
+        # (or ag_+7 / conv_+5) the routes ever minted.
+        "deploy (switch dead)",
+    ],
+)
+async def test_fork_preserves_user_authored_suffix_looking_name(
+    user_authored_name: str,
+) -> None:
     """A user-authored name that merely LOOKS like a clone suffix must be
     copied verbatim on fork.
 
-    Only the id shapes the routes actually mint (hex, optionally with a
-    legacy ``ag_``/``conv_`` prefix) are framework clone suffixes; a template
-    someone named "release (switch prod)" is not a clone and renaming its
-    fork to "release" would change its identity (and could collide with a
-    different agent of that name).
+    Only the exact shapes the routes ever minted (``id[:10]``: 10 bare hex,
+    or legacy ``ag_``+7 / ``conv_``+5 hex) are framework clone suffixes; a
+    template someone named "release (switch prod)" — or with a short hex
+    word like "deploy (switch dead)" — is not a clone, and renaming its
+    fork would change its identity (and could collide with a different
+    agent of that name).
     """
     user_named = Agent(
         id="1d09e2c5b6a74000a000000000000002",
         created_at=1,
-        name="release (switch prod)",
+        name=user_authored_name,
         bundle_location="1d09e2c5b6a74000a000000000000002/fakehash",
         version=1,
         session_id="e9f8f58523cec9a57d3bdf93be543e8d",
@@ -1475,7 +1488,7 @@ async def test_fork_preserves_user_authored_suffix_looking_name() -> None:
 
     assert resp.status_code == 201, resp.text
     assert len(conv_store.fork_calls) == 1
-    assert conv_store.fork_calls[0]["cloned_agent_name"] == "release (switch prod)", (
+    assert conv_store.fork_calls[0]["cloned_agent_name"] == user_authored_name, (
         "A user-authored suffix-looking name is not a clone suffix and must "
         f"survive the fork verbatim, got {conv_store.fork_calls[0]['cloned_agent_name']!r}"
     )

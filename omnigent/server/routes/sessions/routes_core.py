@@ -203,10 +203,12 @@ from omnigent.stores.project_store import ProjectStore
 
 #: One trailing ``" (fork <id>)"`` / ``" (switch <id>)"`` clone suffix.
 #: Mirrors the web's ``agentRootName`` (web/src/lib/forkHarness.ts), but only
-#: matches the id shapes the routes actually mint (bare hex, optionally with
-#: a legacy ``ag_``/``conv_`` prefix) so a user-authored name that merely
-#: ends in ``" (switch prod)"`` is never mistaken for a clone and renamed.
-_CLONE_SUFFIX = re.compile(r" \((?:fork|switch) (?:ag_|conv_)?[0-9a-f]{4,32}\)$")
+#: matches the exact shapes the routes ever minted — ``id[:10]`` of a bare
+#: 32-hex id (10 hex) or of a legacy prefixed id (``ag_`` + 7 hex /
+#: ``conv_`` + 5 hex) — so a user-authored name that merely ends in
+#: ``" (switch prod)"`` or ``" (switch dead)"`` is never mistaken for a
+#: clone and renamed.
+_CLONE_SUFFIX = re.compile(r" \((?:fork|switch) (?:ag_[0-9a-f]{7}|conv_[0-9a-f]{5}|[0-9a-f]{10})\)$")
 
 
 def _agent_root_name(name: str) -> str:
