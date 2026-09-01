@@ -3826,6 +3826,7 @@ async def _auto_create_codex_terminal(
     ):
         from dataclasses import replace as _dataclass_replace
 
+        from omnigent.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.codex_native_app_server import (
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
@@ -3838,11 +3839,30 @@ async def _auto_create_codex_terminal(
         _codex_catalog = await codex_launch_catalog(codex_path=_codex_cli_path)
         if launch_config.model_override and _codex_catalog:
             if not catalog_contains(_codex_catalog, launch_config.model_override):
-                raise click.ClickException(
-                    f"the requested model {launch_config.model_override!r} is not in "
-                    "this host's current model list — it may have changed since the "
-                    "pick. Pick again from the model menu."
+                # A spec pin or routing pick can spell a served model in the
+                # gateway/catalog namespace ("databricks-gpt-5-5") while the
+                # launch catalog lists codex's own slug ("gpt-5.5"). Fold the
+                # spellings together and launch on the catalog's slug — codex
+                # validates the model client-side, so the gateway spelling
+                # must never reach it either.
+                _folded_slug = codex_reachable_model_slug(
+                    launch_config.model_override, _codex_catalog
                 )
+                if _folded_slug is None:
+                    raise click.ClickException(
+                        f"the requested model {launch_config.model_override!r} is not in "
+                        "this host's current model list — it may have changed since the "
+                        "pick. Pick again from the model menu."
+                    )
+                _logger.info(
+                    "codex launch gate folded the pinned model %r onto the catalog "
+                    "slug %r for session=%s",
+                    launch_config.model_override,
+                    _folded_slug,
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+                _codex_launch = _dataclass_replace(_codex_launch, model=_folded_slug)
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
             # Same staleness rule as the claude branch: never convert a stale
             # entry's default into an explicit model pin.
@@ -6715,6 +6735,7 @@ async def _auto_create_claude_terminal(
     # and leave the model to invisible CLI-private state.
     if session_model_override or launch_model is None:
         from omnigent.claude_native import (
+            claude_catalog_launch_spelling,
             claude_catalog_serves_model,
             claude_launch_catalog,
             claude_launch_catalog_is_stale,
@@ -6747,11 +6768,29 @@ async def _auto_create_claude_terminal(
                 claude_catalog_serves_model(launch_catalog, session_model_override, claude_config)
                 or claude_catalog_serves_model(launch_catalog, resolved_request, claude_config)
             ):
-                raise click.ClickException(
-                    f"the requested model {session_model_override!r} is not in this "
-                    "host's current model list — it may have changed since the pick. "
-                    "Pick again from the model menu."
+                # A spec pin or routing pick can spell a served model in the
+                # gateway/catalog namespace ("system.ai.claude-opus-4-8[1m]")
+                # while the launch catalog lists the same model bare. Fold the
+                # mechanical prefix away and launch on the catalog's own
+                # spelling — the one this endpoint demonstrably serves.
+                folded_spelling = claude_catalog_launch_spelling(
+                    launch_catalog, session_model_override
                 )
+                if folded_spelling is None:
+                    raise click.ClickException(
+                        f"the requested model {session_model_override!r} is not in this "
+                        "host's current model list — it may have changed since the pick. "
+                        "Pick again from the model menu."
+                    )
+                _logger.info(
+                    "claude launch gate folded the pinned model %r onto the catalog "
+                    "spelling %r for session=%s",
+                    session_model_override,
+                    folded_spelling,
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+                launch_model = folded_spelling
         if launch_model is None and launch_catalog:
             # A stale entry's default is yesterday's answer: pinning it as
             # ``--model`` turns a provider-side retirement or entitlement

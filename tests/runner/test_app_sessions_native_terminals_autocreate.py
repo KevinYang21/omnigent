@@ -3485,6 +3485,104 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_launch_gate_folds_a_gateway_namespace_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pin spelling a served model in the gateway namespace still launches.
+
+    A deployed agent-spec pin or an orchestrator pick persists the catalog
+    spelling (``system.ai.claude-opus-4-8[1m]``) while the launch catalog
+    lists the same model bare (``claude-opus-4-8[1m]``). The gate must fold
+    the mechanical prefix away and launch on the catalog's own spelling
+    rather than refuse — the refusal bricks every session of that agent.
+    """
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _no_op_forwarder(**kwargs: Any) -> None:
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.claude_native_forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    catalog = [
+        {"id": "opus[1m]", "model": "claude-opus-4-8[1m]", "displayName": "Opus 4.8 (1M)"},
+        {"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5", "isDefault": True},
+    ]
+
+    async def _catalog(config: object) -> list[dict[str, object]]:
+        del config
+        return catalog
+
+    monkeypatch.setattr("omnigent.claude_native.claude_launch_catalog", _catalog)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec and return a terminal resource view."""
+            del terminal_name, session_key
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"model_override": "system.ai.claude-opus-4-8[1m]", "labels": {}}
+        )
+
+    fake_client = httpx.AsyncClient(
+        base_url="http://test-server",
+        transport=httpx.MockTransport(_handle_request),
+    )
+    config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+        api_key_helper="printf %s sk-gateway",
+        model="claude-sonnet-5",
+    )
+
+    async def _resolve() -> ClaudeNativeUcodeConfig | None:
+        return config
+
+    await _auto_create_claude_terminal(
+        "1a2b3c4d5e6f47899a0b1c2d3e4f5061",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=fake_client,
+        resolve_launch_config=_resolve,
+    )
+    args = captured["spec"].args
+    assert args[args.index("--model") + 1] == "claude-opus-4-8[1m]", (
+        "the gate must launch the catalog's own spelling of the pinned model"
+    )
+    await fake_client.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("freshness", ["fresh", "stale"])
 async def test_auto_create_claude_terminal_default_pin_requires_a_fresh_catalog(
     freshness: str,
