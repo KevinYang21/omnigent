@@ -3194,7 +3194,10 @@ class ClaudeSDKExecutor(Executor):
         if resume_session:
             return ClaudeSDKExecutor._extract_trailing_user_content(messages)
 
-        user_messages = [msg for msg in messages if msg.get("role") == "user"]
+        # System-role framework notices (sub-agent wake notices) count as
+        # deliverable input: a wake arriving after prior turns must trigger
+        # the history replay below, not collapse to a context-free prompt.
+        user_messages = [msg for msg in messages if msg.get("role") in ("user", "system")]
         if len(messages) <= 1 or len(user_messages) <= 1:
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
 
@@ -3254,7 +3257,9 @@ class ClaudeSDKExecutor(Executor):
             block dicts.
         """
         for msg in reversed(messages):
-            if msg.get("role") == "user":
+            # System-role framework notices (sub-agent wakes) are deliverable
+            # input — without this the wake turn would send an empty prompt.
+            if msg.get("role") in ("user", "system"):
                 content = msg.get("content")
                 if content is None:
                     return ""
@@ -3294,7 +3299,9 @@ class ClaudeSDKExecutor(Executor):
         """
         trailing: list[Message] = []
         for msg in reversed(messages):
-            if msg.get("role") == "user":
+            # System-role framework notices (sub-agent wakes) belong to the
+            # trailing new-input run just like buffered user messages.
+            if msg.get("role") in ("user", "system"):
                 trailing.append(msg)
             else:
                 break

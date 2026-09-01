@@ -1344,7 +1344,9 @@ class QwenExecutor(Executor):
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
-            if role == "user":
+            # System-role framework notices (sub-agent wakes) are deliverable
+            # input — skipping them would leave the wake turn with no prompt.
+            if role in ("user", "system"):
                 latest_user_idx = idx
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str):

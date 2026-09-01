@@ -1870,7 +1870,10 @@ async def _deliver_subagent_wake_post(
                 json={
                     "type": "message",
                     "data": {
-                        "role": "user",
+                        # System role, not user: a safety-tuned model treats a
+                        # user-turn "[System: ...]" as prompt injection and
+                        # refuses to collect the inbox, stranding orchestration.
+                        "role": "system",
                         "content": [{"type": "input_text", "text": notice}],
                     },
                     **(
@@ -3687,7 +3690,9 @@ def create_runner_app(
             last_type = last.get("type")
             last_role = last.get("role")
             needs_turn = (
-                (last_type == "message" and last_role == "user")
+                # System-role framework notices (sub-agent wakes) need a
+                # turn just like user input — the model must act on them.
+                (last_type == "message" and last_role in ("user", "system"))
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
@@ -10580,7 +10585,9 @@ def create_runner_app(
                 if (
                     session_id not in _active_turns
                     and new_items
-                    and new_items[-1].get("role") == "user"
+                    # System-role framework notices (sub-agent wakes) start a
+                    # catch-up turn just like user input.
+                    and new_items[-1].get("role") in ("user", "system")
                 ):
                     _begin_turn_slot(session_id)
                     _publish_turn_status(session_id, "running")
