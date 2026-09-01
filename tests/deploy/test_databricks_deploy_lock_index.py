@@ -151,6 +151,19 @@ def test_lock_fails_loudly_on_foreign_registry(
         deploy_mod.run_uv_lock(tmp_path)
 
 
+def test_registry_check_rejects_direct_url_sources(deploy_mod: ModuleType, tmp_path: Path) -> None:
+    """A remote direct-URL source is a leak; local path sources are fine."""
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        f'source = {{ registry = "{_PUBLIC}" }}\n'
+        'source = { url = "https://mirror.corp.example/wheels/pkg-1.0-py3-none-any.whl" }\n'
+        'source = { path = "./omnigent-0.1.0-py3-none-any.whl" }\n'
+    )
+
+    with pytest.raises(SystemExit, match=r"mirror\.corp\.example"):
+        deploy_mod._check_lock_registries(lock, _PUBLIC)
+
+
 def test_registry_check_redacts_index_credentials(deploy_mod: ModuleType, tmp_path: Path) -> None:
     """Index URLs with embedded credentials must not reach the error message."""
     lock = tmp_path / "uv.lock"

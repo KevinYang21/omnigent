@@ -164,10 +164,12 @@ def test_generated_app_lock_ignores_machine_mirror_index(
     deploy_mod.run_uv_lock(src)
 
     lock_text = (src / "uv.lock").read_text()
+    # Match the /-terminated URL so an ephemeral mirror port that happens to
+    # prefix the public port (e.g. :5001 vs :50011) cannot false-positive.
     leaked = [
         f"uv.lock line {number}: {line.strip()}"
         for number, line in enumerate(lock_text.splitlines(), start=1)
-        if mirror_url in line
+        if f"{mirror_url}/" in line
     ]
     assert not leaked, (
         "run_uv_lock baked the machine's mirror index into the generated app "

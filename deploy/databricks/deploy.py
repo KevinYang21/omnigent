@@ -507,16 +507,23 @@ def _check_lock_registries(lock_path: Path, index_url: str) -> None:
     :param index_url: The registry every locked package must come from.
     :raises SystemExit: If any package resolved from a different registry.
     """
+    # Per-wheel `url` entries are deliberately not checked: a legitimate index
+    # serves artifacts from a separate CDN host (pypi.org -> pythonhosted.org),
+    # and a wheel's host always follows its package's registry source anyway.
+    # Direct-URL *sources* are different: the generated pyproject only uses
+    # registry and local-path sources, so any http(s) source is a leak.
     expected = index_url.rstrip("/")
-    leaked = sorted(
-        {
-            match.group(1)
-            for match in re.finditer(
-                r'source\s*=\s*\{\s*registry\s*=\s*"([^"]+)"', lock_path.read_text()
-            )
-            if match.group(1).rstrip("/") != expected
-        }
+    lock_text = lock_path.read_text()
+    leaked = {
+        match.group(1)
+        for match in re.finditer(r'source\s*=\s*\{\s*registry\s*=\s*"([^"]+)"', lock_text)
+        if match.group(1).rstrip("/") != expected
+    }
+    leaked.update(
+        match.group(1)
+        for match in re.finditer(r'source\s*=\s*\{\s*url\s*=\s*"(https?://[^"]+)"', lock_text)
     )
+    leaked = sorted(leaked)
     if leaked:
         shown = ", ".join(_redact_url(url) for url in leaked)
         raise SystemExit(
