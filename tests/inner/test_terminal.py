@@ -28,6 +28,18 @@ from omnigent.inner.terminal import (
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
 
+@pytest.fixture(autouse=True)
+def _isolate_idle_poll_backoff_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the ambient backoff kill-switch out of every watcher test.
+
+    The watcher reads :data:`terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR` once at
+    loop start, so a host that exports it (e.g. an operator's shell with the
+    kill switch flipped) would silently pin every backoff test at base rate.
+    Tests that exercise the kill switch re-set the var themselves.
+    """
+    monkeypatch.delenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, raising=False)
+
+
 @dataclass
 class _SuccessfulProcess:
     """
