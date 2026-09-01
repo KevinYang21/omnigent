@@ -1804,15 +1804,32 @@ async def _resolve_elicitation(
         if _harness_elicitation_owners.get(elicitation_id) == session_id:
             result_payload = {k: v for k, v in data.items() if k != "elicitation_id"}
             try:
-                harness_future.set_result(
-                    ElicitationResult.model_validate(result_payload),
-                )
+                verdict_result = ElicitationResult.model_validate(result_payload)
             except ValidationError:
                 _logger.warning(
                     "Invalid approval payload for %r",
                     elicitation_id,
                     exc_info=True,
                 )
+            else:
+                harness_future.set_result(verdict_result)
+                # The waiter may be a zombie: a proxy can sever the
+                # long-poll client-side while holding the backend
+                # connection open, so the verdict set above is written to
+                # a connection nobody reads and disconnect detection never
+                # fires. Tombstone the verdict too, so a re-park of the
+                # same stable id adopts it instead of re-asking; a verdict
+                # that WAS delivered leaves a tombstone that ages out
+                # unconsumed (session-checked, TTL-pruned).
+                _prune_pre_resolved_harness_elicitations()
+                _harness_pre_resolved_elicitations[elicitation_id] = (
+                    _PreResolvedHarnessElicitation(
+                        session_id=session_id,
+                        created_at=time.time(),
+                        result=verdict_result,
+                    )
+                )
+                _prune_pre_resolved_harness_elicitations()
     elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
