@@ -493,7 +493,18 @@ def run_uv_lock(src: Path) -> None:
 
 def _redact_url(url: str) -> str:
     """Strip userinfo credentials from a URL before it reaches a log."""
-    return re.sub(r"^(\w+://)[^/@]+@", r"\1***@", url)
+    # [^/]+ (not [^/@]+) so a literal `@` inside a password redacts fully.
+    return re.sub(r"^(\w+://)[^/]+@", r"\1***@", url)
+
+
+def _canonical_index(url: str) -> str:
+    """Normalize an index URL for equality: drop userinfo and a trailing slash.
+
+    uv does not persist index credentials into ``uv.lock`` registry sources,
+    so a credentialed ``DEPLOY_UV_INDEX_URL`` must still match its own
+    credential-less lock entry.
+    """
+    return re.sub(r"^(\w+://)[^/]+@", r"\1", url).rstrip("/")
 
 
 def _check_lock_registries(lock_path: Path, index_url: str) -> None:
@@ -512,12 +523,12 @@ def _check_lock_registries(lock_path: Path, index_url: str) -> None:
     # and a wheel's host always follows its package's registry source anyway.
     # Direct-URL *sources* are different: the generated pyproject only uses
     # registry and local-path sources, so any http(s) source is a leak.
-    expected = index_url.rstrip("/")
+    expected = _canonical_index(index_url)
     lock_text = lock_path.read_text()
     leaked = {
         match.group(1)
         for match in re.finditer(r'source\s*=\s*\{\s*registry\s*=\s*"([^"]+)"', lock_text)
-        if match.group(1).rstrip("/") != expected
+        if _canonical_index(match.group(1)) != expected
     }
     leaked.update(
         match.group(1)

@@ -184,3 +184,28 @@ def test_registry_check_tolerates_trailing_slash(deploy_mod: ModuleType, tmp_pat
     lock.write_text(f'source = {{ registry = "{_PUBLIC}/" }}\n')
 
     deploy_mod._check_lock_registries(lock, _PUBLIC)  # must not raise
+
+
+def test_registry_check_matches_credentialed_index(
+    deploy_mod: ModuleType, tmp_path: Path
+) -> None:
+    """A credentialed index must match its own credential-less lock entry.
+
+    uv does not persist index userinfo into ``uv.lock`` registry sources, so a
+    deploy locked against ``https://user:token@proxy/simple`` records
+    ``https://proxy/simple`` — a correct lock that must not abort the deploy.
+    """
+    lock = tmp_path / "uv.lock"
+    lock.write_text('source = { registry = "https://proxy.example/simple" }\n')
+
+    deploy_mod._check_lock_registries(
+        lock, "https://user:tok3n@proxy.example/simple"
+    )  # must not raise
+
+
+def test_redact_url_handles_literal_at_in_password(deploy_mod: ModuleType) -> None:
+    """A password containing a literal `@` must still be fully redacted."""
+    redacted = deploy_mod._redact_url("https://user:p@ssw0rd@mirror.corp.example/simple")
+
+    assert redacted == "https://***@mirror.corp.example/simple"
+    assert "ssw0rd" not in redacted
