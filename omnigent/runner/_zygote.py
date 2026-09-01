@@ -288,6 +288,14 @@ def _run_harness_child(request: dict[str, Any]) -> None:
                 f"zygote harness fork: cannot chdir to workspace {workspace!r}: {exc}\n"
             )
             sys.stderr.flush()
+    else:
+        # Every real host/CLI runner sets the workspace var, so an unset value
+        # likely signals a misconfigured dispatch; surface it rather than
+        # silently leaving the child in the zygote's cwd.
+        sys.stderr.write(
+            "zygote harness fork: no workspace in payload env; staying in zygote cwd\n"
+        )
+        sys.stderr.flush()
 
     # Test seam: a sleep seam keeps the harness genuinely alive (crash-recovery
     # tests); the exit seam echoes argv so a test can assert the payload
