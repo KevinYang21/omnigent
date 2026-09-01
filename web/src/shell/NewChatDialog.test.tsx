@@ -2873,6 +2873,32 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByText("Review a pull request")).toBeNull();
   });
 
+  it("opens the menu for a slash typed mid-draft and completes it in place", () => {
+    mockAgents([skilledAgent()]);
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    // Same trigger the in-session composer uses: the "/" token at the caret,
+    // not just one that opens the draft.
+    fireEvent.change(input, {
+      target: { value: "start with /rev", selectionStart: 15 },
+    });
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(input.value).toBe("start with /review-pr ");
+  });
+
+  it("Escape mid-draft closes the menu without discarding the draft", () => {
+    mockAgents([skilledAgent()]);
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
+    fireEvent.change(input, {
+      target: { value: "start with /rev", selectionStart: 15 },
+    });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByTestId("slash-menu-item-review-pr")).toBeNull();
+    expect(input.value).toBe("start with /rev");
+  });
+
   it("shows no menu for native terminal agents even if skills are listed", () => {
     // A native agent with (hypothetical) bundled skills: the gate is the
     // agent kind, not an empty skill list — the vendor CLI interprets

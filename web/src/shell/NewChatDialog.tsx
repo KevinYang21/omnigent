@@ -103,6 +103,7 @@ import {
   rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
+import { detectSlashTokenAt, spliceSlashToken } from "@/lib/composerSlash";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
@@ -3585,12 +3586,11 @@ export function NewChatLandingScreen() {
   // Sandbox creates need no host or path workspace — the server
   // provisions both; only the message, agent, and (optional) repo
   // inputs gate the submit.
-  // Slash-command suggestions for the chosen agent's bundled skills.
-  // Mirrors the in-session composer's menu mechanics (open while the
-  // command name is still being typed: leading "/", no second "/", no
-  // space yet), but lists skills only — built-ins like /model need a
-  // live session. Hidden for native-terminal agents (their CLI owns
-  // slash commands) and for agents without bundled skills.
+  // Slash-command suggestions for the chosen agent's skills. Mirrors the
+  // in-session composer's menu mechanics (open on the "/" token at the caret,
+  // wherever in the draft it sits), but lists skills only — built-ins like
+  // /model need a live session. Hidden for native-terminal agents (their CLI
+  // owns slash commands) and for agents with no skills at all.
   const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
   const skillCommands = useMemo(() => {
     if (isNativeTerminalAgent) return {};
@@ -3598,12 +3598,20 @@ export function NewChatLandingScreen() {
     for (const s of selectedAgent?.skills ?? []) m[`/${s.name}`] = s.description;
     return m;
   }, [selectedAgent, isNativeTerminalAgent]);
-  const trimmedMessage = message.trimStart();
-  const slashMenuOpen =
-    trimmedMessage.startsWith("/") &&
-    !trimmedMessage.slice(1).includes("/") &&
-    !trimmedMessage.includes(" ");
-  const slashMenuQuery = slashMenuOpen ? trimmedMessage.slice(1) : "";
+  // Caret offset + dismissal, exactly as the in-session composer tracks them:
+  // ``null`` reads the token at the end of the draft (a prefilled message the
+  // user hasn't typed into yet), Escape/blur closes without editing the draft.
+  const [slashCaret, setSlashCaret] = useState<number | null>(null);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const slashToken = useMemo(
+    () =>
+      slashDismissed
+        ? null
+        : detectSlashTokenAt(message, Math.min(slashCaret ?? message.length, message.length)),
+    [slashDismissed, slashCaret, message],
+  );
+  const slashMenuOpen = slashToken !== null;
+  const slashMenuQuery = slashToken?.query ?? "";
   // Kept in sync with what SlashCommandMenu renders so keyboard nav
   // indexes into the same list.
   const slashMenuMatches = slashMenuOpen
@@ -3621,12 +3629,22 @@ export function NewChatLandingScreen() {
     setSlashMenuIndex(slashMenuMatches.length > 0 ? 0 : -1);
   }
 
-  // Selecting a skill fills "/name " and leaves the caret ready for the
-  // argument — skills never auto-execute from the menu.
+  // Selecting a skill rewrites just the token to "/name " and leaves the caret
+  // ready for the argument — skills never auto-execute from the menu, and a
+  // completion mid-draft keeps the words around it.
   function applySlashSelection(cmd: string) {
     setSlashMenuIndex(-1);
-    setMessage(cmd + " ");
-    textareaRef.current?.focus();
+    const next =
+      slashToken !== null
+        ? spliceSlashToken(message, slashToken, cmd)
+        : { text: `${cmd} `, caret: cmd.length + 1 };
+    setMessage(next.text);
+    setSlashCaret(next.caret);
+    queueMicrotask(() => {
+      const ta = textareaRef.current;
+      ta?.setSelectionRange(next.caret, next.caret);
+      ta?.focus();
+    });
   }
 
   // Always-visible skill pills for the allowlisted orchestrators, fed by
@@ -4491,14 +4509,13 @@ export function NewChatLandingScreen() {
                   if (attachmentError !== null) setAttachmentError(null);
                   // Recompute the active "@"-mention from the caret each keystroke
                   // (native terminal agents with a workspace — ``mentionEnabled``).
-                  setMention(
-                    mentionEnabled
-                      ? detectMentionAt(
-                          e.target.value,
-                          e.target.selectionStart ?? e.target.value.length,
-                        )
-                      : null,
-                  );
+                  const caret = e.target.selectionStart ?? e.target.value.length;
+                  setMention(mentionEnabled ? detectMentionAt(e.target.value, caret) : null);
+                  // Same for the "/" token, so the menu follows the caret rather
+                  // than only opening on a draft that starts with a slash. Typing
+                  // also lifts an earlier Escape.
+                  setSlashCaret(caret);
+                  setSlashDismissed(false);
                 }}
                 onFocus={() => {
                   // From here the textarea's caret is one the user placed, so
@@ -4509,6 +4526,7 @@ export function NewChatLandingScreen() {
                   // Dismiss the mention menu when focus leaves the textarea; menu
                   // rows preventDefault on mousedown so selecting one doesn't blur.
                   dismissMention();
+                  setSlashDismissed(true);
                 }}
                 onCompositionStart={() => {
                   isComposingRef.current = true;
@@ -4573,9 +4591,11 @@ export function NewChatLandingScreen() {
                     }
                     if (e.key === "Escape") {
                       e.preventDefault();
-                      // Dismiss the menu by clearing the draft so the user can
-                      // start fresh.
-                      setMessage("");
+                      // A leading token IS the whole draft, so clearing it is the
+                      // fastest way back to an empty composer. Mid-draft, only
+                      // the menu closes — the sentence being written survives.
+                      if (slashToken === null || slashToken.leading) setMessage("");
+                      setSlashDismissed(true);
                       setSlashMenuIndex(-1);
                       return;
                     }
