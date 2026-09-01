@@ -46,8 +46,8 @@ _WORKSPACE_WHEEL_LIMIT_BYTES = _WORKSPACE_FILE_LIMIT_BYTES
 _WEB_UI_DIR_NAME = "web-ui"
 _WEB_UI_ARCHIVE_NAME = "web-ui.tar.gz"
 _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
-# Public PyPI by default. Set UV_INDEX_URL to lock against a private mirror or
-# proxy instead (see run_uv_lock).
+# Public PyPI by default. Set DEPLOY_UV_INDEX_URL to lock against a private
+# mirror or proxy instead (see run_uv_lock).
 _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
 
 # Leaving these in the env when we hand off to the CLI/SDK can
@@ -464,21 +464,68 @@ def run_uv_lock(src: Path) -> None:
     :param src: App source directory containing ``pyproject.toml``,
         e.g. ``deploy/databricks/src``.
     """
-    # Honor a caller-supplied UV_INDEX_URL (e.g. a private mirror or proxy);
-    # otherwise default to public PyPI. UV_INDEX / UV_DEFAULT_INDEX are dropped
-    # so a stray value in the shell can't shadow the index we lock against.
-    index_url = os.environ.get("UV_INDEX_URL") or _UV_DEFAULT_INDEX_URL
+    # The lock ships to the Databricks Apps runtime, so it must resolve against
+    # an index that runtime can reach. Only the deploy-scoped DEPLOY_UV_INDEX_URL
+    # opts into a mirror; the generic UV_INDEX_URL is ignored because machines
+    # behind a corporate mirror export it globally just to make uv work.
+    index_url = os.environ.get("DEPLOY_UV_INDEX_URL") or _UV_DEFAULT_INDEX_URL
+    if not os.environ.get("DEPLOY_UV_INDEX_URL") and os.environ.get("UV_INDEX_URL"):
+        _log(
+            "ignoring UV_INDEX_URL for the app lock; set DEPLOY_UV_INDEX_URL "
+            "to lock against a mirror the Databricks Apps runtime can reach"
+        )
     env = os.environ.copy()
     env.pop("UV_INDEX", None)
-    env.pop("UV_DEFAULT_INDEX", None)
-    env["UV_INDEX_URL"] = index_url
-    _log(f"uv lock --python 3.12 --index-url {index_url}")
+    env.pop("UV_INDEX_URL", None)
+    env.pop("UV_EXTRA_INDEX_URL", None)
+    # --default-index / UV_DEFAULT_INDEX replace a machine-level uv config's
+    # `[[index]] default = true`, which outranks the weaker --index-url form.
+    env["UV_DEFAULT_INDEX"] = index_url
+    _log(f"uv lock --python 3.12 --default-index {_redact_url(index_url)}")
     subprocess.run(
-        ["uv", "lock", "--python", "3.12", "--index-url", index_url],
+        ["uv", "lock", "--python", "3.12", "--default-index", index_url],
         cwd=src,
         env=env,
         check=True,
     )
+    _check_lock_registries(src / "uv.lock", index_url)
+
+
+def _redact_url(url: str) -> str:
+    """Strip userinfo credentials from a URL before it reaches a log."""
+    return re.sub(r"^(\w+://)[^/@]+@", r"\1***@", url)
+
+
+def _check_lock_registries(lock_path: Path, index_url: str) -> None:
+    """Fail loudly when the generated lock resolved from another registry.
+
+    Extra ``[[index]]`` entries in a machine-level uv config outrank even
+    ``--default-index``; a lock resolved against one installs locally but
+    breaks in the Databricks Apps runtime, which cannot reach that host.
+
+    :param lock_path: Generated ``uv.lock`` path.
+    :param index_url: The registry every locked package must come from.
+    :raises SystemExit: If any package resolved from a different registry.
+    """
+    expected = index_url.rstrip("/")
+    leaked = sorted(
+        {
+            match.group(1)
+            for match in re.finditer(
+                r'source\s*=\s*\{\s*registry\s*=\s*"([^"]+)"', lock_path.read_text()
+            )
+            if match.group(1).rstrip("/") != expected
+        }
+    )
+    if leaked:
+        shown = ", ".join(_redact_url(url) for url in leaked)
+        raise SystemExit(
+            f"{lock_path} resolved packages from {shown} instead of "
+            f"{_redact_url(index_url)}; the Databricks Apps runtime cannot reach "
+            "that host, so the app would fail to install. Remove machine-level "
+            "uv [[index]] config, or set DEPLOY_UV_INDEX_URL to the intended "
+            "index."
+        )
 
 
 def write_uv_dependency_files(
