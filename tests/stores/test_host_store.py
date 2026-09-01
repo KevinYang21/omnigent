@@ -961,3 +961,55 @@ def test_register_managed_host_refuses_cross_owner_recredential(db_uri: str) -> 
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+def test_upsert_records_tunnel_replica_url(host_store: HostStore) -> None:
+    """A connect records which replica holds the tunnel; a reconnect moves it.
+
+    The replica URL is what a peer replica forwards mis-routed session
+    requests to, so a stale value after a tunnel migration would forward
+    to the wrong place — every connect must overwrite it.
+    """
+    host = host_store.upsert_on_connect(
+        host_id="9a3d1be04df1c1a06b74a838ca07f001",
+        name="laptop",
+        user_id="alice@example.com",
+        replica_url="http://10.0.0.1:6767",
+    )
+    assert host.replica_url == "http://10.0.0.1:6767"
+    fetched = host_store.get_host("9a3d1be04df1c1a06b74a838ca07f001")
+    assert fetched is not None
+    assert fetched.replica_url == "http://10.0.0.1:6767"
+
+    # The tunnel migrates to another replica on reconnect.
+    host = host_store.upsert_on_connect(
+        host_id="9a3d1be04df1c1a06b74a838ca07f001",
+        name="laptop",
+        user_id="alice@example.com",
+        replica_url="http://10.0.0.2:6767",
+    )
+    assert host.replica_url == "http://10.0.0.2:6767"
+
+
+def test_upsert_clears_stale_replica_url(host_store: HostStore) -> None:
+    """A reconnect through a non-addressable replica clears the old URL.
+
+    Otherwise a peer would keep forwarding to a replica that no longer
+    holds the tunnel.
+    """
+    host_store.upsert_on_connect(
+        host_id="7c2f0ad14be3c2b17c85b949db18f002",
+        name="laptop",
+        user_id="alice@example.com",
+        replica_url="http://10.0.0.1:6767",
+    )
+    host = host_store.upsert_on_connect(
+        host_id="7c2f0ad14be3c2b17c85b949db18f002",
+        name="laptop",
+        user_id="alice@example.com",
+        replica_url=None,
+    )
+    assert host.replica_url is None
+    fetched = host_store.get_host("7c2f0ad14be3c2b17c85b949db18f002")
+    assert fetched is not None
+    assert fetched.replica_url is None

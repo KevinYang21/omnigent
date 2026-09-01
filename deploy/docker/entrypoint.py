@@ -436,6 +436,18 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         server_config=cfg,
     )
 
+    # Refine the cross-replica advertise URL from the actual bind address.
+    # Container deploys bind a wildcard, so this derives the pod's primary
+    # outbound IP (peer-reachable on the cluster network); the
+    # OMNIGENT_REPLICA_ADVERTISE_URL env var overrides it when that IP is
+    # not the right address. When neither resolves, a wrong-replica miss
+    # surfaces the error as before.
+    from omnigent.server.replica_forward import resolve_replica_advertise_url
+
+    app.state.replica_advertise_url = resolve_replica_advertise_url(
+        resolved_config.host, resolved_config.port
+    )
+
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)
 
 

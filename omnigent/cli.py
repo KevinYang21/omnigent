@@ -4278,6 +4278,14 @@ def server(
         server_config=title_server_config,
     )
 
+    # Refine the cross-replica advertise URL from the actual bind address
+    # (the app factory could only read the env override). A concrete bind
+    # (e.g. 127.0.0.1:6767 in tests, a pod IP in a deploy) is peer-reachable;
+    # a wildcard bind needs OMNIGENT_REPLICA_ADVERTISE_URL to be forwardable.
+    from omnigent.server.replica_forward import resolve_replica_advertise_url
+
+    app.state.replica_advertise_url = resolve_replica_advertise_url(host, port)
+
     click.echo(f"Starting omnigent server on {host}:{port}")
     click.echo(f"  database:  {_display_db_uri(db_uri)}")
     click.echo(f"  artifacts: {art_loc}")

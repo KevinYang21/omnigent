@@ -75,6 +75,12 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
+    :param replica_url: Advertise URL of the server replica holding the
+        host's live tunnel, e.g. ``"http://10.0.3.7:6767"``. Written on
+        every tunnel connect so a replica that receives a mis-routed
+        session request can forward it to the replica that can serve
+        it. ``None`` when the holding replica advertises no
+        peer-reachable URL (forwarding unavailable).
     """
 
     host_id: str
@@ -86,6 +92,7 @@ class Host:
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    replica_url: str | None = None
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -154,6 +161,7 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
+        replica_url=row.replica_url,
     )
 
 
@@ -202,6 +210,7 @@ class HostStore:
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
+        replica_url: str | None = None,
     ) -> Host:
         """
         Register or update a host on WebSocket connect.
@@ -241,6 +250,11 @@ class HostStore:
             Written on every connect — including ``None`` from an older
             host that doesn't report it, which correctly resets any
             stale value back to "unknown".
+        :param replica_url: Advertise URL of the server replica accepting
+            this tunnel, e.g. ``"http://10.0.3.7:6767"``. Written on every
+            connect — including ``None`` when this replica advertises no
+            peer-reachable URL, which correctly clears a stale value left
+            by a previous holder.
         :returns: The upserted :class:`Host`.
         """
         now = now_epoch()
@@ -267,6 +281,7 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
+                row.replica_url = replica_url
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -281,6 +296,7 @@ class HostStore:
                     name=name,
                     user_id=user_id,
                     configured_harnesses_json=harnesses_json,
+                    replica_url=replica_url,
                 )
                 if reowned is not None:
                     return reowned
@@ -303,6 +319,7 @@ class HostStore:
                     host_id,
                     now,
                     harnesses_json,
+                    replica_url,
                 )
                 return _row_to_host(row)
 
@@ -315,6 +332,7 @@ class HostStore:
                 created_at=now,
                 updated_at=now,
                 configured_harnesses=harnesses_json,
+                replica_url=replica_url,
             )
             session.add(row)
             return _row_to_host(row)
@@ -326,6 +344,7 @@ class HostStore:
         new_host_id: str,
         now: int,
         harnesses_json: str | None,
+        replica_url: str | None = None,
     ) -> SqlHost:
         """Replace a host row's host_id while repointing its conversations.
 
@@ -346,6 +365,8 @@ class HostStore:
         :param new_host_id: The host_id the host reconnected with.
         :param now: Unix epoch seconds for the updated_at timestamp.
         :param harnesses_json: JSON-encoded harness readiness, or None.
+        :param replica_url: Advertise URL of the replica accepting the
+            reconnect, or None when it advertises no peer-reachable URL.
         :returns: The newly inserted :class:`SqlHost` row.
         """
         old_host_id = row.host_id
@@ -399,6 +420,7 @@ class HostStore:
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
             configured_harnesses=harnesses_json,
+            replica_url=replica_url,
         )
         session.add(new_row)
         session.flush()
@@ -424,6 +446,7 @@ class HostStore:
         name: str,
         user_id: str,
         configured_harnesses_json: str | None = None,
+        replica_url: str | None = None,
     ) -> Host | None:
         """Re-own an existing host_id row under a new ``(user_id, name)``.
 
@@ -448,6 +471,8 @@ class HostStore:
             ``'{"claude-sdk": true}'``, or ``None`` when unreported.
             Written like the normal connect paths so a re-owned row
             carries fresh (not stale) readiness.
+        :param replica_url: Advertise URL of the replica accepting the
+            reconnect, or None when it advertises no peer-reachable URL.
         :returns: The re-owned :class:`Host`, or ``None`` if no row holds
             *host_id* (caller falls through to a normal insert).
         """
@@ -472,6 +497,7 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
+                replica_url=replica_url,
             )
         )
         return Host(
@@ -484,6 +510,7 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
+            replica_url=replica_url,
         )
 
     def set_offline(self, host_id: str) -> None:

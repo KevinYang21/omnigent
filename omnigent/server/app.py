@@ -1388,6 +1388,14 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    # URL peer replicas can reach THIS replica at, for cross-replica request
+    # forwarding on a wrong-replica routing miss. The env override is read
+    # here; the CLI / entrypoint refine it from the actual bind address after
+    # building the app (see resolve_replica_advertise_url). None = this
+    # replica is not peer-addressable (forwarding falls back to the error).
+    from omnigent.server.replica_forward import resolve_replica_advertise_url
+
+    app.state.replica_advertise_url = resolve_replica_advertise_url(None, None)
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot

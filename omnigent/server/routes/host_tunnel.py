@@ -282,6 +282,12 @@ def create_host_tunnel_router(
                 user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
+                # Record which replica holds this tunnel so a peer that
+                # receives a mis-routed session request can forward it here
+                # (see omnigent.server.replica_forward). None when this
+                # replica is not peer-addressable — forwarding then falls
+                # back to the wrong_replica error.
+                replica_url=getattr(ws.app.state, "replica_advertise_url", None),
             )
             host_persisted = True
 

@@ -58,6 +58,10 @@ from omnigent.server.background_session_titles import (
     schedule_background_child_task_summary,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.replica_forward import (
+    forward_event_to_replica,
+    forward_stream_to_replica,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -1552,11 +1556,15 @@ def register_events_routes(
                 runner_client = await _get_runner_client(session_id, runner_router)
         # Check for wrong-replica routing miss before attempting healing or dispatch.
         # The runner tunnel is registered on the same replica as its host; when the
-        # tunnel is absent here but the host is live elsewhere, the key routed to
-        # the wrong replica. Signal this to the client so it re-addresses without
-        # the key rather than repeatedly trying this replica.
-        # sub-agent heal below: a wrong-replica send must re-address without the
-        # key rather than attempt a heal against this replica's registry.
+        # tunnel is absent here but the host is live elsewhere, the request routed
+        # to the wrong replica. First try to heal it server-side: the host row
+        # records which replica holds the tunnel, so replay the request there and
+        # mirror its answer — the client never sees the mis-route. Only when
+        # forwarding is unavailable (no advertise URL, forward loop, peer
+        # unreachable) fall back to signaling the client so a slice-key-aware one
+        # re-addresses without the key.
+        # sub-agent heal below: a wrong-replica send must be forwarded (or
+        # re-addressed) rather than attempt a heal against this replica's registry.
         if runner_client is None and conv.host_id is not None:
             _wrong_pod_host_reg = getattr(request.app.state, "host_registry", None)
             _wrong_pod_host_store = getattr(request.app.state, "host_store", None)
@@ -1569,6 +1577,13 @@ def register_events_routes(
                     _wrong_pod_host_store.get_host, conv.host_id
                 )
                 if _wrong_pod_host is not None and host_is_live(_wrong_pod_host):
+                    forwarded = await forward_event_to_replica(
+                        request,
+                        _wrong_pod_host.replica_url,
+                        session_id,
+                    )
+                    if forwarded is not None:
+                        return forwarded  # type: ignore[return-value]
                     raise OmnigentError(
                         "session runner is on another replica; retry",
                         code=ErrorCode.WRONG_REPLICA,
@@ -2012,8 +2027,11 @@ def register_events_routes(
             runner_router,
         )
         # Check for wrong-replica routing miss before streaming.
-        # If the host is wired and the runner is on another replica, signal 400
-        # so setups that don't wire hosts are unaffected.
+        # If the host is wired and the runner is on another replica, first try
+        # to proxy the stream from the replica that holds the tunnel (the host
+        # row records its advertise URL) so the live tail works regardless of
+        # which replica the connection landed on. Only when forwarding is
+        # unavailable signal 400 so setups that don't wire hosts are unaffected.
         if runner_client is None and conv.runner_id and conv.host_id:
             host_registry_state = getattr(request.app.state, "host_registry", None)
             host_store_state = getattr(request.app.state, "host_store", None)
@@ -2021,6 +2039,13 @@ def register_events_routes(
                 if host_registry_state.get(conv.host_id) is None:
                     host = await asyncio.to_thread(host_store_state.get_host, conv.host_id)
                     if host is not None and host_is_live(host):
+                        proxied = await forward_stream_to_replica(
+                            request,
+                            host.replica_url,
+                            session_id,
+                        )
+                        if proxied is not None:
+                            return proxied  # type: ignore[return-value]
                         raise OmnigentError(
                             "session stream is on another replica; retry",
                             code=ErrorCode.WRONG_REPLICA,

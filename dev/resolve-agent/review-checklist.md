@@ -53,6 +53,16 @@ what to look for, and why it's wrong.
   trips the security exfil scan on added lines; the repo idiom
   `os.environ.copy()` is equivalent and passes.
 
+## Server-side request forwarding / proxies
+
+- **A server-side forward must validate its target and preserve stream
+  semantics.** Any code that replays a caller's request (headers include
+  credentials) against a URL read from config/DB must (a) reject anything that
+  isn't a plain `http(s)` origin — no userinfo/path/query/fragment — and (b) for
+  an SSE/streaming relay, carry the anti-buffering headers
+  (`Cache-Control: no-cache`, `X-Accel-Buffering: no`) and relay bytes exactly,
+  plus a one-hop loop guard.
+
 ## Rollback / cleanup
 
 - **Cleanup of an adopted resource must not destroy pre-existing user state.**
