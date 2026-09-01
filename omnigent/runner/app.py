@@ -10717,9 +10717,19 @@ def create_runner_app_from_env() -> FastAPI:
         raise RuntimeError("RUNNER_SERVER_URL is required for the runner subprocess factory")
     from omnigent_client._http import is_loopback_url
 
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    # Carry the runner's tunnel-binding token when the launcher provided one:
+    # the server's system-role authority gate keys off this header, and a
+    # tokenless client's wake notices are downgraded to untrusted user input.
+    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
     server_client = httpx.AsyncClient(
         base_url=server_url,
         timeout=httpx.Timeout(5.0, read=None),
+        headers=({RUNNER_TUNNEL_TOKEN_HEADER: binding_token} if binding_token else None),
         # A proxy cannot reach a loopback server, so local targets bypass it.
         trust_env=not is_loopback_url(server_url),
     )
