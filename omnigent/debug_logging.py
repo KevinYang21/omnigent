@@ -58,6 +58,15 @@ PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
 _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
 
+# Request-scoped session attribution on the server. The HTTP middleware binds
+# this for the duration of a request whose matched route carries a
+# ``{session_id}`` path param, so records emitted while handling it inherit the
+# session even when the callsite did not thread it explicitly. Unset on the
+# runner/host (they use the ``OMNIGENT_RUNNER_PRIMARY_SESSION_ID`` env instead),
+# so this never changes runner attribution. An explicit ``extra`` session id
+# always wins over this ambient value.
+_session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id", default=None)
+
 # Origin deployment identity for the workspace_id/app_name columns. The
 # multi-tenant managed service stamps a per-request ``record.workspace_id`` (via
 # its logging ContextFilter), so the sink prefers that; the values below are the
@@ -234,6 +243,32 @@ def current_user_id() -> str | None:
     return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
 
 
+def set_current_session_id(session_id: str | None) -> None:
+    """Bind the current request's session (server middleware, session-scoped routes only)."""
+    _session_id_var.set(session_id or None)
+
+
+@contextlib.contextmanager
+def current_session_id_scope(session_id: str | None) -> Iterator[None]:
+    """Bind ``session_id`` for the duration of the block, restoring the prior value on exit."""
+    token = _session_id_var.set(session_id or None)
+    try:
+        yield
+    finally:
+        _session_id_var.reset(token)
+
+
+def current_session_id() -> str | None:
+    """Best-available request-scoped session attribution (server only).
+
+    Bound by the HTTP middleware only for a request whose matched route carries a
+    ``{session_id}`` path param, so it never mis-attributes a non-session route.
+    Unset on the runner/host. An explicit ``extra`` session id always wins over
+    this (see :func:`record_to_row`).
+    """
+    return _session_id_var.get() or None
+
+
 def _clean(value: object) -> str | None:
     """Coerce a missing/blank record attribute to ``None`` so a fallback engages.
 
@@ -343,13 +378,16 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
 
-    ``session_id`` is taken from what the callsite threaded via ``extra`` and,
-    failing that, falls back to the runner's primary (parent) conversation id
-    (:func:`runner_primary_session_id`). That fallback reads a runner-only env
-    that is absent on the multi-tenant server, so a server record with no
-    explicit id stays null rather than risk cross-request mis-attribution --
-    this is deliberate; do NOT add an ambient request-scoped fallback here. On a
-    runner, a co-located subagent turn whose log is not threaded can be
+    ``session_id`` is taken from what the callsite threaded via ``extra`` first,
+    then the server's request-scoped :func:`current_session_id` (bound by the
+    HTTP middleware only for a request whose matched route carries a
+    ``{session_id}`` path param -- so it never mis-attributes a non-session
+    route, and an explicit id always wins), and finally the runner's primary
+    (parent) conversation id (:func:`runner_primary_session_id`). The
+    request-scoped var is unset on the runner (which uses the primary-session
+    env), and the primary-session env is absent on the server, so the two
+    fallbacks never collide. A server record on a non-session route stays null.
+    On a runner, a co-located subagent turn whose log is not threaded can be
     attributed to the parent conversation, an accepted trade-off.
 
     ``workspace_id``/``app_name`` describe the record's origin deployment: the
@@ -360,7 +398,11 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     """
     workspace_id, app_name = _process_identity()
     return {
-        "session_id": getattr(record, "session_id", None) or runner_primary_session_id(),
+        "session_id": (
+            getattr(record, "session_id", None)
+            or current_session_id()
+            or runner_primary_session_id()
+        ),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
         "event_name": getattr(record, "event_name", None),
@@ -693,6 +735,13 @@ _sink_lock = threading.Lock()
 # ids, never content — never reach the on-disk/stderr logs.
 SSE_LOGGER_NAME = "omnigent.sse_events"
 
+# Dedicated logger for server request audit events (the per-method
+# start/ok/error envelope, WS lifecycle, and in-handler checkpoints). Like the
+# SSE logger it gets the sink as its sole handler with ``propagate=False``, so
+# audit rows populate the table without flooding the on-disk/stderr logs, and
+# they disappear entirely when the sink is off (no env vars -> no handler).
+AUDIT_LOGGER_NAME = "omnigent.audit_events"
+
 
 def debug_sink_enabled() -> bool:
     """Whether the debug-log sink is active in this process.
@@ -715,6 +764,16 @@ def sse_event_logger() -> logging.Logger:
     handlers and records are dropped -- so gate on :func:`debug_sink_enabled`.
     """
     return logging.getLogger(SSE_LOGGER_NAME)
+
+
+def audit_event_logger() -> logging.Logger:
+    """Return the table-only logger for server request audit events.
+
+    Records go only to the debug sink (attached with ``propagate=False`` in
+    :func:`attach_debug_log_sink`); when the sink is disabled the logger has no
+    handlers and records are dropped -- so gate on :func:`debug_sink_enabled`.
+    """
+    return logging.getLogger(AUDIT_LOGGER_NAME)
 
 
 def attach_debug_log_sink(
@@ -770,3 +829,10 @@ def attach_debug_log_sink(
         sse_logger.setLevel(level)
         sse_logger.propagate = False
         sse_logger.addHandler(_active_sink)
+        # Table-only server audit-event logger (same rationale as the SSE
+        # logger): sink-only, non-propagating, so request audit rows reach the
+        # table but never the on-disk/stderr logs.
+        audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
+        audit_logger.setLevel(level)
+        audit_logger.propagate = False
+        audit_logger.addHandler(_active_sink)

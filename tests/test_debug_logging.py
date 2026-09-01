@@ -215,6 +215,45 @@ def test_record_to_row_falls_back_to_context_var() -> None:
     assert dl.record_to_row(record, source="server")["user_id"] is None
 
 
+def test_record_to_row_session_id_falls_back_to_ambient_scope() -> None:
+    # The server middleware binds an ambient session id for a session-scoped
+    # request; unthreaded records inherit it, and only inside the scope.
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="server")["session_id"] == "conv_ambient"
+    assert dl.record_to_row(record, source="server")["session_id"] is None
+
+
+def test_record_to_row_prefers_explicit_session_id_over_ambient() -> None:
+    # An explicit record.session_id wins over the ambient request-scoped value.
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    record.session_id = "conv_explicit"
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="server")["session_id"] == "conv_explicit"
+
+
+def test_record_to_row_session_ambient_beats_primary_but_explicit_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Priority on a runner: explicit extra > ambient scope > primary-session env.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
+    record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
+    with dl.current_session_id_scope("conv_ambient"):
+        assert dl.record_to_row(record, source="runner")["session_id"] == "conv_ambient"
+    assert dl.record_to_row(record, source="runner")["session_id"] == "conv_primary"
+
+
+def test_current_session_id_scope_resets() -> None:
+    assert dl.current_session_id() is None
+    dl.set_current_session_id("outer")
+    try:
+        with dl.current_session_id_scope("inner"):
+            assert dl.current_session_id() == "inner"
+        assert dl.current_session_id() == "outer"
+    finally:
+        dl.set_current_session_id(None)
+
+
 def test_record_to_row_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # No explicit user_id and no ContextVar -> the process-constant env (runner/host).
     monkeypatch.setenv(dl.USER_ID_ENV_VAR, "env@x")
@@ -348,9 +387,15 @@ def test_attach_uses_custom_send_without_zerobus_config(
         target.info("custom delivery")
         assert delivered.wait(timeout=1.0)
         assert batches[0][0]["message"] == "custom delivery"
+        # The audit-event logger is wired sink-only and non-propagating, so
+        # request audit rows reach the table but never the on-disk/stderr logs.
+        audit_logger = dl.audit_event_logger()
+        assert audit_logger.propagate is False
+        assert sink in audit_logger.handlers
     finally:
         target.removeHandler(sink)
         dl.sse_event_logger().removeHandler(sink)
+        dl.audit_event_logger().removeHandler(sink)
         sink.close()
 
 

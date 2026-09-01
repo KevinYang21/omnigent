@@ -22,12 +22,18 @@ from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.responses import Response
-from starlette.routing import Mount, Route
+from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
-from omnigent.debug_logging import set_current_user_id
+from omnigent.debug_logging import (
+    audit_event_logger,
+    debug_event,
+    debug_sink_enabled,
+    set_current_session_id,
+    set_current_user_id,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -215,14 +221,39 @@ _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
 def _session_id_from_request(request: Request) -> str | None:
     """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
 
-    Threaded into exception-handler logs (``extra={"session_id": …}``) so a 500
-    on a session route carries its conversation id in the debug-logs table. Read
-    from the request explicitly per-invocation — no ambient/request-scoped
-    session ContextVar exists on the server, deliberately, to avoid
-    cross-request mis-attribution.
+    Threaded into exception-handler logs so a 500 on a session route carries its
+    conversation id in the debug-logs table. Parsed from the path here (rather
+    than the matched route param) because a handler may raise before the id is
+    otherwise in scope; the ambient request-scoped session ContextVar bound by
+    the middleware (:func:`omnigent.debug_logging.set_current_session_id`) covers
+    the non-exception records.
     """
     match = _SESSION_PATH_RE.search(request.url.path)
     return match.group(1) if match else None
+
+
+def _error_audit_extra(
+    request: Request,
+    *,
+    phase: str = "error",
+    **attributes: object,
+) -> dict[str, object]:
+    """Build the ``extra=`` for an exception-handler log: operation + session id.
+
+    Routing has already happened by the time an exception handler runs, so the
+    matched route's name (the handler function, e.g. ``get_session``) is the
+    operation. The record keeps its message and stack trace (via ``exc_info``)
+    while gaining a queryable ``event_name`` + ``session_id``, correlating it to
+    the middleware's ``error`` envelope row.
+    """
+    route = request.scope.get("route")
+    operation = getattr(route, "name", None) or "unmatched"
+    return debug_event(
+        operation,
+        session_id=_session_id_from_request(request),
+        phase=phase,
+        **attributes,
+    )
 
 
 # polly's and debby's multi-file bundles are packaged under
@@ -318,6 +349,57 @@ def request_route_template_for_metrics(request: Request) -> str:
     if isinstance(route, Route | Mount):
         return route.path
     return _UNMATCHED_ROUTE_TEMPLATE
+
+
+def _resolve_audit_route(request: Request) -> tuple[str, str, str | None]:
+    """Resolve ``(operation, route_template, session_id)`` before routing.
+
+    ``request.scope["route"]`` is only populated *after* routing (inside
+    ``call_next``), so to name the pre-call ``start`` audit event and bind the
+    ambient session id we match the request against the app's routes here. The
+    operation is the matched route's name (its handler function name, e.g.
+    ``create_session``); the session id comes from the matched route's
+    ``{session_id}`` path param — never the loose path regex — so a non-session
+    route (or ``/v1/sessions`` list) resolves to a null session id. Returns
+    ``("unmatched", "<unmatched>", None)`` when nothing matches.
+    """
+    for route in request.app.router.routes:
+        try:
+            match, child_scope = route.matches(request.scope)
+        except Exception:  # noqa: BLE001 — route matching must never fail a request
+            continue
+        if match is Match.FULL:
+            name = getattr(route, "name", None) or "unmatched"
+            template = getattr(route, "path", _UNMATCHED_ROUTE_TEMPLATE)
+            session_id = child_scope.get("path_params", {}).get("session_id")
+            return name, template, session_id
+    return "unmatched", _UNMATCHED_ROUTE_TEMPLATE, None
+
+
+def _emit_audit_event(
+    operation: str,
+    phase: str,
+    *,
+    session_id: str | None,
+    **attributes: object,
+) -> None:
+    """Emit one server audit row (table-only, gated on the debug sink).
+
+    A no-op when the debug-log sink is off, so it costs nothing for OSS / users
+    who never enabled it. ``event_name`` is the operation (handler name) and
+    ``phase`` / ``route`` / ``status`` / ``duration_ms`` ride as attributes so a
+    reader groups by operation and filters by phase.
+    """
+    if not debug_sink_enabled():
+        return
+    # Audit logging must never fail a request.
+    with suppress(Exception):
+        audit_event_logger().info(
+            "%s %s",
+            operation,
+            phase,
+            extra=debug_event(operation, session_id=session_id, phase=phase, **attributes),
+        )
 
 
 def _request_status_code_for_metrics(
@@ -1539,6 +1621,22 @@ def create_app(
         except Exception:  # noqa: BLE001 — attribution is best-effort
             set_current_user_id(None)
 
+        # Resolve the operation + session id from the matched route up front so
+        # the audit ``start`` event is named and records emitted while handling a
+        # session-scoped request inherit the session id (ambient, from the route
+        # ``{session_id}`` param — set to None for non-session routes so no stale
+        # value leaks and no non-session route is mis-attributed).
+        operation, audit_route, audit_session_id = _resolve_audit_route(request)
+        set_current_session_id(audit_session_id)
+        _emit_audit_event(
+            operation,
+            "start",
+            session_id=audit_session_id,
+            route=audit_route,
+            method=request.method,
+            request_id=request_id,
+        )
+
         failed = False
         status_code: int | None = None
         started_at = server_metrics.request_started()
@@ -1558,6 +1656,16 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
+            _emit_audit_event(
+                operation,
+                "error" if request_failed else "ok",
+                session_id=audit_session_id,
+                route=audit_route,
+                method=request.method,
+                request_id=request_id,
+                status=str(status_code) if status_code is not None else "none",
+                duration_ms=str(round(duration_seconds * 1000)),
+            )
             # Per-route tally (low-cardinality template key) for offline
             # request-breakdown analysis, e.g. the benchmark harness's
             # per-journey network appendix. Cheap; independent of the OTel path.
@@ -1592,14 +1700,18 @@ def create_app(
                 "Internal error: %s",
                 exc.message,
                 exc_info=exc,
-                extra={"session_id": _session_id_from_request(request)},
+                extra=_error_audit_extra(
+                    request, code=str(exc.code), http_status=str(exc.http_status)
+                ),
             )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s",
                 request.url.path,
                 exc.message,
-                extra={"session_id": _session_id_from_request(request)},
+                extra=_error_audit_extra(
+                    request, phase="rejected", code=str(exc.code), http_status="400"
+                ),
             )
         return JSONResponse(
             status_code=exc.http_status,
@@ -1639,7 +1751,9 @@ def create_app(
             "Database error: %s",
             exc,
             exc_info=exc,
-            extra={"session_id": _session_id_from_request(request)},
+            extra=_error_audit_extra(
+                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+            ),
         )
         return JSONResponse(
             status_code=500,
@@ -1670,7 +1784,9 @@ def create_app(
             "Unhandled exception: %s",
             exc,
             exc_info=exc,
-            extra={"session_id": _session_id_from_request(request)},
+            extra=_error_audit_extra(
+                request, code=str(ErrorCode.INTERNAL_ERROR), http_status="500"
+            ),
         )
         return JSONResponse(
             status_code=500,
