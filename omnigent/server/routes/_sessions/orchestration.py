@@ -1364,6 +1364,7 @@ def _persist_native_cumulative_usage(
     session_id: str,
     data: dict[str, Any],
     conversation_store: ConversationStore,
+    conv: Conversation | None = None,
 ) -> float | None:
     """
     Persist cumulative cost / token usage reported by a native harness.
@@ -1414,6 +1415,13 @@ def _persist_native_cumulative_usage(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param data: The ``external_session_usage`` event ``data`` dict.
     :param conversation_store: Store for reading and writing ``session_usage``.
+    :param conv: The session's already-loaded conversation row, when the
+        caller holds one (the events route's access check just read it), so
+        this persist doesn't re-read the same row. The read-then-write on
+        ``session_usage`` is non-transactional with or without an internal
+        read, so a supplied row keeps the same race class (the window merely
+        starts at the caller's read); the monotonic clamps below still apply
+        against whatever baseline was read. ``None`` reads the row here.
     :returns: The session's cumulative priced cost in USD after this
         update (for the caller to broadcast on a ``session.usage``
         event), or ``None`` when the session is unpriced or no
@@ -1428,7 +1436,8 @@ def _persist_native_cumulative_usage(
     if cost is None and policy_cost is None and cin is None and cout is None:
         return None
 
-    conv = conversation_store.get_conversation(session_id)
+    if conv is None:
+        conv = conversation_store.get_conversation(session_id)
     current: dict[str, Any] = dict(conv.session_usage) if conv and conv.session_usage else {}
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
@@ -1565,6 +1574,7 @@ async def _persist_external_session_usage(
     session_id: str,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    conv: Conversation | None = None,
 ) -> int | None:
     """
     Persist and broadcast a token-usage update from a terminal-backed runtime.
@@ -1576,6 +1586,11 @@ async def _persist_external_session_usage(
     :param session_id: Session/conversation identifier.
     :param body: External session-usage event body.
     :param conversation_store: Store used to upsert the labels.
+    :param conv: The session's already-loaded conversation row, when the
+        caller holds one (the events route's access check reads it). Threaded
+        to the own-usage persist, the subtree roll-up, and the ancestor
+        publish so one flush shares one row read instead of re-reading it
+        per step. ``None`` makes each step resolve the row itself.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
     :raises OmnigentError: On missing / malformed fields.
     """
@@ -1617,6 +1632,7 @@ async def _persist_external_session_usage(
         session_id,
         body.data,
         conversation_store,
+        conv,
     )
     _n_in = body.data.get("cumulative_input_tokens")
     _n_out = body.data.get("cumulative_output_tokens")
@@ -1649,8 +1665,14 @@ async def _persist_external_session_usage(
     # would drop a parent's badge back to own-cost on every parent flush and
     # hide in-flight sub-agent spend until the next child flush (the badge would
     # oscillate own ⇄ subtree). For a childless session the subtree is just
-    # itself, so this equals own cost — one indexed tree query per flush.
-    subtree_usage = await asyncio.to_thread(load_session_usage, session_id, conversation_store)
+    # itself, so this equals own cost — one indexed tree query per flush. The
+    # caller's row supplies the root so the tree scan needs no extra row read.
+    subtree_usage = await asyncio.to_thread(
+        load_session_usage,
+        session_id,
+        conversation_store,
+        root_conversation_id=conv.root_conversation_id if conv is not None else None,
+    )
     subtree_cost = _priced_cost_for_display(subtree_usage)
     usage_by_model = _usage_by_model_for_display(subtree_usage)
     # Only include fields that were sent; the client treats absent
@@ -1681,6 +1703,7 @@ async def _persist_external_session_usage(
         _publish_subtree_cost_to_ancestors,
         conversation_store,
         session_id,
+        conv,
     )
     return raw_tokens
 
@@ -6416,10 +6439,22 @@ async def _relay_runner_stream_once(
                             # surfaces tokens). context_tokens/window already ride
                             # on the response.completed event. Threaded: store
                             # reads + SSE fan-out.
+                            # One row read serves both the subtree sum and
+                            # the ancestor publish below (each would
+                            # otherwise re-derive the tree root itself).
+                            _usage_conv = await asyncio.to_thread(
+                                conversation_store.get_conversation,
+                                session_id,
+                            )
                             _subtree_usage = await asyncio.to_thread(
                                 load_session_usage,
                                 session_id,
                                 conversation_store,
+                                root_conversation_id=(
+                                    _usage_conv.root_conversation_id
+                                    if _usage_conv is not None
+                                    else None
+                                ),
                             )
                             _subtree_cost = _priced_cost_for_display(_subtree_usage)
                             _usage_by_model = _usage_by_model_for_display(_subtree_usage)
@@ -6442,6 +6477,7 @@ async def _relay_runner_stream_once(
                                     _publish_subtree_cost_to_ancestors,
                                     conversation_store,
                                     session_id,
+                                    _usage_conv,
                                 )
 
                     # Reset the turn-scoped response_id on any
@@ -9621,8 +9657,15 @@ async def _get_session_snapshot(
     # displayed cost includes sub-agents — a codex/claude sub-agent's spend
     # is persisted on its own child conversation, not the parent's, so the
     # parent's own session_usage would under-report. Off the event loop
-    # because it pages the conversation tree from the store.
-    subtree_usage = await asyncio.to_thread(load_session_usage, conv.id, conv_store)
+    # because it pages the conversation tree from the store. The authorized
+    # row's root is passed so the tree root isn't re-derived with a second
+    # point read of the row this handler already holds.
+    subtree_usage = await asyncio.to_thread(
+        load_session_usage,
+        conv.id,
+        conv_store,
+        root_conversation_id=conv.root_conversation_id,
+    )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web

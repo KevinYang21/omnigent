@@ -216,3 +216,70 @@ def test_token_priced_bucket_matches_flat_cost(
     # total_tokens = 200 (input) + 0 (cache) + 50 (output) = 250; cost = 2.50.
     assert usage["total_cost_usd"] == pytest.approx(2.50)
     assert usage["by_model"]["gpt-5.6"]["total_cost_usd"] == pytest.approx(2.50)
+
+
+def _conversation_point_reads(statements: list[str]) -> list[str]:
+    """Filter captured SQL to point reads of a single conversation row."""
+    matches: list[str] = []
+    for raw in statements:
+        normalized = " ".join(raw.split())
+        if "FROM conversations" not in normalized or " WHERE " not in normalized:
+            continue
+        where = normalized.split(" WHERE ", 1)[1]
+        if "conversations.id = " in where and "root_conversation_id" not in where:
+            matches.append(normalized)
+    return matches
+
+
+def test_supplied_row_skips_conversation_reread(db_uri: str) -> None:
+    """A caller-supplied row must satisfy the persist's own conversation read.
+
+    The events route's access check already read the row; re-reading it here
+    doubled the per-flush point reads. With the row supplied, the persist must
+    issue ZERO conversation point reads and still record the report.
+    """
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="reuse", agent_id=_AGENT_ID)
+    row = store.get_conversation(conv.id)
+    assert row is not None
+
+    engine = _engine_cache[db_uri]
+    statements: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", _on_exec)
+    try:
+        _persist_native_cumulative_usage(
+            conv.id, {"cumulative_cost_usd": 3.0, "model": "m1"}, store, row
+        )
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _on_exec)
+
+    assert _conversation_point_reads(statements) == []
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(3.0)
+
+
+def test_supplied_row_keeps_monotonic_clamp(db_uri: str) -> None:
+    """The forged-low-report clamp must hold on the supplied-row path too.
+
+    The clamp baselines against the row it was handed, so a lowered report
+    stays a no-op when the caller's (fresh) access-check row is reused.
+    """
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="clamp-reuse", agent_id=_AGENT_ID)
+
+    _persist_native_cumulative_usage(conv.id, {"cumulative_cost_usd": 10.0, "model": "m1"}, store)
+    row = store.get_conversation(conv.id)
+    assert row is not None
+    _persist_native_cumulative_usage(
+        conv.id, {"cumulative_cost_usd": 2.0, "model": "m1"}, store, row
+    )
+
+    usage = _usage(store, conv.id)
+    assert usage["total_cost_usd"] == pytest.approx(10.0)
