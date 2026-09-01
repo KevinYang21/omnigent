@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
@@ -75,6 +76,11 @@ from omnigent.onboarding.provider_config import (
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
 # harness gated below on its binary plus an API key or OAuth credential.
 _logger = logging.getLogger(__name__)
+
+# Fan-out width for the readiness probes. Only a handful of harnesses actually
+# exec a subprocess; the rest resolve from local files, so a small pool covers
+# the slow ones without flooding a loaded machine with threads.
+_MAX_PROBE_WORKERS = 8
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
     {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
@@ -450,9 +456,15 @@ def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailab
     # without depending on the probe resolving the CLI on PATH.
     if install_key == ANTHROPIC_FAMILY and _claude_managed_gateway_configured():
         return True
+    # ``use_persisted_cache``: this is the daemon's readiness path, and a cold
+    # daemon start would otherwise re-exec the (slow) status probe every time.
     return (
         True
-        if harness_cli_logged_in(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+        if harness_cli_logged_in(
+            install_key,
+            timeout=READINESS_CLI_PROBE_TIMEOUT_S,
+            use_persisted_cache=True,
+        )
         else "needs-auth"
     )
 
@@ -562,12 +574,36 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
-    availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}
-    result: dict[str, HarnessAvailability] = {}
+    keyed: dict[str, tuple[str, ...]] = {}
+    pending: dict[tuple[str, ...], str] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
         cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
-        if cache_key not in availability_cache:
-            availability_cache[cache_key] = _harness_availability(canonical)
-        result[spelling] = availability_cache[cache_key]
-    return result
+        keyed[spelling] = cache_key
+        pending.setdefault(cache_key, canonical)
+    availability_cache = _probe_availability(pending)
+    return {spelling: availability_cache[cache_key] for spelling, cache_key in keyed.items()}
+
+
+def _probe_availability(
+    pending: dict[tuple[str, ...], str],
+) -> dict[tuple[str, ...], HarnessAvailability]:
+    """Resolve one availability verdict per distinct probe, concurrently.
+
+    Each verdict execs its harness's own CLI (``claude auth status``,
+    ``codex --version``, ``gh auth token``, …) or reads local credential files,
+    and the probes are independent of each other — run serially they cost their
+    sum, which dominated the host daemon's cold-start readiness stage.
+
+    :param pending: Distinct probe key to the canonical harness that resolves it.
+    :returns: The verdict for every key in *pending*.
+    """
+    if len(pending) <= 1:
+        return {key: _harness_availability(canonical) for key, canonical in pending.items()}
+    workers = min(len(pending), _MAX_PROBE_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="harness-probe") as pool:
+        futures = {
+            key: pool.submit(_harness_availability, canonical)
+            for key, canonical in pending.items()
+        }
+        return {key: future.result() for key, future in futures.items()}

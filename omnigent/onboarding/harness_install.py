@@ -35,6 +35,7 @@ when the credentials file is absent — see ``ambient._claude_login_detected``.)
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -57,6 +58,7 @@ from omnigent.opencode_native_client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.process_logging import data_dir
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -774,6 +776,122 @@ _PROBE_CACHE_LOCK = threading.Lock()
 _LOGIN_PROBE_CACHE_TTL_S = 120.0
 _PROBE_CACHE_MAX_ENTRIES = 64
 
+# Per-target gates so concurrent cache misses don't each exec the CLI: the
+# readiness fan-out resolves many harness spellings at once and aliases of one
+# CLI (``claude-native`` / ``native-claude``) share a probe. The loser waits,
+# then reads the winner's cached answer.
+_PROBE_GATES: dict[object, threading.Lock] = {}
+
+
+def _probe_gate(token: object) -> threading.Lock:
+    """Return the lock serializing concurrent probes of the same target.
+
+    :param token: The probe's cache key — a binary signature for ``--version``,
+        a ``(key, binary)`` pair for the login status probe.
+    """
+    with _PROBE_CACHE_LOCK:
+        if len(_PROBE_GATES) >= _PROBE_CACHE_MAX_ENTRIES:
+            _PROBE_GATES.clear()
+        return _PROBE_GATES.setdefault(token, threading.Lock())
+
+
+# The in-process cache above only helps a daemon that stays up: a COLD host
+# start finds it empty and pays ``claude auth status`` (~0.6s on the measured
+# box) again. So positive verdicts are also mirrored to disk, keyed on the CLI's
+# ``(path, mtime_ns, size)`` exactly like the version cache, so an upgraded or
+# replaced binary re-probes.
+_PERSISTED_LOGIN_CACHE_NAME = "cli_login_probe_cache.json"
+# 15 min: covers a burst of cold daemon starts, and a login revoked outside
+# omnigent self-corrects within one working pause. A stale positive only
+# mislabels a picker badge — the launch gate is binary-only — and a login or
+# logout driven through omnigent invalidates immediately.
+_PERSISTED_LOGIN_TTL_S = 900.0
+_PERSISTED_LOGIN_CACHE_MAX_ENTRIES = 32
+
+
+def _persisted_login_cache_path() -> Path:
+    """Return the on-disk login-verdict cache file (honors ``OMNIGENT_DATA_DIR``)."""
+    return data_dir() / _PERSISTED_LOGIN_CACHE_NAME
+
+
+def _persisted_login_entry_key(key: str, binary: str) -> str | None:
+    """Return the disk-cache key for *key*'s verdict on this exact binary.
+
+    :returns: ``"<key>\\n<path>\\n<mtime_ns>\\n<size>"``, or ``None`` when the
+        binary cannot be stat'ed (caller then probes uncached).
+    """
+    sig = _binary_signature(binary)
+    if sig is None:
+        return None
+    path, mtime_ns, size = sig
+    return f"{key}\n{path}\n{mtime_ns}\n{size}"
+
+
+def _read_persisted_logins() -> dict[str, float]:
+    """Return the on-disk ``entry key -> expiry (epoch seconds)`` mapping.
+
+    A missing, unreadable, or malformed file reads as empty so a corrupted
+    cache degrades to probing rather than raising on the readiness path.
+    """
+    try:
+        payload = json.loads(_persisted_login_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        name: float(expiry)
+        for name, expiry in payload.items()
+        if isinstance(name, str)
+        and isinstance(expiry, (int, float))
+        and not isinstance(expiry, bool)
+    }
+
+
+def _write_persisted_logins(entries: dict[str, float]) -> None:
+    """Replace the on-disk cache atomically; a write failure is not fatal."""
+    path = _persisted_login_cache_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(entries), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        # A read-only / full data dir must never break a readiness refresh;
+        # the next probe simply runs the subprocess again.
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _persisted_login_fresh(key: str, binary: str) -> bool:
+    """Whether disk holds an unexpired positive verdict for this exact binary."""
+    entry_key = _persisted_login_entry_key(key, binary)
+    if entry_key is None:
+        return False
+    return time.time() < _read_persisted_logins().get(entry_key, 0.0)
+
+
+def _store_persisted_login(key: str, binary: str) -> None:
+    """Record a positive verdict on disk for :data:`_PERSISTED_LOGIN_TTL_S`."""
+    entry_key = _persisted_login_entry_key(key, binary)
+    if entry_key is None:
+        return
+    now = time.time()
+    entries = {name: expiry for name, expiry in _read_persisted_logins().items() if expiry > now}
+    entries[entry_key] = now + _PERSISTED_LOGIN_TTL_S
+    if len(entries) > _PERSISTED_LOGIN_CACHE_MAX_ENTRIES:
+        entries = {entry_key: entries[entry_key]}
+    _write_persisted_logins(entries)
+
+
+def _drop_persisted_logins(key: str) -> None:
+    """Forget every persisted verdict for *key* so a logout is never masked."""
+    prefix = f"{key}\n"
+    entries = _read_persisted_logins()
+    remaining = {name: expiry for name, expiry in entries.items() if not name.startswith(prefix)}
+    if len(remaining) != len(entries):
+        _write_persisted_logins(remaining)
+
 
 def _binary_signature(binary: str) -> tuple[str, int, int] | None:
     """Return *binary*'s identity signature for the version cache.
@@ -950,11 +1068,28 @@ def _harness_cli_version_string(
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
     sig = _binary_signature(binary)
-    if sig is not None:
+    if sig is None:
+        return _probe_harness_cli_version(binary, timeout)
+    with _PROBE_CACHE_LOCK:
+        cached = _VERSION_PROBE_CACHE.get(sig)
+    if cached is not None:
+        return cached
+    with _probe_gate(sig):
         with _PROBE_CACHE_LOCK:
             cached = _VERSION_PROBE_CACHE.get(sig)
         if cached is not None:
             return cached
+        version = _probe_harness_cli_version(binary, timeout)
+        if version is not None:
+            with _PROBE_CACHE_LOCK:
+                if len(_VERSION_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
+                    _VERSION_PROBE_CACHE.clear()
+                _VERSION_PROBE_CACHE[sig] = version
+        return version
+
+
+def _probe_harness_cli_version(binary: str, timeout: float) -> str | None:
+    """Exec ``<binary> --version`` and return its parsed version, uncached."""
     try:
         completed = subprocess.run(
             [binary, "--version"],
@@ -965,15 +1100,7 @@ def _harness_cli_version_string(
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    version = _parse_harness_cli_version(
-        (completed.stdout or "") + "\n" + (completed.stderr or "")
-    )
-    if version is not None and sig is not None:
-        with _PROBE_CACHE_LOCK:
-            if len(_VERSION_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
-                _VERSION_PROBE_CACHE.clear()
-            _VERSION_PROBE_CACHE[sig] = version
-    return version
+    return _parse_harness_cli_version((completed.stdout or "") + "\n" + (completed.stderr or ""))
 
 
 def harness_install_command(key: str) -> list[str]:
@@ -1107,7 +1234,12 @@ def install_harness_cli(key: str) -> bool:
     return try_install_harness_cli(key).installed
 
 
-def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S) -> bool:
+def harness_cli_logged_in(
+    key: str,
+    timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
+    *,
+    use_persisted_cache: bool = False,
+) -> bool:
     """Return whether the harness CLI itself reports a usable login.
 
     Asks the CLI's own status command (``claude auth status`` /
@@ -1134,6 +1266,12 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
         ``"openai"`` (Codex), or ``"gemini"`` (Antigravity, via ``agy models``).
     :param timeout: Seconds to wait for the status subprocess, e.g. ``10.0`` on
         the readiness path where a hung CLI must not stall the refresh.
+    :param use_persisted_cache: When true, a positive verdict is also served
+        from / written to the on-disk cache (:data:`_PERSISTED_LOGIN_TTL_S`), so
+        a cold host daemon doesn't re-exec the probe on every start. Opt-in: the
+        interactive ``configure`` surfaces and :func:`harness_login` stay live so
+        a user who just ran ``claude auth login``/``logout`` by hand sees the
+        real state immediately.
     :returns: ``True`` when the CLI reports a usable login; ``False`` when the
         key has no status command, the CLI binary is missing, the status
         process failed to spawn, or the CLI reports no login.
@@ -1149,13 +1287,50 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     # refresh is the ambient storm. Negatives always re-probe so a login
     # made a moment ago is seen immediately.
     cache_key = (key, binary)
+    if _cached_login_verdict(cache_key, use_persisted_cache=use_persisted_cache):
+        return True
+    with _probe_gate(cache_key):
+        # Re-check under the gate: a concurrent probe of the same CLI may have
+        # answered while we waited.
+        if _cached_login_verdict(cache_key, use_persisted_cache=use_persisted_cache):
+            return True
+        argv = [binary if key == GEMINI_FAMILY else spec.binary, *spec.status_args]
+        return _run_login_probe(
+            key,
+            binary,
+            argv,
+            spec.login_status_key,
+            timeout,
+            use_persisted_cache=use_persisted_cache,
+        )
+
+
+def _cached_login_verdict(cache_key: tuple[str, str], *, use_persisted_cache: bool) -> bool:
+    """Whether an unexpired positive verdict is already cached for *cache_key*."""
     with _PROBE_CACHE_LOCK:
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
+    return use_persisted_cache and _persisted_login_fresh(*cache_key)
+
+
+def _run_login_probe(
+    key: str,
+    binary: str,
+    argv: list[str],
+    status_key: str | None,
+    timeout: float,
+    *,
+    use_persisted_cache: bool,
+) -> bool:
+    """Exec the CLI's status command and cache a positive verdict.
+
+    Split out of :func:`harness_cli_logged_in` so the cache lookup, the
+    single-flight gate, and the probe itself each stay readable.
+    """
+    cache_key = (key, binary)
     try:
         result = subprocess.run(
-            [argv_binary, *spec.status_args],
+            argv,
             check=False,
             timeout=timeout,
             capture_output=True,
@@ -1169,7 +1344,6 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     # harness has no JSON verdict (Codex's human line, agy's model list), so the
     # exit code is authoritative and stdout is never parsed — output that merely
     # happens to be JSON can't flip the verdict.
-    status_key = spec.login_status_key
     logged_in = result.returncode == 0
     if status_key is not None:
         try:
@@ -1183,6 +1357,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
             if len(_LOGIN_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
                 _LOGIN_PROBE_CACHE.clear()
             _LOGIN_PROBE_CACHE[cache_key] = time.monotonic() + _LOGIN_PROBE_CACHE_TTL_S
+        if use_persisted_cache:
+            _store_persisted_login(key, binary)
     return logged_in
 
 
@@ -1272,4 +1448,5 @@ def harness_logout(key: str) -> bool:
     with _PROBE_CACHE_LOCK:
         for cache_key in [k for k in _LOGIN_PROBE_CACHE if k[0] == key]:
             del _LOGIN_PROBE_CACHE[cache_key]
+    _drop_persisted_logins(key)
     return not harness_cli_logged_in(key)

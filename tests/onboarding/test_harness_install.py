@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -280,6 +282,172 @@ def test_logout_invalidates_login_probe_cache(
         "logout must invalidate the cached positive and confirm live"
     )
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+
+
+def _persisted_cache_setup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, list[list[str]]]:
+    """Point the disk cache at *tmp_path* and stub a real, logged-in claude CLI.
+
+    The persisted entry is keyed on the binary's ``(path, mtime_ns, size)``, so
+    the fake CLI has to be a file that actually exists.
+
+    :returns: ``(binary path, recorded probe argv list)``.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    binary = tmp_path / "claude"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: str(binary))
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+    return binary, runs
+
+
+def test_persisted_login_cache_survives_a_cold_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A second cold probe of an unchanged binary skips ``auth status``.
+
+    The in-process cache starts empty on every host daemon, so without the
+    on-disk mirror each cold start re-paid the (slow) status subprocess.
+    """
+    binary, runs = _persisted_cache_setup(monkeypatch, tmp_path)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+    # A fresh process starts with an empty in-process cache.
+    hi._LOGIN_PROBE_CACHE.clear()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+    assert len(runs) == 1, "a cold process within the TTL must be served from disk"
+
+    # An upgraded binary must re-probe: the entry is keyed on its signature.
+    hi._LOGIN_PROBE_CACHE.clear()
+    binary.write_text("#!/bin/sh\n# upgraded\n", encoding="utf-8")
+    os.utime(binary, ns=(1, 1))
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+    assert len(runs) == 2, "a swapped binary must not reuse the old verdict"
+
+
+def test_persisted_login_cache_reprobes_after_ttl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An expired persisted verdict re-probes, so a revoked login self-corrects."""
+    _persisted_cache_setup(monkeypatch, tmp_path)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+    hi._LOGIN_PROBE_CACHE.clear()
+    hi._write_persisted_logins(dict.fromkeys(hi._read_persisted_logins(), 0.0))
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+    assert len(hi._read_persisted_logins()) == 1
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+
+
+def test_persisted_login_cache_is_opt_in(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Callers that don't opt in never read the disk cache.
+
+    The interactive ``configure`` surfaces and :func:`harness_login` must show
+    the live state, not a verdict recorded up to 15 minutes ago by the daemon.
+    """
+    _persisted_cache_setup(monkeypatch, tmp_path)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+    hi._LOGIN_PROBE_CACHE.clear()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(hi._read_persisted_logins()) == 1
+    hi._LOGIN_PROBE_CACHE.clear()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+
+
+def test_persisted_login_cache_never_strands_a_fresh_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Not-logged-in is never persisted, so a login lands on the next probe.
+
+    A user's most likely next action after "not logged in" is to log in and
+    retry; a cached negative would report the fresh login as still missing.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    binary = tmp_path / "claude"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: str(binary))
+    logged_in = False
+
+    def _stateful_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        body = '{"loggedIn": true}' if logged_in else '{"loggedIn": false}'
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0 if logged_in else 1, stdout=body, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _stateful_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is False
+    assert hi._read_persisted_logins() == {}
+    logged_in = True  # the user logs in and the daemon refreshes readiness
+    hi._LOGIN_PROBE_CACHE.clear()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+
+
+def test_logout_invalidates_persisted_login_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A logout drops the persisted positive so no cold daemon revives it."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    binary = tmp_path / "claude"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: str(binary))
+    logged_in = True
+
+    def _stateful_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal logged_in
+        if "logout" in argv:
+            logged_in = False
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+        body = '{"loggedIn": true}' if logged_in else '{"loggedIn": false}'
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0 if logged_in else 1, stdout=body, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _stateful_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is True
+    assert hi._read_persisted_logins() != {}
+    assert hi.harness_logout(ANTHROPIC_FAMILY) is True
+    assert hi._read_persisted_logins() == {}
+    hi._LOGIN_PROBE_CACHE.clear()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY, use_persisted_cache=True) is False
+
+
+def test_login_probe_runs_once_for_concurrent_callers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Concurrent probes of one CLI exec it once, not once per caller.
+
+    The readiness map resolves harness spellings in parallel and aliases of one
+    CLI (``claude-native`` / ``native-claude``) share a probe, so without a
+    single-flight gate the fan-out would double the very subprocesses these
+    caches exist to damp.
+    """
+    _binary, runs = _persisted_cache_setup(monkeypatch, tmp_path)
+    probe = hi.subprocess.run
+
+    def _slow_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        time.sleep(0.05)  # wide enough for the other callers to pile up
+        return probe(argv, **kwargs)
+
+    monkeypatch.setattr(hi.subprocess, "run", _slow_run)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(hi.harness_cli_logged_in, ANTHROPIC_FAMILY) for _ in range(4)]
+        verdicts = [future.result() for future in futures]
+
+    assert verdicts == [True, True, True, True]
+    assert len(runs) == 1, "concurrent cache misses must share one probe"
 
 
 def test_version_probe_caches_by_binary_signature(

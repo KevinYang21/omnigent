@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -523,6 +525,48 @@ def test_configured_harness_map_probes_codex_readiness_once(
     assert result["codex"] == "needs-auth"
     assert result["codex-native"] == "needs-auth"
     assert result["native-codex"] == "needs-auth"
+
+
+def test_configured_harness_map_probes_families_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distinct harness probes overlap instead of running one after another.
+
+    Each probe execs a vendor CLI (``claude auth status`` alone measured ~0.6s),
+    so run serially the readiness stage cost their sum — which dominated the
+    host daemon's cold start.
+    """
+    import omnigent.onboarding.harness_readiness as hr
+
+    delay = 0.05
+    lock = threading.Lock()
+    live = 0
+    peak = 0
+    calls = 0
+
+    def _slow_probe(_canonical: str) -> bool:
+        nonlocal live, peak, calls
+        with lock:
+            live += 1
+            calls += 1
+            peak = max(peak, live)
+        time.sleep(delay)
+        with lock:
+            live -= 1
+        return True
+
+    monkeypatch.setattr(hr, "_harness_availability", _slow_probe)
+    started = time.monotonic()
+    result = configured_harness_map()
+    elapsed = time.monotonic() - started
+
+    assert calls > 1, "expected several distinct probes"
+    assert peak > 1, "probes ran one at a time"
+    assert elapsed < calls * delay / 2, (
+        f"{elapsed:.2f}s for {calls} probes is not meaningfully under their "
+        f"{calls * delay:.2f}s serial sum"
+    )
+    assert all(value is True for value in result.values())
 
 
 def test_kimi_readiness_keys_off_binary_and_credential(
