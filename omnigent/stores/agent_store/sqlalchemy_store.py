@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import builtins
 
+from typing import cast
+
 from sqlalchemy import and_, asc, desc, or_, select
 from sqlalchemy import update as sql_update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.converters import sql_agent_to_entity
@@ -375,19 +378,22 @@ class SqlAlchemyAgentStore(AgentStore):
                 # between the SELECT and this UPDATE (which re-keys the
                 # bundle under the clone's own id) makes rowcount 0 and the
                 # clone stays pinned to the user's customized bundle.
-                result = session.execute(
-                    sql_update(SqlAgent)
-                    .where(
-                        SqlAgent.workspace_id == current_workspace_id(),
-                        SqlAgent.id == agent_id,
-                        SqlAgent.kind == encode_agent_kind("session"),
-                        SqlAgent.bundle_location == seen_location,
-                    )
-                    .values(
-                        bundle_location=bundle_location,
-                        version=SqlAgent.version + 1,
-                        updated_at=now,
-                    )
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        sql_update(SqlAgent)
+                        .where(
+                            SqlAgent.workspace_id == current_workspace_id(),
+                            SqlAgent.id == agent_id,
+                            SqlAgent.kind == encode_agent_kind("session"),
+                            SqlAgent.bundle_location == seen_location,
+                        )
+                        .values(
+                            bundle_location=bundle_location,
+                            version=SqlAgent.version + 1,
+                            updated_at=now,
+                        )
+                    ),
                 )
                 if result.rowcount == 1:
                     evict.append(agent_id)
