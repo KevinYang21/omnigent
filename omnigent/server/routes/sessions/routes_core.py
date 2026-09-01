@@ -203,6 +203,75 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.version import VERSION
 
 
+async def _inherit_host_binding(
+    *,
+    user_id: str | None,
+    session_id: str,
+    source_session_id: str,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+) -> None:
+    """
+    Copy a session's machine binding onto the session that continues it.
+
+    A native ``/clear`` rotation mints a fresh Omnigent session that keeps
+    running in the same terminal, on the same host, in the same directory.
+    Without this the replacement row is host-less: it routes to the default
+    replica instead of the one holding its host's tunnel, and a later resume
+    defaults to whichever machine the user is looking at rather than the one
+    the rotation happened on.
+
+    Affinity is read from the source row, so no caller-supplied host id or
+    path reaches the DB and nothing needs re-validating — the values were
+    validated when the source session was bound.
+
+    :param user_id: Authenticated caller, e.g. ``"alice@example.com"``, or
+        ``None`` when auth is disabled.
+    :param session_id: Session to bind, e.g. ``"conv_new"``. The caller's
+        ownership of it is already checked by the route.
+    :param source_session_id: Session to read affinity from, e.g.
+        ``"conv_old"``.
+    :param conversation_store: Store holding both rows.
+    :param permission_store: Session permission store, or ``None`` when
+        auth is disabled.
+    :returns: None. A source with no host binding is a no-op, as is a
+        target already bound to the same host.
+    :raises OmnigentError: 404 if either session is missing (or invisible
+        to the caller); 403 if the caller does not own the source; 409 if
+        the target is already bound to a different host.
+    """
+    await _require_access(
+        user_id, source_session_id, LEVEL_OWNER, permission_store, conversation_store
+    )
+    source = await asyncio.to_thread(conversation_store.get_conversation, source_session_id)
+    if source is None:
+        raise _session_not_found()
+    if source.host_id is None or source.workspace is None:
+        # A CLI-local session never had a machine binding to hand over.
+        return
+    target = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if target is None:
+        raise _session_not_found()
+    if target.host_id == source.host_id:
+        return
+    if target.host_id is not None:
+        raise OmnigentError(
+            f"Session {session_id!r} is already bound to host {target.host_id!r}; "
+            "a bound session cannot inherit a different host.",
+            code=ErrorCode.CONFLICT,
+        )
+    try:
+        await asyncio.to_thread(
+            conversation_store.set_host_id,
+            session_id,
+            source.host_id,
+            source.workspace,
+            source.git_branch,
+        )
+    except ConversationNotFoundError as exc:
+        raise _session_not_found() from exc
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -1636,12 +1705,15 @@ def register_core_routes(
         #   session may pin it — including a read-only collaborator on a session
         #   shared with them. Only when the pinned label is the request's ONLY
         #   mutation.
-        # * OWNER — archiving/unarchiving or filing into a project. Both are
+        # * OWNER — archiving/unarchiving, filing into a project, or
+        #   inheriting another session's machine binding. The first two are
         #   owner-only: projects are owner-private (an editor must not move a
         #   session between them), and archive pairs with a client-driven,
         #   owner-gated stop (an editor must not hide/stop a session they can't
         #   issue that stop for). Presence is the signal for project (``""``
         #   unfiles), so gate on model_fields_set, not a non-None value.
+        #   Inheriting a host decides which machine the session runs on, so it
+        #   sits with the runner attach below rather than plain metadata.
         # * EDIT — every other field.
         #
         # Owner implies edit, so a single check at the resolved level gates all
@@ -1652,7 +1724,11 @@ def register_core_routes(
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project:
+        elif (
+            body.archived is not None
+            or set_project
+            or body.inherit_host_from_session_id is not None
+        ):
             required_level = LEVEL_OWNER
         else:
             required_level = LEVEL_EDIT
@@ -1833,6 +1909,18 @@ def register_core_routes(
                 f"invalid terminal_launch_args: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+
+        # Machine affinity before the runner bind: the bind resolves a runner
+        # client and restarts the relay, both of which read the row's host to
+        # classify a missing runner, so the host must already be there.
+        if body.inherit_host_from_session_id is not None:
+            await _inherit_host_binding(
+                user_id=user_id,
+                session_id=session_id,
+                source_session_id=body.inherit_host_from_session_id,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+            )
 
         if body.runner_id is not None:
             # Empty string is the clear sentinel (None = leave unchanged);

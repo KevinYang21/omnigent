@@ -3895,7 +3895,7 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
 
     assert new_session_id == "conv_new"
     # The exact ordered API sequence (method, path) mirroring claude rotation —
-    # ONE PATCH on the new session (runner_id bind), then transfer, then release.
+    # runner_id bind, transfer, host-affinity inherit, then release.
     methods_paths = [(m, p) for (m, p, _b) in calls]
     assert methods_paths == [
         ("GET", f"/v1/sessions/{_SESSION_ID}"),
@@ -3905,6 +3905,7 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
             "POST",
             f"/v1/sessions/{_SESSION_ID}/resources/terminals/terminal_antigravity_main/transfer",
         ),
+        ("PATCH", "/v1/sessions/conv_new"),  # inherit the old session's host
         ("PATCH", f"/v1/sessions/{_SESSION_ID}"),  # release old runner
     ]
     # No external_session_id PATCH is made anywhere (the loop-bug source): every
@@ -3922,8 +3923,11 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     assert calls[2][2] == {"runner_id": "runner_abc"}
     # The terminal transfer targeted the new session (the SAME agy moves over).
     assert calls[3][2] == {"target_session_id": "conv_new"}
+    # The replacement inherited the old session's machine, so it stays on the
+    # host the /clear was typed on instead of looking host-less.
+    assert calls[4][2] == {"inherit_host_from_session_id": _SESSION_ID}
     # Old runner released.
-    assert calls[4][2] == {"runner_id": ""}
+    assert calls[5][2] == {"runner_id": ""}
     # Bridge state was rewritten to the new session + new cascade (the reader
     # rebinds to the new cascade on the SAME agy via this shared bridge_dir).
     state = read_bridge_state(bridge_dir)

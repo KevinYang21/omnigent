@@ -22,6 +22,11 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 
+# Host ids are stored as uuids (the ``host_`` prefix is stripped on write), so
+# the rotation tests use the canonical form the store reads back.
+_HOST_A = "329c39d03aad39ccf2f8597d596676bd"
+_HOST_B = "77599b2c44934910b00cfdfda3ba21fc"
+
 
 @pytest_asyncio.fixture()
 async def session_id(db_uri: str) -> str:
@@ -337,6 +342,120 @@ async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 404
+
+
+# ── PATCH inherit_host_from_session_id ───────────────────────────────
+
+
+async def test_patch_inherits_the_source_session_machine(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A rotation replacement lands on the machine the rotation happened on.
+
+    A native ``/clear`` mints a fresh session that keeps running in the same
+    terminal on the same host. Without inheritance the replacement row is
+    host-less, so it routes to the default replica and a later resume
+    defaults to whichever machine the user is looking at.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="rotation-agent", bundle_location="test:///bundle")
+    old = conv_store.create_conversation(
+        agent_id=agent_id,
+        host_id=_HOST_A,
+        workspace="/home/dev/universe",
+        git_branch="feature/login",
+    )
+    new = conv_store.create_conversation(agent_id=agent_id)
+
+    resp = await client.patch(
+        f"/v1/sessions/{new.id}",
+        json={"inherit_host_from_session_id": old.id},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["host_id"] == _HOST_A
+    assert resp.json()["workspace"] == "/home/dev/universe"
+    rebound = conv_store.get_conversation(new.id)
+    assert rebound is not None
+    assert rebound.host_id == _HOST_A
+    assert rebound.workspace == "/home/dev/universe"
+    assert rebound.git_branch == "feature/login"
+
+
+async def test_patch_inherit_host_is_a_noop_for_a_hostless_source(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A CLI-local source has no machine to hand over — no error, no change."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="rotation-agent", bundle_location="test:///bundle")
+    old = conv_store.create_conversation(agent_id=agent_id)
+    new = conv_store.create_conversation(agent_id=agent_id)
+
+    resp = await client.patch(
+        f"/v1/sessions/{new.id}",
+        json={"inherit_host_from_session_id": old.id},
+    )
+
+    assert resp.status_code == 200, resp.text
+    rebound = conv_store.get_conversation(new.id)
+    assert rebound is not None
+    assert rebound.host_id is None
+
+
+async def test_patch_inherit_host_refuses_to_migrate_a_bound_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Inheritance binds an unbound session; it never moves a bound one.
+
+    Rebinding a live session to another machine would strand its runner, so
+    a target already on a different host is a conflict rather than a
+    silent migration.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="rotation-agent", bundle_location="test:///bundle")
+    old = conv_store.create_conversation(
+        agent_id=agent_id,
+        host_id=_HOST_A,
+        workspace="/home/dev/universe",
+    )
+    new = conv_store.create_conversation(
+        agent_id=agent_id,
+        host_id=_HOST_B,
+        workspace="/home/dev/other",
+    )
+
+    resp = await client.patch(
+        f"/v1/sessions/{new.id}",
+        json={"inherit_host_from_session_id": old.id},
+    )
+
+    assert resp.status_code == 409, resp.text
+    rebound = conv_store.get_conversation(new.id)
+    assert rebound is not None
+    assert rebound.host_id == _HOST_B
+
+
+async def test_patch_inherit_host_from_missing_session_is_404(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """An unknown source session cannot be inherited from."""
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"inherit_host_from_session_id": "4fe12335002377c209e501c3fe3bcffc"},
+    )
+    assert resp.status_code == 404, resp.text
 
 
 # ── GET /v1/sessions/projects ────────────────────────────────────────

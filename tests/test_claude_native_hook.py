@@ -318,6 +318,11 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
         ),
         ("PATCH", "http://127.0.0.1:8787/v1/sessions/conv_new", {"runner_id": "runner_one"}),
         (
+            "PATCH",
+            "http://127.0.0.1:8787/v1/sessions/conv_new",
+            {"inherit_host_from_session_id": "conv_old"},
+        ),
+        (
             "POST",
             (
                 "http://127.0.0.1:8787/v1/sessions/conv_old/resources/"

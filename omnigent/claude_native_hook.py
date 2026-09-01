@@ -514,6 +514,23 @@ def _create_clear_replacement_session(
         )
         bind_resp.raise_for_status()
 
+    # Same machine the /clear was typed on. Sent as its own best-effort PATCH
+    # rather than folded into the bind above: a server predating the field
+    # rejects the whole body (the request model forbids extras), and losing the
+    # rotation over a missing nicety is far worse than losing the affinity.
+    affinity_resp = client.patch(
+        f"{ap_server_url}/v1/sessions/{url_component(new_session_id)}",
+        json={"inherit_host_from_session_id": old_session_id},
+    )
+    if affinity_resp.status_code >= 400:
+        print(
+            (
+                "omnigent claude clear hook: failed to inherit host binding: "
+                f"{affinity_resp.status_code} {affinity_resp.text}"
+            ),
+            file=sys.stderr,
+        )
+
     from omnigent.entities.session_resources import terminal_resource_id
 
     terminal_id = terminal_resource_id("claude", "main")

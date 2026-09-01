@@ -7639,6 +7639,18 @@
             "description": "Runtime-native session id captured by a wrapper bridge (e.g. Claude Code's session uuid for `omnigent claude` sessions). Idempotent on same-value writes; the server rejects attempts to overwrite an already-set different value with `invalid_input` to surface programmer errors. `None` leaves unchanged.",
             "title": "External Session Id"
           },
+          "inherit_host_from_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Copy another session's machine binding (`host_id` / `workspace` / `git_branch`) onto this one, e.g. `\"conv_old\"`. This is the affinity half of a native session rotation: a Claude `/clear` mints a fresh Omnigent session that keeps running in the SAME terminal on the SAME host, so the replacement must land on the machine the rotation was triggered on rather than looking host-less (which strands it on the default replica and makes a later resume default to whichever machine the user happens to be on). The server reads the affinity from the named session \u2014 the caller never supplies a host id or path, so nothing needs re-validating. Owner-level on BOTH sessions. A source with no host binding is a no-op; a target already bound to a DIFFERENT host is rejected (409) rather than migrated. `None` leaves the binding unchanged.",
+            "title": "Inherit Host From Session Id"
+          },
           "labels": {
             "anyOf": [
               {

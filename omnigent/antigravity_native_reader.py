@@ -3085,9 +3085,14 @@ async def _rotate_session_for_cascade(
        the rewritten bridge state below, not via a later ``--resume``. (The old code
        PATCHed it, which 400'd on the auto-cold-started session's already-set,
        set-once-immutable field and looped the rotation — see the module header.)
-    5. Rewrite agy bridge state in ``bridge_dir`` with the new session id + new
+    5. PATCH ``inherit_host_from_session_id`` so the replacement row carries the
+       old session's host / workspace: the same agy process on the same machine
+       keeps serving it, and a host-less row routes to the default replica and
+       resumes on whichever machine the user is looking at (best-effort — an
+       older server rejects the field, which must not cost us the rotation).
+    6. Rewrite agy bridge state in ``bridge_dir`` with the new session id + new
        conversation id (the reader re-reads this on rebind to bind the new cascade).
-    6. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
+    7. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
        a failure is logged, not raised — the new session is already live).
 
     Best-effort: ANY failure (snapshot, create, bind, transfer, state write) is
@@ -3159,6 +3164,35 @@ async def _rotate_session_for_cascade(
             exc,
         )
         return None
+
+    # Same machine the /clear was typed on (best-effort): the replacement keeps
+    # running in this agy process on this host, so its row must say so or it
+    # routes to the default replica and a later resume defaults to whichever
+    # machine the user is looking at. Kept OUT of the rotation try above — a
+    # server predating the field rejects the body (the request model forbids
+    # extras), and the rotation must not be lost over a missing nicety.
+    try:
+        affinity_resp = await client.patch(
+            f"/v1/sessions/{url_component(new_session_id)}",
+            json={"inherit_host_from_session_id": old_session_id},
+        )
+        if affinity_resp.status_code >= 400:
+            _logger.warning(
+                "agy /clear rotation: failed to inherit the host binding; "
+                "old_session=%s new_session=%s status=%s body=%s",
+                old_session_id,
+                new_session_id,
+                affinity_resp.status_code,
+                affinity_resp.text,
+            )
+    except httpx.HTTPError:
+        _logger.warning(
+            "agy /clear rotation: error inheriting the host binding; "
+            "old_session=%s new_session=%s",
+            old_session_id,
+            new_session_id,
+            exc_info=True,
+        )
 
     # The new session is live + bound; commit bridge state so the reader's rebind
     # discovers the new cascade. Done last so a mid-sequence failure above never

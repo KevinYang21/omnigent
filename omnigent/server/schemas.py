@@ -2248,6 +2248,20 @@ class UpdateSessionRequest(BaseModel):
         owner-private, only the session owner may file it, and only into a
         project they own — the server verifies both. Independent of the
         legacy ``omni_project`` label, which is set via ``labels``.
+    :param inherit_host_from_session_id: Copy another session's machine
+        binding (``host_id`` / ``workspace`` / ``git_branch``) onto this
+        one, e.g. ``"conv_old"``. This is the affinity half of a native
+        session rotation: a Claude ``/clear`` mints a fresh Omnigent
+        session that keeps running in the SAME terminal on the SAME host,
+        so the replacement must land on the machine the rotation was
+        triggered on rather than looking host-less (which strands it on
+        the default replica and makes a later resume default to whichever
+        machine the user happens to be on). The server reads the affinity
+        from the named session — the caller never supplies a host id or
+        path, so nothing needs re-validating. Owner-level on BOTH
+        sessions. A source with no host binding is a no-op; a target
+        already bound to a DIFFERENT host is rejected (409) rather than
+        migrated. ``None`` leaves the binding unchanged.
     """
 
     runner_id: str | None = None
@@ -2263,6 +2277,7 @@ class UpdateSessionRequest(BaseModel):
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
     project_id: str | None = None
+    inherit_host_from_session_id: str | None = None
     silent: bool = False
 
     model_config = ConfigDict(extra="forbid")

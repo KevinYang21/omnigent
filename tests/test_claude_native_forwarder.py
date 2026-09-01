@@ -328,7 +328,10 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             }
             return httpx.Response(201, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
-            assert body == {"runner_id": "runner_one"}
+            assert body in (
+                {"runner_id": "runner_one"},
+                {"inherit_host_from_session_id": "conv_old"},
+            )
             return httpx.Response(200, json={"id": "conv_new"})
         if (
             request.method == "POST"
@@ -389,6 +392,9 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             },
         ),
         ("PATCH", "/v1/sessions/conv_new", {"runner_id": "runner_one"}),
+        # Machine affinity: the replacement must land on the host the /clear
+        # was typed on, not wherever the next resume happens to look.
+        ("PATCH", "/v1/sessions/conv_new", {"inherit_host_from_session_id": "conv_old"}),
         (
             "POST",
             "/v1/sessions/conv_old/resources/terminals/terminal_claude_main/transfer",
@@ -454,7 +460,10 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
             create_count += 1
             return httpx.Response(201, json={"id": "conv_new"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
-            assert body == {"runner_id": "runner_one"}
+            assert body in (
+                {"runner_id": "runner_one"},
+                {"inherit_host_from_session_id": "conv_old"},
+            )
             return httpx.Response(200, json={"id": "conv_new"})
         if (
             request.method == "POST"
