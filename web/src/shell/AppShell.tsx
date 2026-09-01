@@ -327,6 +327,12 @@ export function AppShell() {
   const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedTerminalKey ?? null) : null,
   );
+  // The one shell key the user just opened by an explicit gesture (clicking a
+  // tab / creating a "+"→Shell). Its rail xterm may grab keyboard focus when it
+  // connects; a shell merely *restored* on a session switch may not — switching
+  // sessions keeps focus in the chat composer. Cleared once consumed and on
+  // every session switch.
+  const autoFocusTerminalKeyRef = useRef<string | null>(null);
   // Whether the workspace rail is maximized (covers the full content region,
   // hiding the chat column). Session-transient — a fresh visit starts docked.
   const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
@@ -403,7 +409,7 @@ export function AppShell() {
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true);
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
   // the active conversation id, which suppresses the notification/badge for
@@ -443,11 +449,11 @@ export function AppShell() {
   // Set when this client launches a runner outside the send path (a host
   // switch); extends the liveness startup grace so the move spins.
   const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
-  const liveness = useSessionLiveness(
-    conversationId ?? undefined,
-    activeConv ?? livenessRowFromSession(activeSession),
-    { turnActive: chatStatus === "streaming", launchedAt: runnerLaunchedAt },
-  );
+  const livenessRow = activeConv ?? livenessRowFromSession(activeSession);
+  const liveness = useSessionLiveness(conversationId ?? undefined, livenessRow, {
+    turnActive: chatStatus === "streaming",
+    launchedAt: runnerLaunchedAt,
+  });
   // Full agent object (mcp_servers + policies) for the header info icon.
   // react-query-cached, so this shares the fetch ChatPage's picker makes.
   const { data: boundAgent } = useSessionAgent(conversationId ?? null);
@@ -946,6 +952,7 @@ export function AppShell() {
       setRightRailTab("files");
       setSelectedFilePath(null);
       setOpenFiles([]);
+      autoFocusTerminalKeyRef.current = null;
       setSelectedTerminalKey(null);
       setPanelInitialKeyState(null);
       stateConvRef.current = null;
@@ -991,6 +998,7 @@ export function AppShell() {
     // effect clears that selection if its terminal no longer exists once this
     // session's list loads. A restored shell selection must not coexist with a
     // file selection (one content slot).
+    autoFocusTerminalKeyRef.current = null;
     setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
     // A maximized rail is transient too — the incoming session starts docked.
     // If we were maximized, restore the sidebar we collapsed on entry (the
@@ -1433,6 +1441,7 @@ export function AppShell() {
       // just focuses it and reveals the rail. The selection is sticky (never
       // pruned off the list), so a fresh create that's still landing stays
       // selected and its xterm surfaces the instant the terminal appears.
+      autoFocusTerminalKeyRef.current = key;
       setSelectedTerminalKey(key);
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);
@@ -1618,10 +1627,41 @@ export function AppShell() {
   // the failed-suppression exactly like an in-flight send does.
   const launchPending =
     runnerLaunchedAt !== null && Date.now() - runnerLaunchedAt < STARTING_GRACE_S * 1000;
+  // Until the liveness row or session snapshot hydrates, a brand-new
+  // session is indistinguishable from a stopped one — treat the unobserved
+  // window as starting so the stopped UI can't flash during startup.
+  const livenessRowPending =
+    activeConv === null && activeSession === null && (conversationsLoading || sessionLoading);
+  // The runner can register online before its auto-created PTY reaches the
+  // inventory; hold startup through that gap inside the cold-boot grace. A
+  // PTY seen for THIS conversation and then removed is a stop, not a gap.
+  const createdAtS = livenessRow?.created_at;
+  const hadPtyForConvRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (agentTerminal) hadPtyForConvRef.current = conversationId ?? null;
+  }, [conversationId, agentTerminal]);
+  const freshOnlineGrace =
+    terminalFirst &&
+    liveness.kind === "online" &&
+    hadPtyForConvRef.current !== conversationId &&
+    typeof createdAtS === "number" &&
+    createdAtS > 0 &&
+    Date.now() / 1000 - createdAtS < STARTING_GRACE_S;
   const terminalStartingUp =
     !terminalsAvailable &&
     (sessionStatus !== "failed" || chatStatus === "streaming" || launchPending) &&
-    (liveness.kind === "starting" || terminalPending);
+    (livenessRowPending ||
+      launchPending ||
+      // terminal_pending is the runner's own "creating the PTY" signal,
+      // accurate in the snapshot after a reload; gate on an alive-ish
+      // liveness so a stale flag from a dead runner can't pin the spinner.
+      ((terminalPending || activeSession?.terminalPending === true) &&
+        (liveness.kind === "online" ||
+          liveness.kind === "starting" ||
+          liveness.kind === "unknown")) ||
+      // A send in flight is this client (re)launching the runner now.
+      (chatStatus === "streaming" && liveness.kind !== "online") ||
+      freshOnlineGrace);
   // A rail-opened shell (any open terminal key other than the agent's
   // own terminal) takes over the main view chrome-free:
   // ConnectionIndicator hides the Chat/Terminal pill while this is
@@ -1719,6 +1759,11 @@ export function AppShell() {
         traffic lights and supplies a drag strip in the freed space. */}
           <div
             className="app-shell relative flex h-dvh bg-sidebar text-foreground"
+            // Reflect the docked sidebar's open state so CSS can drop the
+            // traffic-light clearance on surfaces the sidebar covers (see the
+            // maximized workspace rail's tab strip in index.css): with the
+            // sidebar open over the window corner there are no lights to clear.
+            data-sidebar-open={sidebarOpen ? "true" : undefined}
             data-electron-mac={isMacElectronShell() ? "true" : undefined}
             data-ios-native={isIOSShell() ? "true" : undefined}
             data-android-native={isAndroidShell() ? "true" : undefined}
@@ -1937,6 +1982,10 @@ export function AppShell() {
                     openTerminalTab={openTerminalTab}
                     openTerminals={openTerminals}
                     selectedTerminalKey={selectedTerminalKey}
+                    autoFocusSelectedTerminal={
+                      autoFocusTerminalKeyRef.current !== null &&
+                      autoFocusTerminalKeyRef.current === selectedTerminalKey
+                    }
                     closingTerminalKey={closingTerminalKey}
                     onCloseTerminal={requestCloseTerminal}
                     maximized={rightPanelMaximized}

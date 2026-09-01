@@ -47,6 +47,7 @@ function getClientSurface(): string {
 export interface ElicitResult {
   action: "accept" | "decline" | "cancel";
   content?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
 }
 
 /** Response body of `POST /v1/sessions/{id}/events` (202 Accepted). */
@@ -556,7 +557,10 @@ export async function importLocalSessions(
  *
  * @param bundle - The agent bundle as a `File` (`.tar.gz`).
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
- * @returns The created session's id.
+ *   A `project_id` files the session into that project atomically at create
+ *   and lets the server default-fill absent fields from the project config.
+ * @returns The created session's id, plus any non-fatal project-consistency
+ *   `warnings` the server attached to a `project_id` create.
  */
 export async function createBundledSession(
   bundle: File,
@@ -564,11 +568,12 @@ export async function createBundledSession(
     host_id?: string;
     host_type?: string;
     workspace?: string;
+    project_id?: string;
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
   } = {},
-): Promise<{ id: string }> {
+): Promise<{ id: string; warnings?: { code?: string; message?: string }[] }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
@@ -584,8 +589,11 @@ export async function createBundledSession(
   // The multipart response uses `session_id` (CreatedSessionResponse),
   // while the JSON path uses `id` (SessionResponse). Normalize to `id`
   // so callers don't need to care which path was taken.
-  const body = (await res.json()) as { session_id: string };
-  return { id: body.session_id };
+  const body = (await res.json()) as {
+    session_id: string;
+    warnings?: { code?: string; message?: string }[];
+  };
+  return { id: body.session_id, warnings: body.warnings };
 }
 
 /**
@@ -608,14 +616,36 @@ export async function createBundledSession(
  * @param upToResponseId - Optional truncation point, e.g. "resp_abc". When
  *   set, the fork copies history only up to and including that response
  *   ("fork from here"); omitted, the full history is copied.
+ * @param config - Optional run-config overrides from the fork dialog's
+ *   model / effort / permission-mode pickers. Each field is opt-in: a field
+ *   left `undefined` inherits the source (model settings carry within the
+ *   same provider family), while a sent field overrides it. The
+ *   permission-/approval-mode selector rides `terminalLaunchArgs` (e.g.
+ *   `["--permission-mode", "auto"]`); `[]` clears the source's launch args.
+ *   `codexBypassSandbox: true` (Codex only) arms the dangerous full-bypass on
+ *   the fork — sent only on an explicit, banner-gated pick.
  */
 export async function forkSession(
   sourceId: string,
   title?: string,
   agentId?: string,
   upToResponseId?: string,
+  config?: {
+    modelOverride?: string;
+    reasoningEffort?: string;
+    terminalLaunchArgs?: string[];
+    codexBypassSandbox?: boolean;
+  },
 ): Promise<Session> {
-  const body: { title?: string; agent_id?: string; up_to_response_id?: string } = {};
+  const body: {
+    title?: string;
+    agent_id?: string;
+    up_to_response_id?: string;
+    model_override?: string;
+    reasoning_effort?: string;
+    terminal_launch_args?: string[];
+    codex_bypass_sandbox?: boolean;
+  } = {};
   if (title !== undefined) {
     body.title = title;
   }
@@ -624,6 +654,20 @@ export async function forkSession(
   }
   if (upToResponseId !== undefined) {
     body.up_to_response_id = upToResponseId;
+  }
+  if (config?.modelOverride !== undefined) {
+    body.model_override = config.modelOverride;
+  }
+  if (config?.reasoningEffort !== undefined) {
+    body.reasoning_effort = config.reasoningEffort;
+  }
+  if (config?.terminalLaunchArgs !== undefined) {
+    body.terminal_launch_args = config.terminalLaunchArgs;
+  }
+  // Only send the dangerous bypass opt-in when explicitly true; omitting it
+  // otherwise keeps the request minimal and the server default (no bypass).
+  if (config?.codexBypassSandbox) {
+    body.codex_bypass_sandbox = true;
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
@@ -685,24 +729,38 @@ export async function launchRunner(
   hostId: string,
   sessionId: string,
   workspace: string,
-  git?: { branchName: string; baseBranch?: string; existingWorktree?: boolean },
+  git?: {
+    branchName: string;
+    baseBranch?: string;
+    existingWorktree?: boolean;
+    existingBranch?: boolean;
+  },
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;
     workspace: string;
-    git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean };
+    git?: {
+      branch_name: string;
+      base_branch?: string;
+      existing_worktree?: boolean;
+      existing_branch?: boolean;
+    };
   } = { session_id: sessionId, workspace };
   if (git !== undefined) {
     // `existing_worktree` binds a pre-existing worktree (no worktree is
-    // created; the branch is recorded for the sidebar + delete flow), so it
-    // never carries a base_branch.
+    // created; the branch is recorded for the sidebar + delete flow) and
+    // `existing_branch` recreates a worktree for a branch that already
+    // exists (the deleted-worktree recreate path) — neither carries a
+    // base_branch (nothing new is forked).
     body.git = {
       branch_name: git.branchName,
       ...(git.existingWorktree
         ? { existing_worktree: true }
-        : git.baseBranch !== undefined
-          ? { base_branch: git.baseBranch }
-          : {}),
+        : git.existingBranch
+          ? { existing_branch: true }
+          : git.baseBranch !== undefined
+            ? { base_branch: git.baseBranch }
+            : {}),
     };
   }
   const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/runners`, {

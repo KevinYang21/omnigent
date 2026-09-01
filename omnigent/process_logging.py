@@ -7,7 +7,8 @@ import contextlib
 import logging
 import os
 import sys
-from collections.abc import Iterator, Sequence
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,49 @@ class ChildLoggingPopenKwargs(TypedDict, total=False):
     """Keyword arguments forwarded to :class:`subprocess.Popen`."""
 
     pass_fds: tuple[int, ...]
+
+
+_log_once_seen: set[str] = set()
+_log_once_lock = threading.Lock()
+
+
+def _mark_once(formatted: str) -> bool:
+    """Return ``True`` the first time *formatted* is seen this process, then remember it."""
+    with _log_once_lock:
+        if formatted in _log_once_seen:
+            return False
+        _log_once_seen.add(formatted)
+        return True
+
+
+def log_once(
+    logger: logging.Logger,
+    level: int,
+    msg: str,
+    *args: object,
+    exc_info: bool = False,
+) -> None:
+    """Log *msg* at *level* the first time this exact line is seen in the process.
+
+    For near-static diagnostics a hot path recomputes and would otherwise re-log
+    on every call -- a harness routing decision resolved on every turn, or a
+    best-effort probe that fails identically on every catalog fetch. The
+    formatted message is the dedup key, so a *changed* line logs again while
+    identical repeats are dropped. Per-process and thread-safe (these callers run
+    under ``asyncio.to_thread``). ``stacklevel=2`` attributes the record to the
+    caller (correct ``func_name`` in the debug-logs table); ``exc_info`` is
+    forwarded so the first occurrence of a failure keeps its traceback.
+    """
+    formatted = msg % args if args else msg
+    if _mark_once(formatted):
+        logger.log(level, formatted, exc_info=exc_info, stacklevel=2)
+
+
+def log_info_once(logger: logging.Logger, msg: str, *args: object) -> None:
+    """INFO convenience wrapper around :func:`log_once`; see it for semantics."""
+    formatted = msg % args if args else msg
+    if _mark_once(formatted):
+        logger.info(formatted, stacklevel=2)
 
 
 class _ProcessLogStreamHandler(logging.StreamHandler[TextIO]):
@@ -369,11 +413,14 @@ def configure_process_logging(
     logger_names: Sequence[str] = ("omnigent",),
     root: bool = True,
     force: bool = False,
+    debug_log_send: Callable[[list[dict[str, object]]], None] | None = None,
 ) -> Path:
     """Configure Python logging for one process destination.
 
     The returned file always receives logs. Stderr receives logs only when
-    requested and an interactive terminal stream is available.
+    requested and an interactive terminal stream is available. When provided,
+    ``debug_log_send`` receives prepared debug-log batches on a daemon thread;
+    otherwise the environment-gated ZeroBus sender remains the default.
     """
     global _current_process_log_path
 
@@ -434,7 +481,12 @@ def configure_process_logging(
     from omnigent.debug_logging import attach_debug_log_sink
 
     sink_targets = _debug_sink_target_loggers(logger_names, root=root)
-    attach_debug_log_sink(sink_targets, source=destination, level=resolved_level)
+    attach_debug_log_sink(
+        sink_targets,
+        source=destination,
+        level=resolved_level,
+        send=debug_log_send,
+    )
 
     logging.captureWarnings(True)
     return path

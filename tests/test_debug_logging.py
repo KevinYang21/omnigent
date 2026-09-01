@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 
 import pytest
 
@@ -114,9 +115,11 @@ def test_record_to_row_shape_and_coercions() -> None:
     }
 
 
-def test_record_to_row_reads_session_id_from_extra() -> None:
+def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
     # session_id is passed explicitly at the callsite via extra= and read off
-    # the record; there is no ambient contextvar fallback.
+    # the record. There is deliberately no ambient request-scoped fallback; an
+    # explicit id also wins over the runner-primary env fallback.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
     record = logging.LogRecord(
         "omnigent.runner", logging.INFO, __file__, 1, "hi", (), None, func="f"
     )
@@ -125,7 +128,22 @@ def test_record_to_row_reads_session_id_from_extra() -> None:
     assert row["session_id"] == "conv_row"
 
 
+def test_record_to_row_session_id_falls_back_to_primary_on_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On a runner the primary-session env is set, so an unthreaded log is
+    # attributed to the primary (parent) conversation. A co-located subagent's
+    # unthreaded log can be mis-attributed to the parent — an accepted trade-off.
+    monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "conv_primary")
+    record = logging.LogRecord("omnigent.runner", logging.INFO, __file__, 1, "hi", (), None)
+    assert dl.record_to_row(record, source="runner")["session_id"] == "conv_primary"
+
+
 def test_record_to_row_null_correlation_without_extra() -> None:
+    # The server never sets the primary-session env (the _clear_env fixture
+    # mirrors that), so an unthreaded server log stays null rather than
+    # borrowing another concurrent request's id — the deliberate no-ambient-
+    # fallback property.
     record = logging.LogRecord("omnigent", logging.INFO, __file__, 1, "hi", (), None)
     row = dl.record_to_row(record, source="server")
     assert row["session_id"] is None
@@ -252,6 +270,39 @@ def test_emit_revives_closed_uploader(_configured_env: None) -> None:
         sink.close()
 
 
+def test_custom_send_receives_prepared_rows_without_zerobus_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    batches: list[list[dl.DebugLogRow]] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        batches.append(batch)
+        delivered.set()
+
+    sink = dl.DebugLogHandler("integration", send)
+    try:
+        record = logging.LogRecord(
+            "integration.logger",
+            logging.INFO,
+            __file__,
+            1,
+            "hello %s",
+            ("world",),
+            None,
+        )
+        sink.emit(record)
+
+        assert delivered.wait(timeout=1.0)
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+        assert batches[0][0]["source"] == "integration"
+        assert batches[0][0]["message"] == "hello world"
+    finally:
+        sink.close()
+
+
 def test_ignored_loggers_are_dropped() -> None:
     # httpx/httpcore records are chatty HTTP-client noise and must be dropped;
     # everything else is kept.
@@ -267,6 +318,40 @@ def test_attach_is_noop_when_disabled() -> None:
     target.handlers.clear()
     dl.attach_debug_log_sink([target], source="runner", level=logging.INFO)
     assert not any(isinstance(h, dl.ZerobusLogHandler) for h in target.handlers)
+
+
+def test_attach_uses_custom_send_without_zerobus_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_active_sink", None)
+    target = logging.getLogger("test.debug_logging.custom")
+    target.handlers.clear()
+    target.setLevel(logging.INFO)
+    batches: list[list[dl.DebugLogRow]] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        batches.append(batch)
+        delivered.set()
+
+    dl.attach_debug_log_sink(
+        [target],
+        source="custom",
+        level=logging.INFO,
+        send=send,
+    )
+    sink = dl._active_sink
+    assert sink is not None
+    assert type(sink) is dl.DebugLogHandler
+    try:
+        target.info("custom delivery")
+        assert delivered.wait(timeout=1.0)
+        assert batches[0][0]["message"] == "custom delivery"
+    finally:
+        target.removeHandler(sink)
+        dl.sse_event_logger().removeHandler(sink)
+        sink.close()
 
 
 def test_runner_primary_session_id(monkeypatch: pytest.MonkeyPatch) -> None:

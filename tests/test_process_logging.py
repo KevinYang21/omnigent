@@ -19,10 +19,13 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     TerminalLogFormatter,
     _debug_sink_target_loggers,
+    _log_once_seen,
     _unlink_if_empty,
     child_logging_popen_kwargs,
     configure_process_logging,
     current_process_log_path,
+    log_info_once,
+    log_once,
     process_log_dir_reference,
     process_log_reference,
     terminal_stream_handler,
@@ -272,6 +275,45 @@ def test_configure_process_logging_publishes_its_log_path(
             handler.close()
 
 
+def test_configure_process_logging_forwards_custom_debug_log_send(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent import debug_logging
+
+    captured: list[object] = []
+
+    def send(batch: list[dict[str, object]]) -> None:
+        captured.append(batch)
+
+    def attach(
+        loggers: list[logging.Logger],
+        *,
+        source: str,
+        level: int,
+        send: debug_logging.DebugLogSend | None = None,
+    ) -> None:
+        captured.extend((loggers, source, level, send))
+
+    monkeypatch.setattr(debug_logging, "attach_debug_log_sink", attach)
+    logger_name = "omnigent.test_custom_debug_send"
+    configure_process_logging(
+        "integration",
+        log_path=tmp_path / "integration.log",
+        level=logging.WARNING,
+        logger_names=(logger_name,),
+        root=False,
+        debug_log_send=send,
+    )
+    try:
+        assert captured[1:] == ["integration", logging.WARNING, send]
+    finally:
+        logger = logging.getLogger(logger_name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+
 def test_unlink_if_empty_sweeps_only_empty_files(tmp_path: Path) -> None:
     """The exit sweep removes an empty log, keeps a written one, tolerates absence."""
     empty = tmp_path / "empty.log"
@@ -348,3 +390,39 @@ def test_debug_sink_targets_follow_non_propagating_package_logger() -> None:
         assert targets == [logging.getLogger()]
     finally:
         logger.propagate = original
+
+
+def test_log_info_once_dedupes_identical_and_relogs_changed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same formatted line logs once per process; a changed line logs again."""
+    logger = logging.getLogger("omnigent.test.log_info_once")
+    # The dedup set is process-global; clear it so a prior test cannot mask this.
+    _log_once_seen.clear()
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        log_info_once(logger, "routing decision provider=%s", "alpha")
+        log_info_once(logger, "routing decision provider=%s", "alpha")  # identical -> dropped
+        log_info_once(logger, "routing decision provider=%s", "beta")  # changed -> logged
+    messages = [r.getMessage() for r in caplog.records if r.name == logger.name]
+    assert messages == [
+        "routing decision provider=alpha",
+        "routing decision provider=beta",
+    ]
+
+
+def test_log_once_respects_level_and_captures_exc_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """log_once emits at the given level with the traceback, then dedupes repeats."""
+    logger = logging.getLogger("omnigent.test.log_once")
+    _log_once_seen.clear()
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            log_once(logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
+            log_once(logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
+    records = [r for r in caplog.records if r.name == logger.name]
+    assert len(records) == 1  # identical repeat dropped
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info is not None  # first occurrence keeps its traceback

@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -209,6 +210,148 @@ async def test_first_message_schedules_background_semantic_title(
     await coordinator.wait_for_idle()
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
     assert snapshot.json()["title"] == "Debug authentication timeout"
+
+
+async def test_create_titled_session_keeps_title_after_first_message(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session named at creation is never auto-renamed.
+
+    The background title pipeline only runs on untitled conversations, so
+    the first user turn must leave a create-time title untouched and must
+    not invoke the generator at all.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="canvas-layout")
+    assert session["title"] == "canvas-layout"
+
+    generator_calls: list[BackgroundTitleRequest] = []
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        generator_calls.append(request)
+        return "Generated title that must not land"
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    # Scheduling happens inline in the events handler, so after the response
+    # and a drained coordinator nothing more can arrive.
+    await coordinator.wait_for_idle()
+    assert generator_calls == []
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "canvas-layout"
+
+
+async def test_sidebar_rename_wins_in_flight_background_title(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sidebar rename while the background title is in flight is never clobbered.
+
+    End-to-end version of the coordinator-level race test: the first message
+    seeds a title and schedules generation, the user renames from the sidebar
+    (PATCH) before generation finishes, and the generated title must not land.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    generator_started = asyncio.Event()
+    release_generator = asyncio.Event()
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        generator_started.set()
+        await release_generator.wait()
+        return "Generated title that must not land"
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        )
+        assert response.status_code == 202, response.text
+        # The background attempt is mid-generation when the user renames.
+        await asyncio.wait_for(generator_started.wait(), timeout=5)
+        renamed = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"title": "My sidebar name"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        release_generator.set()
+        await coordinator.wait_for_idle()
+    finally:
+        release_generator.set()
+        await fake_runner.aclose()
+
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "My sidebar name"
 
 
 async def test_background_title_failure_does_not_break_subsequent_user_turn(
@@ -2186,12 +2329,33 @@ async def test_external_session_title_collapses_whitespace(
     assert snapshot.json()["title"] == "auth refactor"
 
 
-@pytest.mark.parametrize("title", ["", "   ", "one\ntwo"])
+async def test_external_session_title_accepts_user_limit(
+    client: httpx.AsyncClient,
+) -> None:
+    """Terminal-originated manual titles accept the full user title limit."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    title = "x" * USER_SESSION_TITLE_MAX_CHARS
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": title}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == title
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["", "   ", "one\ntwo", "x" * (USER_SESSION_TITLE_MAX_CHARS + 1)],
+)
 async def test_external_session_title_rejects_malformed_titles(
     client: httpx.AsyncClient,
     title: str,
 ) -> None:
-    """Blank and multi-line titles are rejected rather than persisted."""
+    """Blank, multi-line, and oversized titles are rejected rather than persisted."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"], title="Original title")
 
@@ -5497,6 +5661,132 @@ async def test_accumulate_session_usage_rejects_non_finite_provider_cost(
     # Three turns, each catalog-priced at 2.0 (the non-finite reports ignored).
     assert usage.get("total_cost_usd") == pytest.approx(6.0)
     assert math.isfinite(usage["total_cost_usd"])
+
+
+async def test_accumulate_session_usage_rejects_negative_token_count(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forged negative ``input_tokens`` is coerced to 0, not priced as a negative.
+
+    The ``cost_usd`` guard only covers the harness-reported-cost fast path; the
+    catalog-pricing branch derives the cost delta from the token counts in the
+    same forgeable frame. ``compute_llm_cost`` multiplies without a lower bound,
+    so an unsanitised negative count would make the additive ``total_cost_usd``
+    delta negative — clawing back the running total the relay cost-budget gate
+    reads. The count must collapse to 0 and the turn price on what survives.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": -100_000_000,
+                "output_tokens": 500,
+                "model": "harness-model",
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    # input collapses to 0; catalog charges only 500*2e-3 = 1.0 (never negative).
+    assert usage.get("total_cost_usd") == pytest.approx(1.0)
+    assert usage["by_model"]["harness-model"]["total_cost_usd"] == pytest.approx(1.0)
+    # The forged count is not persisted as a negative cumulative counter.
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 500
+
+
+async def test_accumulate_session_usage_negative_tokens_cannot_reset_running_total(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forged negative token count can't subtract from a prior running total."""
+    from omnigent.server.routes import sessions as sessions_routes
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    # An honest priced turn establishes a positive running total.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "model": "grok-4.3"}},
+        session["id"],
+        store,
+    )
+    assert _read_session_usage(db_uri, session["id"]).get("total_cost_usd") == pytest.approx(2.0)
+
+    # A forged negative report must not drive the running total (or the token
+    # counters) down.
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": -1_000_000_000,
+                "output_tokens": 0,
+                "model": "grok-4.3",
+            }
+        },
+        session["id"],
+        store,
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage.get("total_cost_usd") == pytest.approx(2.0)
+    assert usage["input_tokens"] == 1000
+
+
+async def test_accumulate_session_usage_rejects_non_finite_token_count(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NaN / infinite token count never reaches the cost sum or the counters.
+
+    ``json.loads`` accepts bare ``NaN`` / ``Infinity``, so a runner can send a
+    non-finite token count. Left unsanitised it poisons ``total_cost_usd``
+    permanently (every ``cost > cap`` comparison is then ``False``) and the
+    stored token counters.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1e-3, output_per_token=2e-3),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    for bad_tokens in (float("nan"), float("inf"), float("-inf")):
+        sessions_routes._accumulate_session_usage(
+            {
+                "usage": {
+                    "input_tokens": bad_tokens,
+                    "output_tokens": 500,
+                    "model": "harness-model",
+                }
+            },
+            session["id"],
+            SqlAlchemyConversationStore(db_uri),
+        )
+    usage = _read_session_usage(db_uri, session["id"])
+    # Three turns, each priced only on the finite 500 output tokens (1.0 each).
+    assert usage.get("total_cost_usd") == pytest.approx(3.0)
+    assert math.isfinite(usage["total_cost_usd"])
+    assert usage["input_tokens"] == 0
+    assert math.isfinite(usage["input_tokens"])
 
 
 async def test_accumulate_session_usage_unpriced_without_usage_model(
