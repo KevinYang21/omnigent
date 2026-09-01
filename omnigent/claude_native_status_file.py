@@ -417,6 +417,21 @@ class SessionStatusPoller:
         self._last_edge = None
 
     @property
+    def reports_idle(self) -> bool:
+        """Whether the file's last readable status mapped to runner ``idle``.
+
+        The watcher uses this to decide when its tmux polling may back off
+        while the file owns the session's status: an idle file means Claude
+        itself says nothing is running, so the pane capture can slow down
+        without delaying a status edge — a turn start reaches the watcher
+        through an explicit wake, not through this file's cadence. ``False``
+        while running/waiting, before the first read, and after an
+        unrecognized status (when we are blind, stay at base rate).
+        """
+        status = self._last_status
+        return status is not None and status.runner_status == IDLE
+
+    @property
     def blocked_on(self) -> str | None:
         """Why Claude is parked, when it is parked on a dialog.
 

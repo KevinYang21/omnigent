@@ -22,9 +22,10 @@ while every spawn is recorded::
 
 Measured on the bug (pre-backoff main): 3 idle terminals sustain ~2.0
 watcher-tick tmux spawns per second per terminal (~72 in the 12s window).
-The threshold allows up to 1.0/s/terminal so an adaptive-backoff or
-pipe-pane/control-mode fix passes with margin while the fixed-rate
-two-calls-per-tick bug fails specifically.
+The threshold allows up to 0.6/s/terminal so an adaptive-backoff or
+pipe-pane/control-mode fix passes with margin while both the fixed-rate
+two-calls-per-tick bug (~2.0/s) and a folded-but-unbacked-off poller
+(~1.0/s) fail specifically.
 """
 
 from __future__ import annotations
@@ -74,16 +75,21 @@ _N_TERMINALS = 3
 # ~12 watcher wakeups of the 1s poll cadence per terminal.
 _IDLE_WINDOW_S = 12.0
 
-# Post-turn settle before sampling starts, so launch-time tmux calls
-# (new-session, set-option, initial reads) age out of the window.
-_POST_TURN_SETTLE_S = 3.0
+# Post-turn settle before sampling starts. Longer than the watcher's 10s
+# idle threshold so the idle edge has fired for every terminal before the
+# window opens — the window then samples pure steady-state cadence, not the
+# pre-edge base-rate ramp. Also ages launch-time tmux calls (new-session,
+# set-option, initial reads) out of the window.
+_POST_TURN_SETTLE_S = 12.0
 
 # Max watcher-probe tmux spawns per second per idle terminal. The bug
-# sustains 2.0 (capture-pane + list-panes every 1s tick, no backoff); a
-# quiescence-aware implementation (backoff, pipe-pane, or control mode)
-# measures well under 1.0. Counts only capture-pane/list-panes argv lines,
-# so unrelated tmux use cannot inflate it.
-_MAX_PROBE_SPAWNS_PER_S_PER_TERMINAL = 1.0
+# sustains 2.0 (capture-pane + list-panes every 1s tick, no backoff); merely
+# folding the two calls into one still measures ~1.0. A quiescence-aware
+# implementation (post-idle backoff, pipe-pane, or control mode) measures
+# well under 0.6 once the idle edge has fired, so this threshold rejects a
+# fixed-rate poller even with the probe folded. Counts only
+# capture-pane/list-panes argv lines, so unrelated tmux use cannot inflate it.
+_MAX_PROBE_SPAWNS_PER_S_PER_TERMINAL = 0.6
 
 # Worktree root (tests/e2e/<file> → parents[2]); forwarded to the runner so
 # it imports this checkout's omnigent (see the daemon env comment below).
@@ -188,9 +194,14 @@ def test_idle_terminals_do_not_spawn_tmux_continuously(
         )
     )
     daemon_log = tmp_path / "host-daemon.log"
+    daemon_base_env = os.environ.copy()
+    # The watcher's backoff kill switch must not leak in from the operator's
+    # shell or CI — an ambient =0 would pin every watcher at base rate and
+    # flip this test's verdict for reasons unrelated to the tree under test.
+    daemon_base_env.pop("OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF", None)
     env = apply_runner_env(
         {
-            **os.environ,
+            **daemon_base_env,
             "HOME": str(tmp_path),
             "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
             # The daemon forwards PYTHONPATH to host-spawned runners (it is

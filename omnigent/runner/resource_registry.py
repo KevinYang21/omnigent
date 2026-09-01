@@ -1256,6 +1256,28 @@ class SessionResourceRegistry:
             # ``idle`` and needed a freshness window to arbitrate.
             return status_poller is not None and status_poller.active
 
+        def _idle_poll_backoff_allowed() -> bool:
+            # A backed-off watcher also slows the file poller's stat (it rides
+            # the same tick), so backoff must never delay a status edge the
+            # file would otherwise deliver promptly. Two regimes:
+            #
+            # - PTY fallback (file not owning): the pane diff is the status
+            #   source; the loop's own idle-edge gate suffices, allow backoff.
+            # - File owns status: back off only while the file itself says
+            #   ``idle`` — then nothing is running, and the next running edge
+            #   arrives through the turn-start wake (which restores base rate
+            #   before output lands), not through this poll's cadence. While
+            #   the file says running/waiting — or is unreadable — stay at
+            #   base rate so mid-turn transitions stay snappy.
+            #
+            # Without the idle branch a modern claude-native terminal (file
+            # always resolved) would be pinned at 5 Hz forever, sustaining the
+            # very fork storm this backoff exists to stop.
+            if not _file_owns_status():
+                return True
+            assert status_poller is not None  # implied by _file_owns_status()
+            return status_poller.reports_idle
+
         # claude-native additionally reads Claude's own ``sessions/<pid>.json``
         # status (present since Claude Code v2.1.139): it flips on the real
         # turn edge and knows when a dialog owns the input, neither of which
@@ -1389,7 +1411,7 @@ class SessionResourceRegistry:
             on_exit=_on_exit,
             on_tick=_on_tick if status_poller is not None else None,
             idle_poll_backoff_allowed=(
-                (lambda: not _file_owns_status()) if status_poller is not None else None
+                _idle_poll_backoff_allowed if status_poller is not None else None
             ),
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,

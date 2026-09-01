@@ -430,6 +430,7 @@ class _FakeStatusPoller:
         self._on_status = on_status
         self.active = False
         self.blocked_on: str | None = None
+        self.reports_idle = False
         self.ticks = 0
         self.retired = False
         self.resyncs = 0
@@ -523,7 +524,18 @@ async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_claude_native_status_poller_controls_idle_backoff(tmp_path: Path) -> None:
-    """Backoff is allowed only while the status-file poller is inactive."""
+    """Backoff follows the file's own verdict while the poller owns status.
+
+    Inactive poller (resolving / exhausted / retired): the pane diff owns
+    status and the loop's idle-edge gate suffices, so backoff is allowed.
+    Active poller: backoff is allowed only while the file itself reports
+    ``idle`` — an idle file means nothing is running and the next turn
+    reaches the watcher through the turn-start wake, so slowing the tmux
+    poll (and the file stat riding it) cannot delay a status edge. While
+    the file says running/waiting the watcher must stay at base rate, or a
+    mid-turn ``running -> idle`` flip would be observed a backed-off
+    interval late.
+    """
     callbacks, _statuses, pollers, _registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_backoff_gate"
     )
@@ -533,7 +545,11 @@ async def test_claude_native_status_poller_controls_idle_backoff(tmp_path: Path)
     poller = pollers[0]
     assert allowed() is True
     poller.active = True
-    assert allowed() is False
+    assert allowed() is False  # file owns status and says running/unknown
+    poller.reports_idle = True
+    assert allowed() is True  # file itself says idle: quiesce the fork loop
+    poller.reports_idle = False
+    assert allowed() is False  # a new turn pins base rate again
     poller.retire()
     assert allowed() is True
 
