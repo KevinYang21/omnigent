@@ -9067,7 +9067,7 @@ async def _handle_mcp_tools_call(
     if runner_client is None:
         return _mcp_error_response(rpc_id, -32000, f"No runner bound for session {session_id!r}")
     try:
-        from omnigent.runner.tool_dispatch import MCP_PROXY_FORWARD_TIMEOUT_S
+        from omnigent.runner.tool_timeouts import MCP_PROXY_FORWARD_TIMEOUT_S
 
         exec_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",

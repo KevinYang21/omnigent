@@ -60,6 +60,11 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.native_coding_agents import public_agent_name
+from omnigent.runner.tool_timeouts import (  # noqa: F401  (re-exported)
+    MCP_PROXY_CALL_TIMEOUT_S,
+    MCP_PROXY_FORWARD_TIMEOUT_S,
+    RUNNER_EXECUTION_TIMEOUT_S as _RUNNER_EXECUTION_TIMEOUT_S,
+)
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -167,7 +172,6 @@ def _string_mapping(value: object) -> dict[str, str] | None:
 
 _INBOX_OUTPUT_MAX_CHARS = 12000
 _OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
-_RUNNER_EXECUTION_TIMEOUT_S = 7200.0
 _SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed"})
 _SUBAGENT_INBOX_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _SUBAGENT_POLICY_FAILURE_OUTPUT = "[Result suppressed by policy: policy evaluation failed]"
@@ -181,14 +185,6 @@ _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 # still fails out promptly. Guarded by tests/test_ask_timeout_infinite.py.
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
-
-# Read timeouts for the two MCP-proxy hops that carry a tool call back to the
-# runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
-# timeouts, so these must sit above the runner's execution timeout rather than
-# only above the 120-second shell default. Keep the outer hop larger so the
-# AP→runner leg fails first with the more specific error when the proxy wedges.
-MCP_PROXY_FORWARD_TIMEOUT_S = _RUNNER_EXECUTION_TIMEOUT_S + 30.0
-MCP_PROXY_CALL_TIMEOUT_S = _RUNNER_EXECUTION_TIMEOUT_S + 60.0
 
 
 @dataclass(frozen=True)
