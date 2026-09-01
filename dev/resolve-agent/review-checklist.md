@@ -65,6 +65,17 @@ what to look for, and why it's wrong.
   poison another user's turn; an LRU that can evict a pending enforcement
   decision silently un-enforces it. Gate writes on edit access and size the
   bound against the marker's real lifetime window.
+- **An enforcement decision must never live in an evicting cache.** Bounding a
+  security decision with an LRU trades a memory leak for silent un-enforcement
+  under pressure. Tie the entry's lifetime to its owning resource (pop on
+  consume, on turn start, and on the owner's teardown callback) instead of
+  bounding by count — and gate writes so callers with no live owner can't grow
+  it.
+- **A deny/sanitize verdict must be committed into the retry state, not
+  recomputed on retry.** When a failed persist leaves a buffer for a later
+  retry, the retry must carry the already-substituted (denied/sanitized)
+  content. Re-evaluating from scratch lets a stateful policy (labels/counters
+  moved by the first verdict) flip to ALLOW and leak the original content.
 
 ## Rollback / cleanup
 

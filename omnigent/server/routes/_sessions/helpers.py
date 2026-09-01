@@ -7090,6 +7090,14 @@ async def _relay_response_policy_deny_reason(
     from omnigent.runtime._globals import _agent_store
 
     if _agent_store is None:
+        # Fail open, but loudly: a mis-initialized runtime would otherwise
+        # silently disable RESPONSE-phase gating for every relayed session.
+        _logger.warning(
+            "Relay: agent store not initialized; skipping RESPONSE-phase "
+            "policy evaluation for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
         return None
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -7224,6 +7232,13 @@ async def _flush_relay_text(
         # would close), so without a visible sentinel the deny would only
         # be discoverable after a reload.
         text = f"{_DENY_SENTINEL_PREFIX}{deny_reason}]"
+        # Commit the substitution into the retry buffer itself: a failed
+        # persist below leaves ``text_acc`` for the next flush, and that
+        # retry must carry the sentinel, never the denied content. Without
+        # this, a RESPONSE-phase deny would be re-evaluated from scratch on
+        # retry — and a stateful policy whose labels moved on the first
+        # DENY could flip to ALLOW and leak the original text.
+        text_acc[:] = [text]
         _publish_policy_deny(session_id, deny_reason)
     import uuid
 

@@ -3296,11 +3296,18 @@ def _parse_policy_base_fields(
         # Silently discarding an authored output-phase binding misleads the
         # bundle author into believing an output gate is bound when nothing
         # ever restricts the callable to (or guarantees it sees) that phase —
-        # say so. Scoped to ``response``: an unenforced output gate is a
-        # policy hole, while the common ``on: [tool_call]`` annotation is
-        # harmless documentation on a callable that self-filters anyway.
+        # say so. Scoped to the output phases (``response`` /
+        # ``llm_response``): an unenforced output gate is a policy hole,
+        # while the common ``on: [tool_call]`` annotation is harmless
+        # documentation on a callable that self-filters anyway.
         raw_on = data.get("on")
-        if isinstance(raw_on, (list, str)) and "response" in raw_on:
+        if isinstance(raw_on, str):
+            entries: list[object] = [raw_on]
+        elif isinstance(raw_on, list):
+            entries = raw_on
+        else:
+            entries = []
+        if any(entry in ("response", "llm_response") for entry in entries):
             _log.warning(
                 "policy %r: `on: %r` is ignored for type: function policies — "
                 "the callable self-selects which event types it handles at "

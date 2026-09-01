@@ -278,9 +278,9 @@ class _ScriptedRunnerClient:
 
 async def test_flush_persist_failure_leaves_buffer_for_retry() -> None:
     """
-    An append failure during a denied flush keeps the buffer intact so a
-    later retry can still persist — the deny substitution must not clear
-    the text (the caller re-arms the deny marker off the surviving buffer).
+    An append failure during a denied flush keeps a retry buffer — and
+    that buffer must already hold the SENTINEL, not the denied content,
+    so no retry path can ever persist the original text.
     """
 
     @dataclass
@@ -301,7 +301,78 @@ async def test_flush_persist_failure_leaves_buffer_for_retry() -> None:
             deny_reason="tripwire",
         )
 
-    assert text_acc == [_DENIED_TEXT], "a failed persist must leave the buffer for retry"
+    assert text_acc, "a failed persist must leave a buffer for retry"
+    assert text_acc == ["[Denied by policy: tripwire]"], (
+        "the retry buffer must carry the sentinel, never the denied text"
+    )
+
+
+async def test_response_phase_deny_survives_persist_failure_retry() -> None:
+    """
+    A RESPONSE-phase deny must not be re-evaluated from scratch on a
+    persist-failure retry: a stateful policy whose labels moved on the
+    first DENY can flip to ALLOW, which would leak the original denied
+    text. The first flush commits the sentinel into the retry buffer, so
+    the retry persists the sentinel even when the policy now allows.
+    """
+    call_count = 0
+
+    async def _deny_once_then_allow(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {"verdict": "deny", "reason": "stateful tripwire", "_denied_body": None}
+        return None  # ALLOW on re-evaluation (labels moved on the first DENY)
+
+    @dataclass
+    class _FailOnceStore(_FakeConversationStore):
+        fail_next: bool = True
+
+        def append(self, conversation_id: str, items: list[Any]) -> list[ConversationItem]:
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("db write failed")
+            return super().append(conversation_id, items)
+
+    store = _FailOnceStore()
+    text_acc = [_DENIED_TEXT]
+
+    with (
+        patch(
+            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            _deny_once_then_allow,
+        ),
+        patch("omnigent.runtime._globals._agent_store", object()),
+        patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"),
+    ):
+        # First flush: DENY computed, persist fails — buffer must now
+        # hold the sentinel.
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_stateful_retry",
+            text_acc,
+            "resp_retry_2",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+        assert text_acc == ["[Denied by policy: stateful tripwire]"]
+        # Retry flush (same call shape the relay's later flush uses):
+        # even though the policy would now ALLOW, the denied text is
+        # gone — only the sentinel can persist.
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_stateful_retry",
+            text_acc,
+            "resp_retry_2",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    texts = _persisted_texts(store)
+    assert texts == ["[Denied by policy: stateful tripwire]"], (
+        f"the original denied text must never persist on retry, got {texts!r}"
+    )
+    assert _DENIED_TEXT not in "".join(texts)
 
 
 async def test_mid_turn_boundary_flush_gates_response_phase() -> None:
@@ -403,5 +474,47 @@ async def test_relay_consumes_deny_marker_and_persists_sentinel(db_uri: str) -> 
         handle = sessions_module._runner_relay_tasks.get(session_id)
         if handle is not None:
             await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        session_stream.close(session_id)
+
+
+async def test_relay_teardown_clears_stranded_deny_marker(db_uri: str) -> None:
+    """
+    A relay that dies before its terminal flush (runner drop, cancel)
+    must not strand its deny marker: the marker dict is unbounded by
+    design (an enforcement decision must never be silently evicted), so
+    its leak-safety rides the relay's done-callback cleanup.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    session_id = conv.id
+
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(release, [])  # no terminal event needed
+
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_teardown",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        _llm_response_denied_turns[session_id] = "tripwire"
+        handle.task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(handle.task, timeout=2.0)
+        # Done-callbacks run soon after task completion.
+        await asyncio.sleep(0)
+        assert session_id not in _llm_response_denied_turns, (
+            "a dead relay must not strand its deny marker"
+        )
+    finally:
+        release.set()
+        _llm_response_denied_turns.pop(session_id, None)
         sessions_module._runner_relay_tasks.clear()
         session_stream.close(session_id)

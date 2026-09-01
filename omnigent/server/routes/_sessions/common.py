@@ -645,13 +645,13 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # the denied text already streamed and filled the relay's persistence
 # buffer), consumed by the relay's terminal text flush so the buffered
 # text persists as the deny sentinel instead of the denied content.
-# LRU-bounded so a session that never reaches its terminal flush cannot
-# leak an entry. Entries live only for the tail of a turn (DENY verdict →
-# terminal event, typically well under a second), so eviction would need
-# that many sessions in that window simultaneously; the bound is sized
-# far above any realistic concurrency to keep this enforcement state from
-# disappearing under cache pressure.
-_llm_response_denied_turns: cachetools.LRUCache[str, str] = cachetools.LRUCache(maxsize=8192)
+# A plain dict, NOT an evicting cache: this is an enforcement decision,
+# and a silent eviction would downgrade a DENY into normal persistence.
+# Leak-safety comes from lifetime, not bounding — writes are gated on an
+# active relay for the session (routes_hooks), and the entry is popped at
+# every consume point, on each new turn, and when the relay task ends
+# (the relay's done-callback), so an entry can never outlive its relay.
+_llm_response_denied_turns: dict[str, str] = {}
 
 
 _native_ask_gate_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
