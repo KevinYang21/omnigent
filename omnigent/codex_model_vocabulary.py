@@ -167,6 +167,11 @@ def codex_catalog_launch_slug(
     a fold that matches rows with *different* slugs is refused — the gate has
     no authority to pick between them.
 
+    Folding reuses :func:`comparable_model_id`, whose ``.``→``-`` fold applies
+    to any id, not just gpt-style versions; that breadth is deliberate — it is
+    the same equivalence the live turn-routing path already trusts for this
+    catalog, and the single-slug guard refuses any collision.
+
     :param model: A pinned model id, e.g. ``"databricks-gpt-5-5"``.
     :param options: Catalog rows, e.g. ``[{"id": "gpt-5.5", "model": "gpt-5.5"}]``.
     :returns: The single matching row's ``id``, or ``None`` when no row (or
