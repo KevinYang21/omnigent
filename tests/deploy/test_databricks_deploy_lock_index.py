@@ -186,9 +186,7 @@ def test_registry_check_tolerates_trailing_slash(deploy_mod: ModuleType, tmp_pat
     deploy_mod._check_lock_registries(lock, _PUBLIC)  # must not raise
 
 
-def test_registry_check_matches_credentialed_index(
-    deploy_mod: ModuleType, tmp_path: Path
-) -> None:
+def test_registry_check_matches_credentialed_index(deploy_mod: ModuleType, tmp_path: Path) -> None:
     """A credentialed index must match its own credential-less lock entry.
 
     uv does not persist index userinfo into ``uv.lock`` registry sources, so a
