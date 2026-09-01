@@ -31,6 +31,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import {
+  useHostAgentSkills,
   useHostModelOptions,
   useHosts,
   useInstallHarness,
@@ -74,6 +75,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
+  useHostAgentSkills: vi.fn(),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
@@ -188,6 +190,7 @@ const CODEX_MODEL_OPTIONS_RESULT = {
 };
 
 const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
+const useHostAgentSkillsMock = vi.mocked(useHostAgentSkills);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useHostWorktreesMock = vi.mocked(useHostWorktrees);
@@ -701,6 +704,12 @@ function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
   useHostModelOptionsMock.mockReset();
+  useHostAgentSkillsMock.mockReset();
+  // Default: the host reports no extra skills, so the menu shows the agent's
+  // bundled ones alone (what every test predating host discovery expects).
+  useHostAgentSkillsMock.mockReturnValue({
+    data: undefined,
+  } as unknown as ReturnType<typeof useHostAgentSkills>);
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
   useHostWorktreesMock.mockReset();
@@ -2897,6 +2906,60 @@ describe("NewChatLandingScreen skills menu", () => {
     fireEvent.keyDown(input, { key: "Escape" });
     expect(screen.queryByTestId("slash-menu-item-review-pr")).toBeNull();
     expect(input.value).toBe("start with /rev");
+  });
+
+  it("lists host-discovered skills alongside the bundled ones", () => {
+    // The user's own ~/.claude/skills and enabled plugins live on the host, so
+    // before this the first message couldn't complete them at all — they only
+    // appeared once a runner had bound and pushed a session snapshot.
+    mockAgents([skilledAgent()]);
+    useHostAgentSkillsMock.mockReturnValue({
+      data: [
+        { name: "dev-productivity:deslop", description: "Remove AI slop" },
+        { name: "my-own-skill", description: "Something local" },
+      ],
+    } as unknown as ReturnType<typeof useHostAgentSkills>);
+    renderLanding();
+    typeMessage("/");
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toBeTruthy();
+    expect(screen.getByTestId("slash-menu-item-dev-productivity:deslop")).toBeTruthy();
+    expect(screen.getByTestId("slash-menu-item-my-own-skill")).toBeTruthy();
+  });
+
+  it("asks the chosen host, scoped to the agent and workspace", () => {
+    mockAgents([skilledAgent()]);
+    renderLanding();
+    // Host + agent + workspace identify the answer; the seeded recent
+    // workspace (see setupLandingMocks) supplies the path.
+    expect(useHostAgentSkillsMock).toHaveBeenCalledWith(
+      "host_1",
+      "ag_skilled",
+      "/Users/corey/repo",
+      true,
+    );
+  });
+
+  it("does not ask the host for a native terminal agent", () => {
+    // The vendor CLI owns slash commands there, so the web menu stays hidden
+    // — and a request whose answer can't be shown is pure round-trip.
+    mockAgents([
+      {
+        id: "a_native",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+    // Last arg is the `enabled` gate — false keeps the query from firing.
+    expect(useHostAgentSkillsMock).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      false,
+    );
   });
 
   it("shows no menu for native terminal agents even if skills are listed", () => {

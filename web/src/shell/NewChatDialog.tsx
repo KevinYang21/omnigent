@@ -184,7 +184,7 @@ import {
   CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   CURSOR_NATIVE_EXEC_MODES,
 } from "@/lib/nativeHarnessModes";
-import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { useHostAgentSkills, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
@@ -791,22 +791,21 @@ export function deriveRepoName(url: string): string | null {
 }
 
 /**
- * Match a first message against an agent's bundled skills.
+ * Match a first message against the skills the chosen agent can invoke.
  *
  * Uses the in-session composer's shared command-shape guard
  * (:func:`isSlashCommandText`): the first token must read as ``/name``
  * (file paths like ``/etc/hosts`` never match), while the args after it
  * may carry anything — including paths and URLs, e.g.
- * ``"/review-pr https://github.com/..."``. The command name must
- * exactly match a bundled skill. Anything else — including
- * host-discovered skills the server can't know before a runner boots —
- * is sent as plain text, the same fall-through the in-session composer
- * uses for unknown commands.
+ * ``"/review-pr https://github.com/..."``. The command name must exactly
+ * match one of *skills*. Anything else is sent as plain text, the same
+ * fall-through the in-session composer uses for unknown commands.
  *
  * @param text The sanitized first message, e.g. ``"/review-pr 123"``.
- * @param skills The chosen agent's bundled skills from GET /v1/agents.
+ * @param skills Skills the agent can resolve — bundled ones from
+ *   GET /v1/agents plus what the host discovered for it.
  * @returns The skill name and argument string, or ``null`` when the
- *   text is not an invocation of a bundled skill.
+ *   text is not an invocation of a known skill.
  */
 export function matchSkillInvocation(
   text: string,
@@ -3592,12 +3591,30 @@ export function NewChatLandingScreen() {
   // /model need a live session. Hidden for native-terminal agents (their CLI
   // owns slash commands) and for agents with no skills at all.
   const [slashMenuIndex, setSlashMenuIndex] = useState(-1);
+  // Skills the chosen host would add on top of the bundled ones —
+  // ~/.claude/skills, enabled Claude Code plugins, the workspace's own
+  // .claude/skills. Only the host can see those, so before this a user's own
+  // skill wasn't completable until a runner had bound and pushed a snapshot.
+  // A pending agent (an upload still being described) has no registered spec
+  // for the server to read a harness and filter from; a sandbox has no host to
+  // ask. Both leave the menu on bundled skills alone.
+  const skillsAgentId =
+    selectedAgent !== undefined && selectedAgent.id !== PENDING_AGENT_ID ? selectedAgent.id : null;
+  const { data: hostSkills } = useHostAgentSkills(
+    sandboxSelected ? null : selectedHostId,
+    skillsAgentId,
+    workspaceValid ? workspaceTrimmed : null,
+    !isNativeTerminalAgent && skillsAgentId !== null,
+  );
   const skillCommands = useMemo(() => {
     if (isNativeTerminalAgent) return {};
     const m: Record<string, string> = {};
     for (const s of selectedAgent?.skills ?? []) m[`/${s.name}`] = s.description;
+    // Host skills come after the bundled ones (the endpoint already drops
+    // names the bundle claims), so a bundled skill keeps its own description.
+    for (const s of hostSkills ?? []) m[`/${s.name}`] ??= s.description;
     return m;
-  }, [selectedAgent, isNativeTerminalAgent]);
+  }, [selectedAgent, isNativeTerminalAgent, hostSkills]);
   // Caret offset + dismissal, exactly as the in-session composer tracks them:
   // ``null`` reads the token at the end of the draft (a prefilled message the
   // user hasn't typed into yet), Escape/blur closes without editing the draft.
@@ -4356,16 +4373,17 @@ export function NewChatLandingScreen() {
       // loads from the session id and never reads the sidebar cache.
       void queryClient.refetchQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
-      // A first message matching one of the agent's bundled skills is
-      // handed off as a structured invocation so ChatPage auto-sends it
-      // as a `slash_command` event (server resolves the skill) instead
-      // of plain text the agent would see as a literal "/name". Native
+      // A first message matching one of the agent's skills is handed off as a
+      // structured invocation so ChatPage auto-sends it as a `slash_command`
+      // event (server resolves the skill) instead of plain text the agent
+      // would see as a literal "/name". Host-discovered skills count too —
+      // the menu offers them, so completing one has to invoke it. Native
       // terminal agents keep plain text — their CLI owns slash commands.
       setPendingInitialPrompt(data.id, {
         text: initialPrompt,
         skill: isNativeTerminalAgent
           ? null
-          : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
+          : matchSkillInvocation(initialPrompt, [...(agent?.skills ?? []), ...(hostSkills ?? [])]),
         files,
       });
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
