@@ -5727,6 +5727,10 @@ async def _dispatch_session_event_to_runner_impl(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+        # This bypass persists nothing, so the round-trip is the only other
+        # writer — too late to keep the row off its "Claude Code" fallback for
+        # the whole first turn, and too late for the background titler's seed.
+        await _seed_missing_title(conv, background_title_content(body), conversation_store)
         # Emit the routing chip AFTER forwarding the message to the
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.
@@ -5759,17 +5763,6 @@ async def _dispatch_session_event_to_runner_impl(
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
                 )
-        # Seed the deterministic title here, not on the transcript round-trip.
-        # This path is the single-writer bypass: nothing persists the message
-        # in-request, so an untitled native session would keep rendering its
-        # harness fallback ("Claude Code" / "Codex") for the whole first turn,
-        # and the background titler — which waits for this seed before it will
-        # rename anything — could time out and never name the session at all.
-        await _seed_missing_title(
-            conv,
-            background_title_content(body),
-            conversation_store,
-        )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
         session_id,

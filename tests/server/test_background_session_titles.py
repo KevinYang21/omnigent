@@ -86,9 +86,8 @@ async def test_prepare_background_title_from_message(db_uri: str) -> None:
 async def test_prepare_background_title_matches_the_seed_for_attachments(db_uri: str) -> None:
     """The expected seed drops attachment markers, exactly like the seeder.
 
-    Deriving it from the flattened prompt instead joined the marker onto the
-    prompt's own line, so the compare-and-swap could never match and a session
-    started with an image was never named.
+    Flattening first joined the marker onto the prompt's own line, so the
+    compare-and-swap never matched and an image-started session went unnamed.
     """
     store = SqlAlchemyConversationStore(db_uri)
     conversation = store.create_conversation(kind="default")
@@ -385,12 +384,10 @@ async def test_background_rename_publishes_a_live_title_event(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A generated title reaches open clients immediately.
+    """A generated title reaches open clients without waiting for a reconcile.
 
-    The write goes straight to the store, and the session list can be served
-    by a search index that reindexes asynchronously — without this event the
-    sidebar keeps the harness fallback until some later write forces a
-    reconcile, which is why the name used to appear only on a later turn.
+    Without the event the sidebar kept the old name until a later write, which
+    is why a generated name used to appear only on a subsequent turn.
     """
     from omnigent.server.routes._sessions import common as sessions_common
 

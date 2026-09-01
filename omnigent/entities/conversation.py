@@ -26,12 +26,6 @@ _ATTACHMENT_MARKER_RE = re.compile(
     rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
 )
 
-# Untitled top-level conversations are stored as the empty string (the column
-# is NOT NULL) and surface as ``None`` at the entity boundary. Automatic
-# titlers compare-and-swap against this sentinel so they only ever name a
-# session nobody has named yet.
-UNTITLED_CONVERSATION_SENTINEL = ""
-
 # Generated titles stay compact by default, while explicit user formats and
 # manually assigned titles have room for structured identifiers.
 DEFAULT_GENERATED_TITLE_MAX_CHARS = 100

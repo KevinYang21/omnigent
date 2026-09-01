@@ -45,7 +45,6 @@ from omnigent.cost_plan import (
 )
 from omnigent.db.utils import generate_task_id
 from omnigent.entities import (
-    UNTITLED_CONVERSATION_SENTINEL,
     USER_SESSION_TITLE_MAX_CHARS,
     Agent,
     Conversation,
@@ -6546,11 +6545,8 @@ async def _seed_missing_title(
     yield no usable text. Mutates ``conv.title`` in place on success
     so callers holding the row see the persisted value.
 
-    Written as a compare-and-swap against the untitled sentinel rather
-    than a plain update: ``conv`` was read at the route boundary, so a
-    rename typed in the UI between that read and this write would
-    otherwise be clobbered by a title the user never asked for. A
-    session named by a human is never automatically renamed.
+    Compare-and-swap rather than a plain update: ``conv`` was read at
+    the route boundary, so a rename typed in the UI since then wins.
 
     :param conv: The conversation row for the session.
     :param content: Title-candidate blocks, e.g.
@@ -6566,7 +6562,7 @@ async def _seed_missing_title(
     updated = await asyncio.to_thread(
         conversation_store.rename_conversation_if_title_matches,
         conv.id,
-        UNTITLED_CONVERSATION_SENTINEL,
+        "",  # the stored form of "untitled"
         title,
     )
     if updated is not None:

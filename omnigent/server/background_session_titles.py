@@ -78,14 +78,12 @@ def normalize_background_title(
 
 
 def publish_session_title(session_id: str, title: str) -> None:
-    """Push a freshly written title onto the session's live event stream.
+    """Announce a title an automatic writer just stored.
 
-    Automatic titles are written straight to the store, and the session list
-    can be served by a search index that reindexes asynchronously — without
-    this event the sidebar keeps the old name (or the harness fallback,
-    "Claude Code" / "Codex") until some later write forces a reconcile.
-
-    Imported lazily: the route modules that own the stream import this one.
+    The session list can be served by a search index that reindexes
+    asynchronously, so without this the sidebar keeps the stale name until a
+    later write forces a reconcile. Imported lazily — the route modules that
+    own the stream import this one.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param title: Title the session is now on.
@@ -93,11 +91,7 @@ def publish_session_title(session_id: str, title: str) -> None:
     from omnigent.server.routes._sessions.common import session_stream
     from omnigent.server.schemas import SessionTitleEvent
 
-    event = SessionTitleEvent(
-        type="session.title",
-        conversation_id=session_id,
-        title=title,
-    )
+    event = SessionTitleEvent(type="session.title", conversation_id=session_id, title=title)
     session_stream.publish(session_id, event.model_dump())
 
 
@@ -435,13 +429,12 @@ def prepare_background_session_title(
         return None
 
     content = background_title_content(event)
-    prompt = background_title_prompt(event)
+    prompt = _prompt_from_content(content)
     if not prompt:
         return None
 
-    # Synthesized from the blocks, not the flattened prompt: the seeder drops
-    # attachment-marker lines per block, so a message carrying an image would
-    # otherwise produce a seed the compare-and-swap can never match.
+    # Synthesized from the blocks, not the flattened prompt, which would join an
+    # attachment marker onto the text and never match what the seeder writes.
     expected_seed_title = synthesize_conversation_title(content)
     if expected_seed_title is None:
         return None
@@ -481,9 +474,8 @@ def schedule_background_child_task_summary(
 def background_title_content(event: SessionEventInput) -> list[dict[str, Any]]:
     """Return the title-candidate content blocks for *event*.
 
-    Mirrors the deterministic seeder's ``_title_content_from_item`` so both
-    read the same blocks: the expected-seed compare-and-swap only holds while
-    the two agree.
+    Mirrors the deterministic seeder's ``_title_content_from_item``: the
+    expected-seed compare-and-swap only holds while the two agree.
 
     :param event: The user event being forwarded.
     :returns: Content blocks, or ``[]`` for events that carry no title text.
@@ -493,11 +485,10 @@ def background_title_content(event: SessionEventInput) -> list[dict[str, Any]]:
         arguments = event.data.get("arguments", "")
         if not isinstance(name, str) or not name.strip() or not isinstance(arguments, str):
             return []
-        text = f"/{name.strip()} {arguments}".strip()
-        return [{"type": "input_text", "text": text}]
+        return [{"type": "input_text", "text": f"/{name.strip()} {arguments}".strip()}]
 
-    # Meta and non-user messages never title a session; arming the one-shot
-    # titler on one would burn the attempt on a seed nobody will ever write.
+    # A meta or assistant message never titles a session, and arming the
+    # one-shot titler on one burns the attempt on a seed nobody will write.
     role = event.data.get("role")
     if (role is not None and role != "user") or event.data.get("is_meta"):
         return []
@@ -507,12 +498,16 @@ def background_title_content(event: SessionEventInput) -> list[dict[str, Any]]:
     return [block for block in content if isinstance(block, dict)]
 
 
+def _prompt_from_content(content: list[dict[str, Any]]) -> str:
+    """Flatten title-candidate blocks into the text a title is inferred from."""
+    parts = [
+        block["text"]
+        for block in content
+        if block.get("type") == "input_text" and isinstance(block.get("text"), str)
+    ]
+    return " ".join(parts)[:4000]
+
+
 def background_title_prompt(event: SessionEventInput) -> str:
     """Return the user text a title is inferred from, or ``""`` when there is none."""
-    parts: list[str] = []
-    for block in background_title_content(event):
-        if block.get("type") == "input_text":
-            text = block.get("text", "")
-            if isinstance(text, str):
-                parts.append(text)
-    return " ".join(parts)[:4000]
+    return _prompt_from_content(background_title_content(event))

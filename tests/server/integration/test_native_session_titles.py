@@ -97,8 +97,8 @@ async def test_native_web_message_seeds_the_session_title(
 ) -> None:
     """The first prompt names the session, without waiting for the transcript.
 
-    The bypass persists no item, so before this the row stayed untitled for
-    the whole first turn and the sidebar rendered "Claude Code".
+    The bypass persists no item, so the row used to stay untitled for the whole
+    first turn and the sidebar rendered "Claude Code".
     """
     conv, conv_store = await _native_session(client, db_uri, agent_name="native-title-seed")
     assert conv.title is None
@@ -136,9 +136,8 @@ async def test_seed_loses_to_a_rename_that_lands_first(
 ) -> None:
     """A UI rename racing the seed wins.
 
-    ``conv`` is read at the route boundary, so it still says untitled here —
-    the seed is a compare-and-swap against the untitled sentinel rather than
-    a blind write, which is what keeps the human's name.
+    ``conv`` is read at the route boundary, so it still reads untitled here;
+    the compare-and-swap is what keeps the human's name.
     """
     conv, conv_store = await _native_session(client, db_uri, agent_name="native-title-race")
     assert conv.title is None

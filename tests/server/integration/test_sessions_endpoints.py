@@ -3378,8 +3378,7 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
         "stderr": "",
     }
 
-    # The first user message also names the untitled session, and the seed
-    # announces itself so an open sidebar repaints without a reconcile.
+    # The first user message also names the untitled session, and says so.
     assert [event["type"] for _, event in published] == [
         "session.title",
         "session.input.consumed",
@@ -7972,8 +7971,7 @@ async def test_post_external_conversation_item_auto_assigns_response_id(
     assert isinstance(persisted_response_id, str) and persisted_response_id, (
         "auto-assigned response_id must be a non-empty string"
     )
-    # The first user message names the untitled session before the item
-    # broadcast, so the sidebar repaints without waiting for a reconcile.
+    # The first user message also names the untitled session, and says so.
     assert [event["type"] for _, event in published] == [
         "session.title",
         "session.input.consumed",
