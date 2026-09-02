@@ -32,16 +32,8 @@ _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os
 # ``omnigent.server.routes._sessions.common`` (asserted in the tests).
 NATIVE_WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 
-# Claude Code and Codex native tool names surfaced via the PreToolUse /
-# PostToolUse hook contract (see ``omnigent.native_policy_hook``).
-# These bypass Omnigent' ``sys_os_*`` MCP tools and execute directly
-# inside the CLI subprocess.
 _NATIVE_OS_TOOLS = NATIVE_WRITE_TOOLS | {"Bash", "Read", "Glob", "Grep"}
 
-# Cursor SDK native tool names surfaced via the preToolUse hook
-# (see ``omnigent.inner.cursor_policy_hook``). Cursor uses ``Shell``
-# for its terminal tool (not ``Bash``). ``Read`` / ``Write`` / ``Edit``
-# are already in ``_NATIVE_OS_TOOLS`` above.
 _CURSOR_NATIVE_OS_TOOLS = frozenset({"Shell"})
 
 # Pi native tool names (lowercase), surfaced via the pi ``tool_call``
