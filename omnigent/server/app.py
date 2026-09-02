@@ -238,7 +238,7 @@ def _error_audit_extra(
     request: Request,
     *,
     phase: str = "error",
-    **attributes: object,
+    **attributes: str,
 ) -> dict[str, object]:
     """Build the ``extra=`` for an exception-handler log: operation + session id.
 
@@ -383,7 +383,7 @@ def _emit_audit_event(
     phase: str,
     *,
     session_id: str | None,
-    **attributes: object,
+    **attributes: str,
 ) -> None:
     """Emit one server audit row (table-only, gated on the debug sink).
 
