@@ -25,7 +25,7 @@ _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
 _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"})
 
-# Claude Code / Codex native tools that MUTATE a file, surfaced via the
+# Claude Code / Codex native tools that WRITE to a file, surfaced via the
 # PreToolUse hook contract. Single source of truth: the write policies in
 # ``omnigent.policies.builtins.orchestration`` build their gated sets from
 # this, and it must stay equal to ``_CLAUDE_NATIVE_EDIT_TOOLS`` in
