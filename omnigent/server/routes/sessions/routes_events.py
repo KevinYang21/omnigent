@@ -15,7 +15,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
-from omnigent.debug_logging import add_audit_attrs, debug_event, mark_request_audit_suppressed
+from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
     NewConversationItem,
