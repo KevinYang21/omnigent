@@ -4541,7 +4541,9 @@ async def _codex_discover_thread_and_forward(
                     "Codex TUI never started a thread for %s; chat will not forward",
                     session_id,
                 )
-                # Bridge state is never written here; leave the real cause for the executor (#59).
+                # Bridge state is never written here: the executor's
+                # bridge-state retry then surfaces this recorded startup
+                # error as the turn's real cause instead of a generic hang.
                 cause = (
                     "startup timed out"
                     if isinstance(exc, TimeoutError)
