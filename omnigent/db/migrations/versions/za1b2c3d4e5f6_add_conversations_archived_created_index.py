@@ -1,7 +1,7 @@
 """Add an (archived, created_at) ordering index on conversations.
 
 Revision ID: za1b2c3d4e5f6
-Revises: e5d9bc8ac650
+Revises: ga1b2c3d4e5f
 Create Date: 2026-07-23 00:00:00.000000
 
 The sessions list defaults to ``created_at DESC`` ordering. With the ACL
@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "za1b2c3d4e5f6"
-down_revision: str | None = "e5d9bc8ac650"
+down_revision: str | None = "ga1b2c3d4e5f"
 branch_labels: Sequence[str] | None = None
 depends_on: Sequence[str] | None = None
 
