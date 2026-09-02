@@ -1659,10 +1659,27 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
-            # Handler-attached attributes (e.g. POST /events' event type, a
-            # created session id) ride the end event; base attributes win on any
-            # key collision.
-            end_attributes = current_request_audit_attrs()
+            # Handler-attached attributes ride the end event. A handler that
+            # learns the session id mid-request (create_session, launch_runner —
+            # routes with no {session_id} path param) puts it in the bag; the
+            # BaseHTTPMiddleware runs the handler in a child context, so a
+            # ContextVar it sets there would not be visible here, but the bag is a
+            # shared dict, so it is. The bag's session_id becomes the row's column
+            # (not an attribute). Other reserved keys are dropped so a handler can
+            # never shadow an envelope field or collide with an _emit_audit_event
+            # argument (session_id / phase would raise TypeError).
+            _bag = current_request_audit_attrs()
+            end_session_id = _bag.get("session_id") or audit_session_id
+            _reserved = {
+                "session_id",
+                "phase",
+                "route",
+                "method",
+                "request_id",
+                "status",
+                "duration_ms",
+            }
+            end_attributes = {k: v for k, v in _bag.items() if k not in _reserved}
             end_attributes.update(
                 route=audit_route,
                 method=request.method,
@@ -1673,7 +1690,7 @@ def create_app(
             _emit_audit_event(
                 operation,
                 "error" if request_failed else "ok",
-                session_id=audit_session_id,
+                session_id=end_session_id,
                 **end_attributes,
             )
             # Per-route tally (low-cardinality template key) for offline

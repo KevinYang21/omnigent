@@ -1005,8 +1005,9 @@ def create_hosts_router(
                 detail=f"host failed to launch runner: {result.get('error')}",
             )
 
-        # Tag the audit envelope: the runner is bound to a session carried in
-        # the body (not the request path), so surface it plus the target host.
+        # The runner is bound to a session carried in the body (not the request
+        # path); the middleware promotes a bag session_id to the audit row's
+        # session_id column. Host is an attribute.
         add_audit_attrs(session_id=body.session_id, host_id=host_id, runner_id=runner_id)
         return {
             "runner_id": runner_id,

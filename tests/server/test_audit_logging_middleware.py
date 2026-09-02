@@ -206,3 +206,73 @@ def test_handler_audit_attrs_ride_the_envelope_end_event(
         dl.audit_event_logger().removeHandler(sink)
         dl.sse_event_logger().removeHandler(sink)
         sink.close()
+
+
+def test_reserved_attr_keys_never_crash_and_session_id_binds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A handler that (mis)uses a reserved key like session_id/phase must not
+    # collide with the envelope's own args (which would 500 the request); the
+    # create-session pattern binds the id via set_current_session_id so the ok
+    # row carries it in the session_id column even on a route with no path id.
+    from fastapi.testclient import TestClient
+
+    from omnigent.server.app import _emit_audit_event, _resolve_audit_route
+
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_active_sink", None)
+    rows: list[dl.DebugLogRow] = []
+    got_end = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        rows.extend(batch)
+        for row in batch:
+            if row["attributes"].get("phase") in ("ok", "error"):
+                got_end.set()
+
+    dl.attach_debug_log_sink([], source="server", level=logging.INFO, send=send)
+    sink = dl._active_sink
+    assert sink is not None
+
+    app = FastAPI()
+    _reserved = {"session_id", "phase", "route", "method", "request_id", "status", "duration_ms"}
+
+    @app.middleware("http")
+    async def _audit(request: Request, call_next):  # type: ignore[no-untyped-def]
+        operation, route, session_id = _resolve_audit_route(request)
+        dl.set_current_session_id(session_id)
+        dl.reset_request_audit_attrs()
+        _emit_audit_event(operation, "start", session_id=session_id, route=route)
+        response = await call_next(request)
+        bag = dl.current_request_audit_attrs()
+        end_session_id = bag.get("session_id") or session_id
+        end = {k: v for k, v in bag.items() if k not in _reserved}
+        end.update(route=route, status=str(response.status_code))
+        _emit_audit_event(operation, "ok", session_id=end_session_id, **end)
+        return response
+
+    @app.post("/v1/sessions")
+    def create_session() -> dict[str, str]:
+        # Mimic the real handler: surface the created id via the bag, and
+        # deliberately shove reserved keys through it to prove they can't crash us
+        # (a ContextVar set here would not survive the child->parent boundary).
+        dl.add_audit_attrs(session_id="sess_created", phase="shadow", agent="polly")
+        return {"id": "sess_created"}
+
+    try:
+        with TestClient(app) as client:
+            resp = client.post("/v1/sessions")
+            assert resp.status_code == 200  # no 500 from a reserved-key collision
+        assert got_end.wait(timeout=1.0)
+        end_row = next(r for r in rows if r["attributes"].get("phase") == "ok")
+        assert end_row["event_name"] == "create_session"
+        # session_id column comes from set_current_session_id (route has no path id).
+        assert end_row["session_id"] == "sess_created"
+        # The reserved keys were dropped; the real attribute rode along.
+        assert end_row["attributes"]["agent"] == "polly"
+        assert end_row["attributes"]["phase"] == "ok"
+    finally:
+        dl.set_current_session_id(None)
+        dl.audit_event_logger().removeHandler(sink)
+        dl.sse_event_logger().removeHandler(sink)
+        sink.close()

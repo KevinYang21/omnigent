@@ -370,8 +370,9 @@ def register_core_routes(
             result, project_warnings = await _create_bundled_session_from_multipart(
                 request, user_id
             )
-            # Tag the audit envelope with the created session (not in the request
-            # path, so the envelope would otherwise have a null session_id).
+            # Surface the freshly-minted session id (the request path has no
+            # {session_id} on create); the middleware promotes a bag session_id
+            # to the audit row's session_id column.
             add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
             if project_warnings:
                 return {
