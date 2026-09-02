@@ -11266,6 +11266,23 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "description": "Optional item-type filter, e.g. `\"compaction\"`. `None` returns every item type.",
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Type"
+            }
           }
         ],
         "responses": {

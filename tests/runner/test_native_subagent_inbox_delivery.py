@@ -470,7 +470,7 @@ async def test_runner_restart_recovers_undrained_terminal_child(
 ) -> None:
     """A new runner queue is rebuilt from durable child state and transcript.
 
-    This is the OMNI-4482 regression: no work entry, inbox item, or drained
+    This is the lost-undelivered-sub-agent-results regression: no work entry, inbox item, or drained
     tombstone survives the process restart. The test supplies only server-side
     session/history records and requires recovery to recreate the exact result.
     """

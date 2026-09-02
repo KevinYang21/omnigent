@@ -43,6 +43,16 @@ what to look for, and why it's wrong.
   failure than the journey intends — script enough identical entries that the
   main call deterministically sees the intended response.
 
+- **A new init/boot-path callback must update the "exact calls" contract tests.**
+  Adding a server read (or any side call) to session initialization breaks tests
+  that assert the precise list of callbacks made during init (e.g. a single-flight
+  test asserting `get_paths == [...]`). Grep for tests that enumerate the touched
+  path's calls and extend their expectations deliberately — don't leave them to
+  fail in CI.
+- **A new API query parameter requires regenerating `openapi.json`.** Any change
+  to a FastAPI route signature (new param, changed schema) must be followed by
+  `scripts/dump_openapi.py`; the drift test fails byte-for-byte otherwise.
+
 ## UI / affordances
 
 - **Don't offer an action the code can't perform.** Flag a menu/UI option gated on

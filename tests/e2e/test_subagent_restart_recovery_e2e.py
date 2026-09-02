@@ -26,7 +26,7 @@ from tests.e2e.conftest import (
 )
 from tests.e2e.helpers import POLL_INTERVAL_S
 
-_CHILD_RESULT = "DURABLE_RESTART_RESULT_4482"
+_CHILD_RESULT = "DURABLE_RESTART_RESULT"
 _WAKE_WITHOUT_DRAIN = "WAKE_COMPLETED_WITHOUT_INBOX_DRAIN"
 
 pytestmark = [
