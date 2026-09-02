@@ -309,6 +309,20 @@ def current_request_audit_attrs() -> dict[str, str]:
     return dict(_audit_attrs_var.get() or {})
 
 
+def mark_request_audit_suppressed() -> None:
+    """Suppress this request's audit envelope end-event (high-frequency echoes).
+
+    For endpoints hit per streamed chunk (``POST /events`` with a transient
+    ``external_*_delta`` / usage type) whose per-call row is pure noise — the
+    content is already on the SSE-event logger. Recorded in the shared attribute
+    bag (a reserved key the middleware reads), so it survives the middleware's
+    child-context boundary like any other bag entry.
+    """
+    bag = _audit_attrs_var.get()
+    if bag is not None:
+        bag["_suppress"] = "1"
+
+
 def _clean(value: object) -> str | None:
     """Coerce a missing/blank record attribute to ``None`` so a fallback engages.
 

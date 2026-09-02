@@ -208,6 +208,79 @@ def test_handler_audit_attrs_ride_the_envelope_end_event(
         sink.close()
 
 
+def test_suppressed_request_emits_no_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A handler that calls mark_request_audit_suppressed() (transient POST /events
+    # echoes) produces ZERO audit rows; a normal request on the same route
+    # produces exactly one end row (no start row for post_event).
+    from fastapi.testclient import TestClient
+
+    from omnigent.server.app import _emit_audit_event, _resolve_audit_route
+
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_active_sink", None)
+    rows: list[dl.DebugLogRow] = []
+    delivered = threading.Event()
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        rows.extend(batch)
+        delivered.set()
+
+    dl.attach_debug_log_sink([], source="server", level=logging.INFO, send=send)
+    sink = dl._active_sink
+    assert sink is not None
+
+    app = FastAPI()
+    _reserved = {
+        "_suppress",
+        "session_id",
+        "phase",
+        "route",
+        "method",
+        "request_id",
+        "status",
+        "duration_ms",
+    }
+
+    @app.middleware("http")
+    async def _audit(request: Request, call_next):  # type: ignore[no-untyped-def]
+        operation, route, session_id = _resolve_audit_route(request)
+        dl.set_current_session_id(session_id)
+        dl.reset_request_audit_attrs()
+        if operation != "post_event":
+            _emit_audit_event(operation, "start", session_id=session_id, route=route)
+        response = await call_next(request)
+        bag = dl.current_request_audit_attrs()
+        if not (bag.get("_suppress")):
+            end = {k: v for k, v in bag.items() if k not in _reserved}
+            end.update(route=route, status=str(response.status_code))
+            _emit_audit_event(operation, "ok", session_id=session_id, **end)
+        return response
+
+    @app.post("/v1/sessions/{session_id}/events")
+    def post_event(session_id: str, transient: bool = False) -> dict[str, bool]:
+        dl.add_audit_attrs(event_type="external_output_text_delta" if transient else "message")
+        if transient:
+            dl.mark_request_audit_suppressed()
+        return {"queued": True}
+
+    try:
+        with TestClient(app) as client:
+            client.post("/v1/sessions/conv_1/events?transient=true")
+            client.post("/v1/sessions/conv_1/events")  # normal
+        assert delivered.wait(timeout=1.0)
+        ev = [r for r in rows if r["event_name"] == "post_event"]
+        # Transient -> nothing; normal -> a single end row (no start for post_event).
+        assert all(r["attributes"].get("event_type") != "external_output_text_delta" for r in ev)
+        assert len(ev) == 1
+        assert ev[0]["attributes"]["phase"] == "ok"
+        assert ev[0]["attributes"]["event_type"] == "message"
+    finally:
+        dl.set_current_session_id(None)
+        dl.audit_event_logger().removeHandler(sink)
+        dl.sse_event_logger().removeHandler(sink)
+        sink.close()
+
+
 def test_reserved_attr_keys_never_crash_and_session_id_binds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

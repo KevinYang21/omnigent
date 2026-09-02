@@ -1631,14 +1631,19 @@ def create_app(
         operation, audit_route, audit_session_id = _resolve_audit_route(request)
         set_current_session_id(audit_session_id)
         reset_request_audit_attrs()
-        _emit_audit_event(
-            operation,
-            "start",
-            session_id=audit_session_id,
-            route=audit_route,
-            method=request.method,
-            request_id=request_id,
-        )
+        # ``post_event`` is hit per streamed chunk (the harness echoes its own
+        # output back), so a per-call ``start`` row is pure noise — emit only the
+        # end row for it (and the handler suppresses even that for transient
+        # types). Every other operation keeps its real-time ``start``.
+        if operation != "post_event":
+            _emit_audit_event(
+                operation,
+                "start",
+                session_id=audit_session_id,
+                route=audit_route,
+                method=request.method,
+                request_id=request_id,
+            )
 
         failed = False
         status_code: int | None = None
@@ -1669,30 +1674,37 @@ def create_app(
             # never shadow an envelope field or collide with an _emit_audit_event
             # argument (session_id / phase would raise TypeError).
             _bag = current_request_audit_attrs()
-            end_session_id = _bag.get("session_id") or audit_session_id
-            _reserved = {
-                "session_id",
-                "phase",
-                "route",
-                "method",
-                "request_id",
-                "status",
-                "duration_ms",
-            }
-            end_attributes = {k: v for k, v in _bag.items() if k not in _reserved}
-            end_attributes.update(
-                route=audit_route,
-                method=request.method,
-                request_id=request_id,
-                status=str(status_code) if status_code is not None else "none",
-                duration_ms=str(round(duration_seconds * 1000)),
-            )
-            _emit_audit_event(
-                operation,
-                "error" if request_failed else "ok",
-                session_id=end_session_id,
-                **end_attributes,
-            )
+            # A handler can suppress the whole envelope for this request (e.g. a
+            # transient POST /events echo). An error still logs — a failure is
+            # never noise, and the exception handler carries the detail.
+            if _bag.get("_suppress") and not request_failed:
+                pass
+            else:
+                end_session_id = _bag.get("session_id") or audit_session_id
+                _reserved = {
+                    "_suppress",
+                    "session_id",
+                    "phase",
+                    "route",
+                    "method",
+                    "request_id",
+                    "status",
+                    "duration_ms",
+                }
+                end_attributes = {k: v for k, v in _bag.items() if k not in _reserved}
+                end_attributes.update(
+                    route=audit_route,
+                    method=request.method,
+                    request_id=request_id,
+                    status=str(status_code) if status_code is not None else "none",
+                    duration_ms=str(round(duration_seconds * 1000)),
+                )
+                _emit_audit_event(
+                    operation,
+                    "error" if request_failed else "ok",
+                    session_id=end_session_id,
+                    **end_attributes,
+                )
             # Per-route tally (low-cardinality template key) for offline
             # request-breakdown analysis, e.g. the benchmark harness's
             # per-journey network appendix. Cheap; independent of the OTel path.

@@ -261,6 +261,15 @@ def test_request_audit_attrs_accumulate_and_reset() -> None:
     }
 
 
+def test_mark_request_audit_suppressed_sets_reserved_flag() -> None:
+    # Inside a request it sets the reserved _suppress key the middleware reads
+    # to skip the envelope end-event.
+    dl.reset_request_audit_attrs()
+    assert "_suppress" not in dl.current_request_audit_attrs()
+    dl.mark_request_audit_suppressed()
+    assert dl.current_request_audit_attrs()["_suppress"] == "1"
+
+
 def test_current_session_id_scope_resets() -> None:
     assert dl.current_session_id() is None
     dl.set_current_session_id("outer")
