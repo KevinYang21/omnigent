@@ -2294,13 +2294,14 @@ def create_app(
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
-        # one panel per provider. A provider appears only when both its config
-        # and its connection store are present.
+        # one panel per provider. Derived from the same registry that wires
+        # app.state and mounts the routers, so a new provider can never mount
+        # without also being advertised here.
         enabled_connections = [
-            provider
-            for provider in ("github",)
-            if getattr(app.state, f"{provider}_config", None) is not None
-            and getattr(app.state, f"{provider}_store", None) is not None
+            provider.name
+            for provider in connection_providers()
+            if getattr(app.state, f"{provider.name}_config", None) is not None
+            and getattr(app.state, f"{provider.name}_store", None) is not None
         ]
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share

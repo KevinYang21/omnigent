@@ -466,7 +466,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     logger.info(
         "Capabilities: managed_sandboxes=%s provider=%s github_app=%s",
         managed,
-        sandbox_config.provider if managed else None,
+        sandbox_config.default.provider if managed else None,
         github_config is not None and github_store is not None,
     )
 
