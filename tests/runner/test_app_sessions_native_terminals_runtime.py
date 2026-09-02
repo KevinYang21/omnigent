@@ -3406,6 +3406,71 @@ async def test_codex_direct_thread_start_failure_still_records_startup_error(
 
 
 @pytest.mark.asyncio
+async def test_codex_direct_thread_start_hang_times_out_and_records_startup_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A silent app-server must not hang the fallback forever.
+
+    The app-server client awaits its ``thread/start`` future with no timeout,
+    so an unresponsive-but-not-erroring connection would block the discovery
+    task indefinitely and never write the startup-error breadcrumb. The
+    fallback bounds the request; on expiry it records the original cause.
+    """
+    import omnigent.runner.native.orchestration as orchestration
+    from omnigent import codex_native_forwarder
+    from omnigent.codex_native_bridge import (
+        read_bridge_startup_error,
+        read_bridge_state,
+    )
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    class _Client:
+        async def request(self, method: str, params: object) -> dict[str, object]:
+            # Never resolves — models a socket that went silent without a
+            # clean close, the exact case the client's timeout-less await hits.
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        async def close(self) -> None:
+            return None
+
+    async def _raise_timeout(*_args: object, **_kwargs: object) -> str:
+        raise TimeoutError("no thread/started observed")
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise_timeout)
+    # Keep the test fast: the real deadline is 15s.
+    monkeypatch.setattr(orchestration, "_DIRECT_THREAD_START_TIMEOUT_SECONDS", 0.1)
+
+    session_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    try:
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path / "workspace"),
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
+        )
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    recorded = read_bridge_startup_error(tmp_path)
+    assert recorded is not None
+    assert "startup timed out" in recorded
+    assert read_bridge_state(tmp_path) is None
+
+
+@pytest.mark.asyncio
 async def test_cold_start_agy_conversation_rejects_a_foreign_agy_cascade(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

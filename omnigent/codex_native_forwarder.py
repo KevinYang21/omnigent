@@ -249,6 +249,11 @@ class _ForwarderTarget:
         ``session_id``.
     :param elicitation_tracker: Background Codex elicitation hook
         tracker posting to ``session_id``.
+    :param pending_rotation_event: A ``thread/started`` whose rotation was
+        deferred because the current thread had an in-flight turn (see
+        :func:`_maybe_rotate_session_on_thread_started`). Replayed once that
+        turn reaches a terminal boundary so the in-flight output is not
+        stranded. ``None`` when no rotation is pending.
     """
 
     session_id: str
@@ -256,6 +261,7 @@ class _ForwarderTarget:
     delta_coalescer: _OutputTextDeltaCoalescer
     usage_coalescer: _SessionUsageCoalescer
     elicitation_tracker: _CodexElicitationTaskTracker
+    pending_rotation_event: CodexMessage | None = None
 
 
 @dataclass(frozen=True)
@@ -1912,6 +1918,32 @@ async def supervise_forwarder(
             name="codex-native-forwarder-subscribe",
         )
         await _sleep(0)
+
+        async def _resubscribe_after_rotation() -> None:
+            """Cancel the old thread's subscription and start the new one."""
+            nonlocal subscribe_task, thread_active
+            forwarder_state.note_parent_rotation(target.session_id)
+            subscribe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await subscribe_task
+            # Fresh thread after rotation — start its own active signal so the
+            # new subscription parks until the rotated thread's first turn.
+            thread_active = asyncio.Event()
+            subscribe_task = asyncio.create_task(
+                _subscribe_until_ready(
+                    client,
+                    ap_client,
+                    session_id=target.session_id,
+                    bridge_dir=bridge_dir,
+                    thread_id=target.thread_id,
+                    usage_coalescer=target.usage_coalescer,
+                    elicitation_tracker=target.elicitation_tracker,
+                    forwarder_state=forwarder_state,
+                    ready_signal=thread_active,
+                ),
+                name="codex-native-forwarder-subscribe",
+            )
+
         try:
             async for event in client.iter_events():
                 try:
@@ -1923,28 +1955,7 @@ async def supervise_forwarder(
                         event=event,
                     )
                     if rotated:
-                        forwarder_state.note_parent_rotation(target.session_id)
-                        subscribe_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await subscribe_task
-                        # Fresh thread after a /clear rotation — start its
-                        # own active signal so the new subscription parks
-                        # until the rotated thread's first turn.
-                        thread_active = asyncio.Event()
-                        subscribe_task = asyncio.create_task(
-                            _subscribe_until_ready(
-                                client,
-                                ap_client,
-                                session_id=target.session_id,
-                                bridge_dir=bridge_dir,
-                                thread_id=target.thread_id,
-                                usage_coalescer=target.usage_coalescer,
-                                elicitation_tracker=target.elicitation_tracker,
-                                forwarder_state=forwarder_state,
-                                ready_signal=thread_active,
-                            ),
-                            name="codex-native-forwarder-subscribe",
-                        )
+                        await _resubscribe_after_rotation()
                         continue
                     # Release the subscribe task as soon as the thread shows
                     # activity (rollout now exists), so it resumes instead of
@@ -1963,6 +1974,24 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
+                    # A rotation deferred to protect an in-flight turn (see
+                    # _maybe_rotate_session_on_thread_started) can now run once
+                    # that turn has reached a terminal boundary and cleared the
+                    # bridge's active turn — the deferred output is no longer at
+                    # risk of being dropped as stale.
+                    if target.pending_rotation_event is not None and not _bridge_has_active_turn(
+                        bridge_dir
+                    ):
+                        pending = target.pending_rotation_event
+                        target.pending_rotation_event = None
+                        if await _maybe_rotate_session_on_thread_started(
+                            ap_client=ap_client,
+                            target=target,
+                            bridge_dir=bridge_dir,
+                            app_server_url=app_server_url,
+                            event=pending,
+                        ):
+                            await _resubscribe_after_rotation()
                 except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
@@ -1977,6 +2006,16 @@ async def supervise_forwarder(
             with contextlib.suppress(asyncio.CancelledError):
                 await subscribe_task
             await client.close()
+
+
+def _bridge_has_active_turn(bridge_dir: Path) -> bool:
+    """Return whether the bridge state records an in-flight turn.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``True`` when a turn is streaming (``active_turn_id`` set).
+    """
+    state = read_bridge_state(bridge_dir)
+    return state is not None and state.active_turn_id is not None
 
 
 async def _maybe_rotate_session_on_thread_started(
@@ -2019,6 +2058,25 @@ async def _maybe_rotate_session_on_thread_started(
     # That thread is never persistable and cannot host goals; rotating onto it
     # strands the real turn's output as stale. Ignore all ephemeral threads.
     if _thread_started_is_ephemeral(event):
+        return False
+    # Defer rotation while a turn is still streaming on the current thread.
+    # This happens when a startup-blocked TUI's thread was adopted directly
+    # (the fallback), a web turn began on it, and the user only then answers
+    # the prompt — the un-blocked TUI starts its own thread mid-turn. Rotating
+    # now would swap the target and drop the in-flight turn's remaining output
+    # as stale. Stash the event; the terminal-turn handler replays it once the
+    # turn completes. (A native ``/clear`` fires between turns, so it is
+    # unaffected.)
+    if _bridge_has_active_turn(bridge_dir):
+        if target.pending_rotation_event is None:
+            _logger.info(
+                "Codex forwarder deferring thread rotation until the in-flight "
+                "turn completes: session=%s current_thread=%s new_thread=%s",
+                target.session_id,
+                target.thread_id,
+                new_thread_id,
+            )
+        target.pending_rotation_event = event
         return False
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()

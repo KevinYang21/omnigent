@@ -311,6 +311,12 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 # runners, kept referenced so they aren't garbage-collected mid-run.
 _AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
 
+# Deadline for the direct ``thread/start`` fallback: the app-server client's
+# request future has no timeout of its own, so bound it here to keep a silent
+# connection from hanging the discovery task and skipping the startup-error
+# breadcrumb.
+_DIRECT_THREAD_START_TIMEOUT_SECONDS = 15.0
+
 # Background OpenCode ``opencode serve`` instances for host-spawned
 # opencode-native runners, kept referenced so they aren't garbage-collected
 # mid-run (mirrors ``_AUTO_CODEX_APP_SERVERS``).
@@ -4399,8 +4405,16 @@ async def _start_codex_thread_directly(
     :returns: The new thread id, or ``None`` when the app-server refused.
     """
     try:
-        response = await event_client.request("thread/start", {})
+        # Bound the request: the app-server client awaits its response future
+        # with no timeout, and the reader loop does not fail pending futures
+        # when the socket goes silent. An unresponsive-but-not-erroring
+        # connection would otherwise hang here forever and skip the
+        # startup-error breadcrumb the caller writes on failure.
+        async with asyncio.timeout(_DIRECT_THREAD_START_TIMEOUT_SECONDS):
+            response = await event_client.request("thread/start", {})
     except Exception:
+        # Includes the asyncio.timeout TimeoutError; CancelledError (not an
+        # Exception subclass) still propagates so shutdown is not swallowed.
         _logger.exception("Codex direct thread/start fallback failed for %s", session_id)
         return None
     result = response.get("result")

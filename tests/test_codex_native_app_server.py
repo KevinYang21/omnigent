@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1995,7 +1998,10 @@ def test_suppress_codex_startup_prompts_disables_update_and_model_prompts(
     be silenced in the private config before it renders — for any session,
     not just a pinned model with a known migration target.
     """
-    from omnigent.codex_native_app_server import _suppress_codex_startup_prompts
+    from omnigent.codex_native_app_server import (
+        _CODEX_MIGRATION_PROMPT_HIDE_KEYS,
+        _suppress_codex_startup_prompts,
+    )
 
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
@@ -2008,10 +2014,47 @@ def test_suppress_codex_startup_prompts_disables_update_and_model_prompts(
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert config["model"] == "gpt-5"
     assert config["check_for_update_on_startup"] is False
-    assert config["notice"]["max_migration_prompt"] == 0
     assert config["notice"]["hide_rate_limit_model_nudge"] is True
+    for key in _CODEX_MIGRATION_PROMPT_HIDE_KEYS:
+        assert config["notice"][key] is True
     # The user's own notice table is preserved, not clobbered.
     assert config["notice"]["model_migrations"] == {}
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="requires the codex CLI")
+def test_suppress_codex_startup_prompts_are_real_codex_fields(tmp_path: Path) -> None:
+    """Every suppressed key must survive Codex's ``--strict-config`` parser.
+
+    Re-parsing our own TOML only proves it round-trips; a key Codex does not
+    recognize is silently ignored on the normal path (so the prompt is never
+    actually suppressed) and hard-fails a strict launch. Validate against the
+    real CLI so a bogus key cannot slip in.
+    """
+    from omnigent.codex_native_app_server import _suppress_codex_startup_prompts
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    _suppress_codex_startup_prompts(codex_home)
+
+    # ``exec`` loads config.toml through the strict parser before anything
+    # else: an unknown field prints "unknown configuration field <name>" and
+    # exits within a fraction of a second. A clean parse then proceeds to the
+    # network (which fails auth or hangs), so a TIMEOUT here means the config
+    # parsed fine — the only failure we assert is the unknown-field marker.
+    try:
+        proc = subprocess.run(
+            ["codex", "--strict-config", "exec", "--skip-git-repo-check", "noop"],
+            env={**os.environ, "CODEX_HOME": str(codex_home)},
+            capture_output=True,
+            text=True,
+            timeout=3,
+            input="",
+        )
+    except subprocess.TimeoutExpired:
+        return  # got past config parse into the network — keys are valid
+    assert "unknown configuration field" not in (proc.stdout + proc.stderr), (
+        f"a suppressed key is not a real Codex config field:\n{proc.stdout}\n{proc.stderr}"
+    )
 
 
 def test_routed_spawn_note_appends_then_restores_the_user_base(tmp_path: Path) -> None:

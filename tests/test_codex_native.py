@@ -2127,6 +2127,61 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
     assert state.thread_id == "thread_old"
 
 
+def test_forwarder_defers_thread_rotation_while_a_turn_is_in_flight(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``thread/started`` mid-turn must not rotate away and strand output.
+
+    When a startup-blocked TUI's thread was adopted directly and a web turn
+    is streaming on it, the user answering the prompt starts the TUI's own
+    thread. Rotating then would drop the in-flight turn's remaining output as
+    stale. The detector must defer (stash the event, no rotation) while the
+    bridge records an active turn.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_old",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_old",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_in_flight",
+        ),
+    )
+
+    async def run() -> tuple[bool, codex_native_forwarder._ForwarderTarget]:
+        """Drive one mid-turn thread/started through the rotation detector."""
+        async with httpx.AsyncClient(base_url="http://127.0.0.1:8000") as client:
+            target = codex_native_forwarder._ForwarderTarget(
+                session_id="conv_old",
+                thread_id="thread_old",
+                delta_coalescer=codex_native_forwarder._OutputTextDeltaCoalescer(
+                    client, "conv_old"
+                ),
+                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(client, "conv_old"),
+                elicitation_tracker=_elicitation_tracker(),
+            )
+            rotated = await codex_native_forwarder._maybe_rotate_session_on_thread_started(
+                ap_client=client,
+                target=target,
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "app-server.sock"),
+                event=_thread_started_event("thread_new"),
+            )
+            return rotated, target
+
+    rotated, target = asyncio.run(run())
+    assert rotated is False
+    # The event is stashed for replay once the turn completes; the session and
+    # thread are unchanged so the in-flight turn's output keeps flowing.
+    assert target.pending_rotation_event is not None
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.session_id == "conv_old"
+    assert state.thread_id == "thread_old"
+
+
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
 ) -> None:

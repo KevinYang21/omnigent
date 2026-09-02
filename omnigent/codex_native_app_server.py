@@ -431,6 +431,15 @@ def _acknowledge_codex_model_migration(codex_home: Path, model: str, target: str
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
+# Codex's per-model migration advertisement ("a new model is available,
+# press 1 to try it / 2 to keep yours") is gated by a version-specific
+# ``[notice]`` flag rather than one generic switch. These are the flags
+# known to the supported Codex floor; codex adds a new one per model
+# generation, so this list is best-effort and the direct-thread fallback
+# remains the catch-all for a not-yet-named future advertisement.
+_CODEX_MIGRATION_PROMPT_HIDE_KEYS = ("hide_gpt5_1_migration_prompt",)
+
+
 def _suppress_codex_startup_prompts(codex_home: Path) -> None:
     """Silence Codex's interactive startup prompts in the private config.
 
@@ -442,15 +451,15 @@ def _suppress_codex_startup_prompts(codex_home: Path) -> None:
 
     * ``check_for_update_on_startup`` off — the "a new Codex is available,
       press 1 to update" nag;
-    * ``[notice].max_migration_prompt = 0`` — the "a new model is
-      available, press 1 to try it / 2 to keep yours" advertisement, for
-      every session (the per-model ``model_migrations`` acknowledgement
-      only covers a pinned model with a known upgrade target);
-    * the ``[notice]`` warning nudges that can also gate first render.
+    * the ``[notice]`` warning nudges (full-access / world-writable /
+      rate-limit) that can gate first render;
+    * the known per-model migration-advertisement hide flags (see
+      ``_CODEX_MIGRATION_PROMPT_HIDE_KEYS``).
 
-    These are real Codex config fields, so they are safe even under Codex's
-    strict "error on unknown config" mode. The config is a private per-session
-    copy; the user's shared ``~/.codex/config.toml`` is never touched.
+    Every key here is a real Codex config field (validated against the CLI's
+    ``--strict-config`` parser), so this is safe even when Codex is launched
+    to reject unknown config. The config is a private per-session copy; the
+    user's shared ``~/.codex/config.toml`` is never touched.
 
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :returns: None.
@@ -463,10 +472,11 @@ def _suppress_codex_startup_prompts(codex_home: Path) -> None:
     if notice is None:
         notice = tomlkit.table()
         document["notice"] = notice
-    notice["max_migration_prompt"] = 0
     notice["hide_rate_limit_model_nudge"] = True
     notice["hide_full_access_warning"] = True
     notice["hide_world_writable_warning"] = True
+    for key in _CODEX_MIGRATION_PROMPT_HIDE_KEYS:
+        notice[key] = True
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
