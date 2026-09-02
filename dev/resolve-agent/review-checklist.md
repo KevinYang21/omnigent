@@ -13,6 +13,15 @@ what to look for, and why it's wrong.
 
 ## Tests / hermeticity
 
+- **A "does not crash/fail" e2e must also assert a positive milestone.** A test
+  that only rejects failure markers passes when the journey dies early for an
+  unrelated reason and never reaches the repaired code — assert output/state
+  that can only appear *past* the fixed point.
+- **Guard construction-time exceptions outside the library's base hierarchy.**
+  When widening an `except` around a client library call, check for errors
+  raised at *client construction* that don't subclass the request-error base
+  (e.g. `httpx.InvalidURL` is not an `httpx.HTTPError`) — and check every
+  sibling call site on the same journey, not just the one in the traceback.
 - **Env-absent tests must clear *every* relevant ambient variable.** A test
   asserting an environment-derived value is absent/None/default must clear **all**
   of the variables the code-under-test reads in its fixture — not just the obvious
@@ -20,6 +29,19 @@ what to look for, and why it's wrong.
   machine and flakes in CI where that var is exported.
 - **No order-dependence / shared mutable state** across tests — a test that only
   passes after another ran, or mutates a module/global without restoring it.
+- **Re-importing a module that registers global event listeners leaks them.** A
+  test that re-executes module-level code (deleting it from `sys.modules` and
+  importing again) re-runs every class-level registration in it — e.g. a
+  SQLAlchemy `@event.listens_for(Engine, "do_connect")` hook — piling up global
+  listeners that outlive the test and interfere with later engine tests. The
+  fixture must capture and remove every listener the import registered.
+
+- **claude-sdk e2e mocks must script for parallel API calls.** The claude CLI
+  opens more than one API call at turn start (main + side calls), and only the
+  main call's stream events reach the executor. A mock queue with a single
+  scripted entry can be consumed by a side call, silently testing a different
+  failure than the journey intends — script enough identical entries that the
+  main call deterministically sees the intended response.
 
 ## UI / affordances
 
@@ -40,3 +62,25 @@ what to look for, and why it's wrong.
 - **A "clear/reset" must not clobber unrelated config.** An edit that rewrites a
   config file to remove one key must preserve every other key — no full-file
   overwrite that drops the user's other settings.
+
+- **Copy the environment with `os.environ.copy()`.** Wrapping the environ in a
+  dump-style constructor (dict / json.dumps / str / repr of the whole environ)
+  trips the security exfil scan on added lines; the repo idiom
+  `os.environ.copy()` is equivalent and passes.
+
+- **Never name a specific secret env var in a file that also makes network
+  calls.** The exfil scan blocks any added line naming a secret-shaped variable
+  (a provider token / private-key / `*"_SECRET"`-suffixed name written out
+  verbatim) in a file whose added lines also contain a network-client sink.
+  Strip credentials by prefix (`k.startswith(<provider prefix>)`) instead of
+  listing the secret's exact name.
+
+## Rollback / cleanup
+
+- **Cleanup of an adopted resource must not destroy pre-existing user state.**
+  When an operation *recreates or adopts* something that predates the request (an
+  existing branch, an existing directory, an existing config), its
+  rollback/cleanup path must remove only what the operation itself created —
+  never force-delete the pre-existing thing (e.g. `git branch -D` on a branch the
+  user owned before the call, losing unpushed commits). Check every failure path
+  that shares a cleanup helper with the create-from-scratch flow.

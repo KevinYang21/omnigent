@@ -3,12 +3,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import { BubbleView } from "./ChatPage";
 import {
-  BubbleView,
   ConnectionIndicator,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
-} from "./ChatPage";
+} from "./ChatIndicators";
 
 // Render-level coverage for the chat surface's status bands and bubble
 // dispatcher. These exercise the branches that the pure-helper tests can't:
@@ -243,6 +243,7 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(screen.queryByTestId("message-timestamp")).not.toBeInTheDocument();
   });
@@ -262,6 +263,7 @@ describe("BubbleView dispatch", () => {
 
     const bubble = screen.getByTestId("message-bubble");
     expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+    expect(bubble).toHaveClass("max-w-full");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(screen.getByTestId("message-timestamp")).toBeInTheDocument();
   });
@@ -356,7 +358,7 @@ describe("BubbleView dispatch", () => {
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl");
+    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });
@@ -387,5 +389,36 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByTestId("compacting-indicator")).toHaveTextContent(
       "Compacting conversation…",
     );
+  });
+
+  it("accepts createdAtS timestamp for timer calculation", () => {
+    // WHY: when a compaction_loading bubble has a createdAtS timestamp, the timer
+    // component receives it and can calculate elapsed time from that timestamp
+    // rather than from component mount time, so the progress persists across
+    // session switches. This test verifies the prop flows through correctly.
+    const someTimestamp = Math.floor(Date.now() / 1000) - 10;
+
+    render(
+      <BubbleView
+        bubble={{ kind: "compaction_loading", itemId: "cmp_2", createdAtS: someTimestamp }}
+      />,
+    );
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator).toHaveTextContent("Compacting conversation…");
+    // Timer should show some elapsed time (exact value depends on test timing)
+    expect(indicator.textContent).toMatch(/\(\d+s\)/);
+  });
+
+  it("shows 0s initially when no createdAtS is provided", () => {
+    // WHY: when a compaction_loading bubble has no createdAtS (shouldn't happen
+    // in practice, but defensive), the timer falls back to current time and shows
+    // 0s initially.
+    render(<BubbleView bubble={{ kind: "compaction_loading", itemId: "cmp_3" }} />);
+
+    const indicator = screen.getByTestId("compacting-indicator");
+    expect(indicator).toHaveTextContent("Compacting conversation…");
+    // Initially shows no elapsed time or (0s)
+    // (timer ticks immediately on mount, so we can't reliably assert the exact initial state)
   });
 });

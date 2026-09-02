@@ -93,6 +93,8 @@ from omnigent.tools.builtins.spawn import (
     _ACTIVITY_MAX_CHARS,
     _CLOSED_TITLE_INFIX,
     _HISTORY_DEFAULT_TAIL,
+    _bound_history_content_chars,
+    _clamp_history_content_chars,
     _clamp_tail_items,
 )
 from omnigent.tools.builtins.sys_terminal import (
@@ -298,6 +300,12 @@ _SESSION_QUERY_TOOLS = frozenset(
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
 
+# The title bound the rename tool advertises to the LLM — read once from the
+# tool schema so the dispatcher can never drift from the published contract.
+_SESSION_RENAME_TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["function"][
+    "parameters"
+]["properties"]["title"]["maxLength"]
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -319,12 +327,11 @@ _SHARE_PUBLIC_POLICY = "public"
 _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 
 # Priority 5f.1b: web_search — the first-party search builtin. Runner-local
-# so a non-OpenAI model's web_search function call resolves to the spec's
-# configured backend (google / perplexity / nimble) via WebSearchTool.invoke.
-# (OpenAI models use the native web_search_preview passthrough and never reach
-# this path.) Without this entry the call fell through to the spec-callable
-# branch and errored "tool unavailable" — the gap behind the non-OpenAI
-# web_search known-failure.
+# so non-OpenAI-harness web_search calls resolve to the spec's configured
+# backend (google / perplexity / nimble) via WebSearchTool.invoke.
+# (OpenAI Responses-compatible harnesses use the native web_search_preview
+# passthrough and never reach this path.) Without this entry the call fell
+# through to the spec-callable branch and errored "tool unavailable".
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
 # nimble_research — Nimble Agent API v2 research runs (start → poll → result).
@@ -473,6 +480,10 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
     | _HINDSIGHT_TOOLS
+    # Skills ride the relay for the same reason memory does: ``load_skill`` is
+    # what discovers host-scope skills (``.agents/skills`` and friends), and a
+    # native session's only tool surface is this relay.
+    | _SKILL_TOOLS
 )
 
 
@@ -1422,6 +1433,127 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+async def _inherited_parent_model(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    sub_agent_name: str,
+    agent_spec: AgentSpec | None,
+    child_harness: str | None,
+) -> str | None:
+    """
+    Resolve the parent session's model for a dispatch that names none.
+
+    A user who selects a model for a session expects the whole session —
+    including the sub-agents it fans out to — to run on it; without
+    inheritance a dispatch that omits ``args.model`` silently lands on the
+    worker/provider default. Inheritance is best-effort and skips quietly
+    (unlike the explicit ``args.model`` path, which fails loud) because the
+    caller asked for nothing:
+
+    - a sub-agent spec that pins its own ``executor.model`` keeps it — the
+      worker's author chose that model deliberately;
+    - a child harness without model-override plumbing runs its default;
+    - a parent model outside the child harness's family (e.g. a Claude
+      selection dispatched to a codex worker) is not forced across vendors.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The parent session id.
+    :param sub_agent_name: Name of the sub-agent being dispatched.
+    :param agent_spec: Parent agent's spec.
+    :param child_harness: The child's resolved harness, e.g. ``"claude-sdk"``.
+    :returns: The parent's effective model to inherit, or ``None`` when
+        inheritance does not apply.
+    """
+    sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+    spec_model = getattr(getattr(sub_spec, "executor", None), "model", None)
+    if isinstance(spec_model, str) and spec_model:
+        return None
+    if not harness_supports_model_override(child_harness):
+        return None
+    try:
+        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    if resp.status_code != 200:
+        return None
+    snap = _string_object_dict(resp.json())
+    if snap is None:
+        return None
+    # Effective selection: an explicit per-session override wins over the
+    # spec/CLI-resolved model; both may be absent.
+    raw_model = snap.get("model_override") or snap.get("llm_model")
+    if not isinstance(raw_model, str) or not raw_model:
+        return None
+    try:
+        parent_model = validate_model_override(raw_model)
+    except ValueError:
+        return None
+    if child_harness is not None and model_family_mismatch(child_harness, parent_model):
+        _logger.debug(
+            "sys_session_send: not inheriting parent model %r for sub-agent %r "
+            "(family mismatch with harness %s); child runs its default",
+            parent_model,
+            sub_agent_name,
+            child_harness,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        return None
+    return parent_model
+
+
+def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
+    """
+    Extract the optional ``reasoning_effort`` from
+    ``sys_session_send`` args.
+
+    :param args: Decoded tool arguments, e.g.
+        ``{"args": {"input": "fix the bug", "reasoning_effort": "high"}}``.
+    :returns: The requested effort, or ``None`` when absent.
+    :raises ValueError: If ``reasoning_effort`` is present but is not a
+        non-empty string.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    raw_effort = raw_message.get("reasoning_effort")
+    if raw_effort is None:
+        return None
+    if not isinstance(raw_effort, str) or not raw_effort:
+        raise ValueError("'reasoning_effort' must be a non-empty string when provided")
+    return raw_effort
+
+
+def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
+    """
+    Validate *effort* against the child harness's declared effort family.
+
+    A harness whose family is ``NONE`` has no effort plumbing, and an
+    unrecognized one cannot be checked at all — the caller asked for this
+    explicitly, so reject rather than accept-and-drop. (Delivery of a
+    persisted effort takes the opposite tack and filters quietly; see the
+    reasoning guard in :mod:`omnigent.runner.app`.)
+
+    :param effort: Requested effort, e.g. ``"high"``.
+    :param harness: Resolved child harness, e.g. ``"claude-native"``.
+    :returns: The canonical effort that harness accepts.
+    :raises ValueError: If the harness supports no effort override, or
+        the value falls outside its vocabulary.
+    """
+    from omnigent.reasoning_effort import efforts_for_harness, validate_effort
+
+    canonical = canonicalize_harness(harness) if harness is not None else None
+    supported = efforts_for_harness(harness)
+    if not supported:
+        raise ValueError(
+            f"harness {canonical or harness or 'unknown'!r} does not support "
+            "a reasoning-effort override"
+        )
+    validated = validate_effort(effort, canonical or harness or "unknown", supported)
+    assert validated is not None
+    return validated
+
+
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -1624,9 +1756,32 @@ def _find_subagent_spec(sub_agent_name: str, agent_spec: AgentSpec | None) -> Ag
     """
     if agent_spec is None:
         return None
-    for sub_agent in agent_spec.sub_agents:
-        if sub_agent.name == sub_agent_name:
+    # Defensive access: resolvers hand us legacy / test spec objects that are
+    # only structurally AgentSpec-shaped, and ``_has_subagent`` routes its
+    # existence check through here, so a stub without ``sub_agents`` must miss
+    # rather than raise.
+    for sub_agent in getattr(agent_spec, "sub_agents", None) or []:
+        if getattr(sub_agent, "name", None) == sub_agent_name:
             return sub_agent
+    # Built-in web_fetch researcher: ``WebFetchTool.__init__`` appends
+    # ``__web_researcher`` to the owner's live ``sub_agents`` in memory but
+    # never serializes it, so it is absent from the runner's re-parsed spec.
+    # Reconstruct it deterministically -- the same pure builder the
+    # child-boot resolver (``workflow.py::_find_spec_by_name``) uses -- so
+    # this lookup and the dispatch gate agree the sub-agent exists. Without
+    # it, ``_has_subagent`` returns True while ``_subagent_harness`` /
+    # ``_subagent_allowed_harnesses`` (both routed through here) return
+    # ``None``, i.e. the gate and the spec lookup disagree about the same
+    # name. Reconstruction is gated inside the helper on the tree actually
+    # declaring ``web_fetch``, so a caller-supplied name cannot coerce an
+    # arbitrary parent into a shell-capable researcher.
+    from omnigent.tools.builtins.web_fetch import (
+        RESEARCHER_NAME,
+        reconstruct_researcher_spec,
+    )
+
+    if sub_agent_name == RESEARCHER_NAME:
+        return reconstruct_researcher_spec(agent_spec)
     return None
 
 
@@ -1890,6 +2045,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'model': {exc}"
 
     try:
+        reasoning_effort = _subagent_reasoning_effort_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
+
+    try:
         file_ids = _subagent_file_ids_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'file_ids': {exc}"
@@ -1934,6 +2094,12 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'harness' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'harness' to continue "
+                f"session {target_session_id!r}."
+            )
+        if reasoning_effort is not None:
+            return (
+                "Error: sys_session_send 'reasoning_effort' applies only when a "
+                "sub-agent session is first created; it cannot change an existing "
                 f"session {target_session_id!r}."
             )
         if cost_budget is not None:
@@ -2036,6 +2202,14 @@ async def _execute_subagent_tool(
                 "continue it, or sys_session_close it first to spawn a "
                 "fresh session with the requested files."
             )
+        if reasoning_effort is not None:
+            return (
+                f"Error: sys_session_send 'reasoning_effort' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} title "
+                f"{session_name!r} already exists as {child_session_id}. Re-send "
+                "without 'reasoning_effort' to continue it, or "
+                "sys_session_close it first to spawn a fresh session."
+            )
         if cost_budget is not None:
             return (
                 f"Error: sys_session_send 'cost_budget' applies only when a "
@@ -2066,6 +2240,7 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
+        _auto_ordinal = False
         if not session_name:
             # No title hint — auto-generate a structured session name
             # (e.g. "researcher-1"). Recover ordinals from existing
@@ -2092,6 +2267,7 @@ async def _execute_subagent_tool(
                 str(sub_agent_name),
             )
             session_name = f"{sub_agent_name}-{ordinal}"
+            _auto_ordinal = True
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
@@ -2194,9 +2370,115 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
-        resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
-        if resp.status_code >= 400:
-            return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
+        else:
+            # No explicit per-dispatch model: inherit the parent session's
+            # selection so the user's chosen model governs the whole session
+            # tree. Best-effort — skipped when the sub-agent spec pins its
+            # own model, the harness has no override plumbing, or the parent
+            # model's family cannot run on the child harness.
+            inherited = await _inherited_parent_model(
+                server_client=server_client,
+                conversation_id=conversation_id,
+                sub_agent_name=str(sub_agent_name),
+                agent_spec=agent_spec,
+                child_harness=child_harness,
+            )
+            if inherited is not None:
+                create_body["model_override"] = _normalize_subagent_model(
+                    inherited,
+                    sub_agent_name=str(sub_agent_name),
+                    agent_spec=agent_spec,
+                    harness=child_harness,
+                )
+        # A dispatch that names no effort inherits the sub-agent spec's
+        # ``executor.reasoning_effort``, so a worker's default is declared
+        # once in its config instead of depending on the orchestrator
+        # remembering to pass it on every dispatch.
+        effective_effort = reasoning_effort
+        effort_source = "sys_session_send"
+        if effective_effort is None:
+            sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+            # ``getattr``: sub-specs also arrive as structural stubs that
+            # carry only the fields a caller needed.
+            spec_effort = getattr(getattr(sub_spec, "executor", None), "reasoning_effort", None)
+            if isinstance(spec_effort, str) and spec_effort:
+                effective_effort = spec_effort
+                effort_source = f"sub-agent {sub_agent_name!r} spec"
+        if effective_effort is not None:
+            try:
+                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                    effective_effort,
+                    child_harness,
+                )
+            except ValueError as exc:
+                return f"Error: invalid 'reasoning_effort' from {effort_source}: {exc}"
+
+        # Best-effort retry for auto-ordinal name collisions: a 409 means
+        # another runner (or a restart race) already created a child with
+        # this ordinal. Bump and retry. Not watertight — the server's
+        # (parent, title) check is SELECT-then-INSERT with no DB unique
+        # constraint, so truly concurrent creates can still race past it.
+        _max_ordinal_retries = 5 if _auto_ordinal else 0
+        _create_timeout_exc: httpx.ReadTimeout | None = None
+        resp: httpx.Response | None = None
+        try:
+            for _ordinal_attempt in range(_max_ordinal_retries + 1):
+                resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+                if (
+                    resp.status_code == 409
+                    and _auto_ordinal
+                    and _ordinal_attempt < _max_ordinal_retries
+                ):
+                    ordinal = _runner_app.next_subagent_ordinal(
+                        conversation_id,
+                        str(sub_agent_name),
+                    )
+                    session_name = f"{sub_agent_name}-{ordinal}"
+                    create_body["title"] = f"{sub_agent_name}:{session_name}"
+                    continue
+                break
+        except httpx.ReadTimeout as _exc:
+            _create_timeout_exc = _exc
+        if _create_timeout_exc is not None:
+            # The read deadline elapsed after the server may have committed the
+            # child session — child_session_id is unknown to us, but the
+            # (parent, agent, title) triple is. Reconcile: look up the created
+            # child by its expected title so we can reap its process cluster.
+            # Guard the entire reconcile path against further transport errors
+            # (the server may still be wedged) so any failure still returns
+            # the descriptive string instead of propagating.
+            _reap_warning: str = ""
+            try:
+                _leaked = await _find_existing_child_session(
+                    server_client=server_client,
+                    conversation_id=conversation_id,
+                    agent=str(sub_agent_name),
+                    title=str(session_name),
+                )
+                if isinstance(_leaked, dict):
+                    _leaked_id = _leaked.get("id") or _leaked.get("session_id")
+                    if isinstance(_leaked_id, str) and _leaked_id:
+                        _reap_warning = (
+                            await _teardown_failed_child(
+                                server_client,
+                                _leaked_id,
+                                created_child=True,
+                            )
+                            or ""
+                        )
+            except Exception:  # noqa: BLE001 — reconcile is best-effort; any transport error still returns the descriptive string
+                pass
+            _suffix = f" {_reap_warning}" if _reap_warning else ""
+            return (
+                f"Error: timed out waiting for child session create response "
+                f"({sub_agent_name!r} / {session_name!r}); the server may have "
+                f"committed the session — reaping any orphaned cluster.{_suffix} "
+                "Retry the same send to continue in a fresh child."
+            )
+        if resp is None or resp.status_code >= 400:
+            status = resp.status_code if resp is not None else 0
+            text = resp.text[:200] if resp is not None else "(no response)"
+            return f"Error: failed to create child session: {status} {text}"
         child_data = _string_object_dict(resp.json())
         if child_data is None:
             return "Error: server returned malformed child session data"
@@ -2518,15 +2800,23 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    reasoning_effort: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``model``, and ``reasoning_effort`` are included when provided; the
+    message becomes the child's first queued user turn via
+    ``initial_items``.
+
+    ``model`` and ``reasoning_effort`` are passed through unvalidated:
+    this path never resolves the child's harness (the agent is named by
+    id and resolved server-side), so neither can be checked against the
+    harness's capabilities here. The server validates both against their
+    vocabularies at create.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2536,6 +2826,8 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
+        written as ``reasoning_effort`` on the session.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2546,6 +2838,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2685,6 +2979,18 @@ async def _execute_session_create(
             }
         )
     if has_config_path:
+        # The multipart create carries only the config bundle, so an effort
+        # passed here would never reach the child. Refuse instead of dropping it.
+        if args.get("reasoning_effort") is not None:
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create 'reasoning_effort' is supported only "
+                        "with 'agent_id'; the 'config_path' create cannot carry "
+                        "it. Set the effort in the config you upload instead."
+                    )
+                }
+            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -2700,6 +3006,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -3067,16 +3374,13 @@ async def _execute_web_search_tool(
     runs its synchronous ``invoke`` off the event loop (the backend makes a
     blocking HTTP call).
 
-    ``llm_provider`` is inferred exactly as ``ToolManager._create_web_search``
-    does, so the dispatch path preserves the same invariants as session setup:
-
-    - **OpenAI models** keep the native ``web_search_preview`` passthrough; if a
-      ``web_search`` function call ever reached this path, ``invoke()`` raises
-      (its built-in fence) and the third-party backend is never run. In normal
-      operation OpenAI models never emit a ``web_search`` function call, so this
-      is defensive — but it keeps the promise rather than silently weakening it.
-    - **``databricks-*`` models** skip provider inference (they don't support
-      ``web_search_preview``) and run in function-tool mode.
+    ``llm_provider`` comes from the same helper session setup uses
+    (:func:`~omnigent.llms.routing.web_search_native_passthrough_provider`),
+    so dispatch preserves the session-setup invariants: on OpenAI
+    Responses-compatible harnesses the native ``web_search_preview``
+    passthrough is kept (``invoke()`` raises its fence if a function call
+    ever reaches this path — defensive, the provider executes server-side);
+    every other harness/model runs in function-tool mode.
 
     :param args: Parsed LLM arguments — ``query`` (required).
     :param agent_spec: Parent agent's spec; carries the web_search config + model.
@@ -3089,14 +3393,14 @@ async def _execute_web_search_tool(
     from omnigent.tools.builtins.web_search import WebSearchTool
 
     config = _web_search_config_from_spec(agent_spec)
-    # Mirror ToolManager._create_web_search's provider inference (same skip for
-    # databricks-*, same OpenAI passthrough fence) so dispatch honors session-setup invariants.
-    llm_provider: str | None = None
-    model = getattr(getattr(agent_spec, "executor", None), "model", None)
-    if model and not model.startswith("databricks-"):
-        from omnigent.llms.routing import parse_model_string
+    # Same helper as ToolManager._create_web_search, so dispatch and
+    # session-setup advertisement cannot drift.
+    from omnigent.llms.routing import web_search_native_passthrough_provider
 
-        llm_provider = parse_model_string(model).provider
+    executor = getattr(agent_spec, "executor", None)
+    llm_provider = web_search_native_passthrough_provider(
+        getattr(executor, "model", None), getattr(executor, "harness_kind", None)
+    )
     tool = WebSearchTool(config=config, llm_provider=llm_provider)
     ctx = ToolContext(
         task_id=task_id or "web_search",
@@ -3304,11 +3608,12 @@ def _has_subagent(
     """
     if agent_spec is None:
         return False
-    # AP-style spec: sub_agents list
-    sub_agents = getattr(agent_spec, "sub_agents", None) or []
-    for sa in sub_agents:
-        if getattr(sa, "name", None) == sub_agent_name:
-            return True
+    # AP-style spec: sub_agents list, including the synthesized
+    # ``__web_researcher``. Routed through the single resolver so the gate
+    # and every downstream harness / allowlist lookup agree about whether a
+    # name exists (see :func:`_find_subagent_spec`).
+    if _find_subagent_spec(sub_agent_name, agent_spec) is not None:
+        return True
     # Omnigent inner loader: tools dict with AgentTool entries
     tools = getattr(agent_spec, "tools", None)
     if isinstance(tools, dict) and sub_agent_name in tools:
@@ -3733,10 +4038,12 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "name",
     "prompt",
     "rrule",
+    "agent_id",
     "timezone",
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "max_cost_usd",
     "workspace",
     "host_id",
     "state",
@@ -3854,19 +4161,24 @@ def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
     return _ParsedTitle(agent=head, title=tail)
 
 
-def _truncate_activity(text: str | None) -> str | None:
+def _truncate_activity(
+    text: str | None,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+) -> str | None:
     """
-    Truncate text to ``_ACTIVITY_MAX_CHARS`` to bound peek prompt size.
+    Truncate text to ``max_chars`` to bound peek prompt size.
 
     :param text: The text to truncate, or ``None``.
+    :param max_chars: Maximum characters retained before the marker.
     :returns: The (possibly truncated) text, or ``None`` when the input
         is ``None``.
     """
     if text is None:
         return None
-    if len(text) <= _ACTIVITY_MAX_CHARS:
+    if len(text) <= max_chars:
         return text
-    return text[:_ACTIVITY_MAX_CHARS] + " [truncated]"
+    return text[:max_chars] + " [truncated]"
 
 
 def _text_from_api_content(content: object) -> str:
@@ -3887,7 +4199,11 @@ def _text_from_api_content(content: object) -> str:
     return " ".join(parts)
 
 
-def _project_api_item(item: _JsonObject) -> _JsonObject:
+def _project_api_item(
+    item: _JsonObject,
+    *,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
+) -> _JsonObject:
     """
     Project a REST API conversation item into the compact peek shape.
 
@@ -3898,6 +4214,7 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
     the same as the in-process tool's.
 
     :param item: One API item dict from the items endpoint.
+    :param max_chars: Maximum characters retained in each content field.
     :returns: A compact dict — ``{type, tool, args}`` for tool calls,
         ``{type, output}`` for tool results, ``{type, role, text}`` for
         messages.
@@ -3907,17 +4224,26 @@ def _project_api_item(item: _JsonObject) -> _JsonObject:
         return {
             "type": "function_call",
             "tool": _optional_string(item.get("name")),
-            "args": _truncate_activity(_optional_string(item.get("arguments"))),
+            "args": _truncate_activity(
+                _optional_string(item.get("arguments")),
+                max_chars=max_chars,
+            ),
         }
     if itype == "function_call_output":
         output = item.get("output")
         rendered = output if isinstance(output, str) else json.dumps(output)
-        return {"type": "function_call_output", "output": _truncate_activity(rendered)}
+        return {
+            "type": "function_call_output",
+            "output": _truncate_activity(rendered, max_chars=max_chars),
+        }
     if itype == "message":
         return {
             "type": "message",
             "role": _optional_string(item.get("role")),
-            "text": _truncate_activity(_text_from_api_content(item.get("content"))),
+            "text": _truncate_activity(
+                _text_from_api_content(item.get("content")),
+                max_chars=max_chars,
+            ),
         }
     return {"type": itype}
 
@@ -4898,12 +5224,11 @@ async def _rename_current_session_via_rest(
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
 ) -> str:
-    """Conditionally rename the calling session through the server API.
+    """Rename the calling session through the server API.
 
-    Automatic naming is framework metadata, never a prerequisite for the
-    user's turn. Every failure therefore becomes a tool-result envelope so a
-    missing route, unavailable server, or malformed response cannot abort the
-    harness session.
+    Session naming is metadata, never a prerequisite for the user's turn.
+    Every failure therefore becomes a tool-result envelope so a missing route,
+    unavailable server, or malformed response cannot abort the harness session.
     """
     if server_client is None:
         return json.dumps({"error": "sys_session_rename requires server access"})
@@ -4912,10 +5237,60 @@ async def _rename_current_session_via_rest(
     title = args.get("title")
     if not isinstance(title, str):
         return json.dumps({"error": "sys_session_rename requires a string 'title'"})
+    # Enforce exactly the bounds the tool schema advertises to the LLM.
+    max_chars = _SESSION_RENAME_TITLE_MAX_CHARS
+    if len(title) < 2 or len(title) > max_chars:
+        return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    if "\n" in title or "\r" in title:
+        return json.dumps({"error": "sys_session_rename title must be a single line"})
+    normalized_title = " ".join(title.split())
+    if len(normalized_title) < 2:
+        return json.dumps({"error": f"sys_session_rename title must be 2-{max_chars} characters"})
+    # Only a top-level session may rename itself: a sub-agent's title is its
+    # (parent, title) continuation address for sys_session_send, so a child
+    # rename would corrupt sibling addressing. Refuse explicitly, matching
+    # the old seed-gated endpoint's response for child sessions.
     try:
-        response = await server_client.post(
-            f"/v1/sessions/{conversation_id}/auto-title",
-            json={"title": title},
+        info_response = await server_client.get(
+            f"/v1/sessions/{conversation_id}",
+            # Skip the transcript and the runner/host liveness lookup — the
+            # probe only needs parent_session_id.
+            params={"include_items": "false", "include_liveness": "false"},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if info_response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {info_response.status_code}",
+                "detail": info_response.text[:200],
+            }
+        )
+    try:
+        info_payload = info_response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    # Fail closed: only a payload that positively shows a parentless session
+    # may proceed — a malformed or version-skewed snapshot must not let a
+    # child rename slip through and corrupt its continuation address. Exactly
+    # None means top-level; a non-empty string means child; anything else
+    # (empty string, wrong type) is malformed and blocks the rename.
+    if not isinstance(info_payload, dict) or "parent_session_id" not in info_payload:
+        return json.dumps(
+            {"error": "sys_session_rename could not verify the session is top-level"}
+        )
+    parent_session_id = info_payload["parent_session_id"]
+    if parent_session_id is not None:
+        if isinstance(parent_session_id, str) and parent_session_id:
+            return json.dumps({"renamed": False, "title": None, "reason": "not_top_level"})
+        return json.dumps(
+            {"error": "sys_session_rename could not verify the session is top-level"}
+        )
+    try:
+        response = await server_client.patch(
+            f"/v1/sessions/{conversation_id}",
+            json={"title": normalized_title},
             timeout=30.0,
         )
     except Exception as exc:  # noqa: BLE001
@@ -4933,7 +5308,10 @@ async def _rename_current_session_via_rest(
         return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
     if not isinstance(payload, dict):
         return json.dumps({"error": "sys_session_rename returned a non-object response"})
-    return json.dumps(payload)
+    updated_title = payload.get("title")
+    if not isinstance(updated_title, str):
+        return json.dumps({"error": "sys_session_rename response omitted the updated title"})
+    return json.dumps({"renamed": True, "title": updated_title, "reason": None})
 
 
 async def _collect_sub_agents(
@@ -5161,7 +5539,7 @@ async def _session_get_history_via_rest(
     may read).
 
     :param args: Parsed tool arguments; requires ``conversation_id``,
-        optional ``tail_items``.
+        optional ``tail_items`` and ``content_max_chars``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON peek result, or a JSON error object.
     """
@@ -5173,6 +5551,15 @@ async def _session_get_history_via_rest(
     tail_items = _clamp_tail_items(args.get("tail_items", _HISTORY_DEFAULT_TAIL))
     if isinstance(tail_items, str):
         return tail_items
+    content_max_chars = _clamp_history_content_chars(
+        args.get("content_max_chars", _ACTIVITY_MAX_CHARS),
+    )
+    if isinstance(content_max_chars, str):
+        return content_max_chars
+    content_max_chars = _bound_history_content_chars(
+        tail_items=tail_items,
+        content_max_chars=content_max_chars,
+    )
     try:
         resp = await server_client.get(
             f"/v1/sessions/{target_id}/items",
@@ -5190,7 +5577,9 @@ async def _session_get_history_via_rest(
     data: list[_JsonObject] = resp.json().get("data", [])
     # ``order="desc"`` returns newest-first; reverse to chronological so
     # the LLM reads top-to-bottom (matches the in-process peek).
-    items: list[_JsonObject] = [_project_api_item(it) for it in reversed(data)]
+    items: list[_JsonObject] = [
+        _project_api_item(it, max_chars=content_max_chars) for it in reversed(data)
+    ]
     meta = await _fetch_peek_meta(target_id, server_client)
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
@@ -5348,6 +5737,10 @@ async def _session_close_via_rest(
             json={
                 "title": new_title,
                 "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                # archived=True triggers the server's _spawn_archive_stop reaper,
+                # which stops the child's harness / tmux / bridge cluster.
+                # Without this the child's OS-process cluster is never reaped.
+                "archived": True,
             },
             timeout=30.0,
         )
@@ -5525,7 +5918,7 @@ async def execute_tool(
                 args,
                 session_inbox=session_inbox,
                 session_async_tasks=session_async_tasks,
-                harness_client=harness_client or httpx.AsyncClient(),
+                harness_client=harness_client,
                 server_client=server_client,
                 terminal_registry=terminal_registry,
                 resource_registry=resource_registry,
@@ -5691,7 +6084,12 @@ async def execute_tool(
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
         else:
             output = await _execute_spec_callable_tool(tool_name, args, agent_spec=agent_spec)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        _logger.exception(
+            "tool %s failed",
+            tool_name,
+            extra={"session_id": conversation_id},
+        )
         output = f"Error: {type(exc).__name__}: {exc}"
 
     return output
@@ -7261,7 +7659,8 @@ def _spawn_async_tool(
                 }
             )
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            _logger.exception("async tool %s failed", target_tool)
             session_inbox.put_nowait(
                 {
                     "handle_id": handle_id,
@@ -7600,9 +7999,9 @@ def _execute_skill_tool(
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
 
-    Instantiates the tool with the agent spec's bundled skills
-    plus host-scope discovery from the runner workspace, then
-    invokes it.
+    Both tools are built from one registry — the agent spec's bundled
+    skills merged with host-scope discovery from the runner workspace —
+    so anything ``load_skill`` can load, ``read_skill_file`` can read.
 
     :param tool_name: ``"load_skill"`` or ``"read_skill_file"``.
     :param args: Parsed JSON arguments from the LLM.
@@ -7622,15 +8021,14 @@ def _execute_skill_tool(
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
 
-    tool: Tool
-    if tool_name == "load_skill":
-        tool = LoadSkillTool(
-            bundled_skills,
-            agent_root=runner_workspace,
-            skills_filter=skills_filter,
-        )
-    else:
-        tool = ReadSkillFileTool(bundled_skills)
+    # Both tools must resolve the same registry: a skill load_skill can load
+    # from host scope must have its files readable too.
+    load_tool = LoadSkillTool(
+        bundled_skills,
+        agent_root=runner_workspace,
+        skills_filter=skills_filter,
+    )
+    tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)
 
     arguments_json = json.dumps(args)
     from omnigent.tools.base import ToolContext

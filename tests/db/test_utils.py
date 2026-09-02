@@ -20,6 +20,7 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
+    _run_migrations,
     _shared_read_sessions,
     build_search_snippet,
     builtin_agent_id,
@@ -29,6 +30,7 @@ from omnigent.db.utils import (
     generate_item_id,
     get_or_create_engine,
     make_managed_session_maker,
+    run_migrations_with_retry,
     set_lakebase_token_provider,
     shared_read_scope,
     strip_nul_bytes,
@@ -302,6 +304,29 @@ def test_create_engine_wires_token_refresh_and_short_recycle(
         engine.dispose()
 
 
+def test_build_alembic_config_preserves_percent_encoded_database_url() -> None:
+    """Alembic accepts URL-encoded credentials without changing the URL."""
+    uri = "postgresql+psycopg://user:p%40ss%25word@db.example.com:5432/app"
+
+    config = _build_alembic_config(uri)
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
+def test_alembic_env_override_preserves_percent_encoded_database_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The environment override survives Alembic's ConfigParser boundary."""
+    uri = f"sqlite:///{tmp_path / 'override%25.db'}"
+    config = _build_alembic_config("sqlite:///:memory:")
+    monkeypatch.setenv("OMNIGENT_DB_URL", uri)
+
+    command.upgrade(config, "head")
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
 # ── _initialize_or_verify_schema ────────────────────────
 
 
@@ -324,6 +349,24 @@ def _make_db_at_revision(db_path: Path, revision: str) -> str:
         with engine.begin() as conn:
             config.attributes["connection"] = conn
             command.upgrade(config, revision)
+    finally:
+        engine.dispose()
+    return uri
+
+
+def _make_db_at_unknown_revision(db_path: Path, revision: str) -> str:
+    """Build a SQLite database stamped beyond this build's migration map."""
+    uri = f"sqlite:///{db_path}"
+    engine = create_engine(uri)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO alembic_version (version_num) VALUES (?)",
+                (revision,),
+            )
     finally:
         engine.dispose()
     return uri
@@ -460,6 +503,63 @@ def test_initialize_or_verify_schema_reports_manual_retry_when_auto_migration_fa
         f"Error message must include the database URL so the "
         f"command is copy-pastable. Got: {msg!r}"
     )
+
+
+def test_initialize_or_verify_schema_reports_database_from_newer_build(
+    tmp_path: Path,
+) -> None:
+    """An unknown DB revision means this build is too old, not that the DB is stale."""
+    future_revision = "deadbeef1234"
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", future_revision)
+    head = _get_head_db_revision(uri)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    msg = str(exc_info.value)
+    assert future_revision in msg
+    assert head in msg
+    assert "out of date" not in msg.lower()
+    assert "db-upgrade" not in msg
+
+
+def test_initialize_or_verify_schema_does_not_migrate_database_from_newer_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup must leave a database from a newer build untouched."""
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", "deadbeef1234")
+    run_migrations = MagicMock()
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", run_migrations)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer"):
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    run_migrations.assert_not_called()
+
+
+def test_run_migrations_reports_database_from_newer_build(tmp_path: Path) -> None:
+    """The manual db-upgrade path must replace Alembic's CommandError."""
+    future_revision = "deadbeef1234"
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", future_revision)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _run_migrations(engine, uri)
+        assert _get_current_db_revision(engine) == future_revision
+    finally:
+        engine.dispose()
+
+    assert "Can't locate revision" not in str(exc_info.value)
 
 
 # ── slash_command persistence path ────────────────────
@@ -869,3 +969,143 @@ def test_shared_read_scope_closes_session_when_init_fails(
     assert counts["out"] == counts["in"], (
         f"a session that failed mid-init leaked its checkout: {counts}"
     )
+
+
+# ── run_migrations_with_retry (cold-start resilience) ──────────────
+
+
+def _operational_error(msg: str = "the database system is starting up") -> Any:
+    """Build an OperationalError shaped like a cold-managed-DB failure."""
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError(statement=None, params=None, orig=Exception(msg))
+
+
+def test_run_migrations_with_retry_succeeds_first_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy DB migrates on the first attempt with no sleeping."""
+    engine = MagicMock()
+    calls: dict[str, int] = {"migrate": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        calls["migrate"] += 1
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        engine_factory=lambda _uri: engine,
+        sleep=slept.append,
+    )
+
+    assert calls["migrate"] == 1
+    assert slept == []
+    # The engine is always disposed, even on the happy path.
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_recovers_after_cold_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient OperationalErrors are retried until one attempt succeeds.
+
+    Each attempt must use a FRESH engine (a poisoned pool from a failed
+    connect is never reused), and every engine created must be disposed.
+    """
+    engines: list[MagicMock] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock(name=f"engine{len(engines)}")
+        engines.append(e)
+        return e
+
+    attempts: dict[str, int] = {"n": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        backoff_seconds=2.0,
+        engine_factory=_factory,
+        sleep=slept.append,
+    )
+
+    assert attempts["n"] == 3
+    # A distinct engine per attempt, each disposed exactly once.
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # Linear backoff between the two failed attempts: 2.0*1, 2.0*2.
+    assert slept == [2.0, 4.0]
+
+
+def test_run_migrations_with_retry_raises_after_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB that never comes up fails loudly after max_attempts."""
+    from sqlalchemy.exc import OperationalError
+
+    def _always_cold(_engine: Any, _uri: str) -> None:
+        raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _always_cold)
+    engines: list[MagicMock] = []
+    slept: list[float] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock()
+        engines.append(e)
+        return e
+
+    with pytest.raises(OperationalError):
+        run_migrations_with_retry(
+            "postgresql://x",
+            max_attempts=3,
+            backoff_seconds=1.0,
+            engine_factory=_factory,
+            sleep=slept.append,
+        )
+
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # No sleep after the final (raising) attempt.
+    assert slept == [1.0, 2.0]
+
+
+def test_run_migrations_with_retry_propagates_non_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real migration/schema error is NOT retried — it surfaces at once."""
+
+    def _bad_migration(_engine: Any, _uri: str) -> None:
+        raise ValueError("bad revision")
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _bad_migration)
+    engine = MagicMock()
+    slept: list[float] = []
+
+    with pytest.raises(ValueError, match="bad revision"):
+        run_migrations_with_retry(
+            "postgresql://x",
+            engine_factory=lambda _uri: engine,
+            sleep=slept.append,
+        )
+
+    # Failed on the first attempt without retrying, but still disposed.
+    assert slept == []
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_rejects_bad_max_attempts() -> None:
+    """max_attempts < 1 is a programming error, not a runtime retry."""
+    with pytest.raises(ValueError, match="max_attempts"):
+        run_migrations_with_retry("postgresql://x", max_attempts=0)

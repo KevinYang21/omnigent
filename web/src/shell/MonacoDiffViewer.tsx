@@ -8,12 +8,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DiffEditor, type DiffEditorProps, type DiffOnMount } from "@monaco-editor/react";
-import { useTheme } from "next-themes";
-import { normalizeResolvedTheme } from "@/components/theme/themeMode";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import {
   codeFontFamilyForEditor,
-  readCodeFontFamily,
-  readCodeFontSizePx,
+  readCodeFont,
   subscribeCodeFont,
 } from "@/lib/codeFontPreferences";
 import type { Comment } from "@/hooks/useComments";
@@ -74,8 +72,7 @@ export function MonacoDiffViewer({
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const lang = detectLang(path);
-  const { resolvedTheme } = useTheme();
-  const monacoTheme = resolvedThemeToMonaco(normalizeResolvedTheme(resolvedTheme));
+  const monacoTheme = resolvedThemeToMonaco(useResolvedThemeMode());
 
   // Gate rendering until Shiki has registered the github themes + this file's
   // grammar (so the diff never flashes Monaco's default 'vs' theme); surface an
@@ -150,13 +147,14 @@ export function MonacoDiffViewer({
 
   // Apply live code-font changes to both diff panes. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new
-  // size/family must be pushed imperatively; the options memo seeds the initial
+  // options must be pushed imperatively; the options memo seeds the initial
   // value at creation.
   useEffect(() => {
     return subscribeCodeFont((font) => {
       diffEditorRef.current?.updateOptions({
         fontSize: font.sizePx,
         fontFamily: codeFontFamilyForEditor(font.family),
+        fontWeight: String(font.weight),
       });
     });
   }, []);
@@ -174,8 +172,9 @@ export function MonacoDiffViewer({
     path,
   });
 
-  const options = useMemo<DiffEditorProps["options"]>(
-    () => ({
+  const options = useMemo<DiffEditorProps["options"]>(() => {
+    const font = readCodeFont();
+    return {
       readOnly: true, // modified side: view + select + comment, no editing
       originalEditable: false,
       renderSideBySide: layout === "split",
@@ -190,8 +189,9 @@ export function MonacoDiffViewer({
       // changes arrive via updateOptions in the effect above. An unset family
       // resolves to the shared mono stack, so the diff matches the terminal
       // rather than falling back to Monaco's own platform default.
-      fontSize: readCodeFontSizePx(),
-      fontFamily: codeFontFamilyForEditor(readCodeFontFamily()),
+      fontSize: font.sizePx,
+      fontFamily: codeFontFamilyForEditor(font.family),
+      fontWeight: String(font.weight),
       automaticLayout: true,
       renderOverviewRuler: false,
       ignoreTrimWhitespace: hideWhitespace,
@@ -201,9 +201,8 @@ export function MonacoDiffViewer({
       // Collapse long unchanged runs into expandable bands (like the old pierre
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
-    }),
-    [layout, hideWhitespace, wrapLines],
-  );
+    };
+  }, [layout, hideWhitespace, wrapLines]);
 
   return (
     <div className="flex h-full flex-col">

@@ -6,13 +6,14 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
@@ -267,6 +268,7 @@ beforeEach(() => {
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
+  clearSessionDrafts();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
@@ -320,12 +322,34 @@ describe("Sidebar session list", () => {
     expect(scroller.className).not.toContain("scrollbar-gutter");
   });
 
+  it("shows a draft icon only beside sessions with unfinished composer content", () => {
+    mockConversations([
+      conv("conv_draft", "Codex", { title: "Draft session" }),
+      conv("conv_empty", "Codex", { title: "Empty session" }),
+    ]);
+    renderSidebar();
+
+    const draftRow = screen.getByText("Draft session").closest("li")!;
+    const emptyRow = screen.getByText("Empty session").closest("li")!;
+    expect(within(draftRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+
+    act(() => setSessionDraft("conv_draft", { text: "unfinished message", files: [] }));
+
+    const indicator = within(draftRow).getByTestId("conversation-draft-indicator");
+    expect(indicator).toHaveAccessibleName("Draft");
+    expect(indicator.parentElement).toHaveClass("absolute", "right-1");
+    expect(within(emptyRow).queryByTestId("conversation-draft-indicator")).toBeNull();
+  });
+
   it("uses balanced title padding until row actions are revealed", () => {
     mockConversations([conv("conv_balanced", "Codex", { title: "Balanced row title" })]);
     renderSidebar();
 
     const row = screen.getByText("Balanced row title").closest("a")!;
-    expect(row).toHaveClass("pr-28", "md:pr-2");
+    // Mobile drops the pin + kebab, so at rest it reserves the same slim `pr-2`
+    // as desktop; only desktop hover widens it for the revealed controls.
+    expect(row).toHaveClass("pr-2");
+    expect(row.className).not.toMatch(/(?:^|\s)pr-28(?:\s|$)/);
     expect(row.className).toContain("md:group-hover:pr-14");
     // Keyed on `:focus-visible`, matching when the trailing controls appear and
     // the state marker fades. `focus-within` would also fire for a plain click,
@@ -362,6 +386,34 @@ describe("Sidebar session list", () => {
     // not react to — the mismatch that put the title under the selected row's
     // tag.
     expect(row.className).not.toContain("focus-within");
+  });
+
+  it("centers a row's dot marker in a size-6 slot at the right-1 edge", () => {
+    // The row dot and the collapsed-project dot share this geometry so they
+    // line up vertically; keep the row side pinned here.
+    mockConversations([
+      conv("conv_running", "Claude Code", { title: "Running row", status: "running" }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("right-1", "w-6", "justify-center");
+  });
+
+  it("does not constrain a row's awaiting pill to the dot slot", () => {
+    // The "Needs response" pill is wider than the dot markers; the size-6 box
+    // would clip its label, so the pill keeps its natural width.
+    mockConversations([
+      conv("conv_awaiting", "Claude Code", {
+        title: "Awaiting row",
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).toHaveClass("right-1");
+    expect(slot).not.toHaveClass("w-6");
   });
 
   it("offers the four display filters and defaults to My sessions", () => {
@@ -675,17 +727,20 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
     expect(selectSessions.parentElement).toHaveClass(
-      "md:opacity-0",
-      "md:group-hover/header:opacity-100",
-      "md:group-focus-within/header:opacity-100",
-      "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
     const filterSessions = within(sessionsSection!).getByRole("button", {
       name: "Filter sessions",
     });
+    // The filter never fades; its wrapper re-enables hit-testing inside the
+    // pointer-events-gated outer box (see the overlay hit-test spec below).
     expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
-    expect(filterSessions.parentElement).toHaveClass("absolute", "right-1", "flex");
+    expect(filterSessions.parentElement).toHaveClass("pointer-events-auto", "flex");
+    expect(filterSessions.parentElement!.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
@@ -1673,28 +1728,137 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("folds the new-session pencil into the kebab on mobile", async () => {
-    // The pencil is desktop-only (max-md:hidden); on mobile the same action is
-    // offered as a md:hidden "New session" kebab item pre-filed under the
-    // project (same ?project= link as the pencil).
+  it("keeps New session in the project menu when the pencil requires hover", async () => {
+    // The pencil is a redundant shortcut for the kebab's always-present "New
+    // session" item, so without a fine hover pointer it is genuinely absent
+    // (display:none via `hidden`), NOT sr-only — an sr-only pencil would stay
+    // focusable and announce a duplicate "New session" alongside the kebab's
+    // item. On hover+fine it is display-flex, revealed on hover/focus by the
+    // overlay's opacity. The kebab (not this pencil) carries the touch a11y path.
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderSidebar();
 
-    // Pencil stays in the tree but is hidden below the md breakpoint.
-    expect(screen.getByTestId("project-new-session")).toHaveClass("max-md:hidden");
+    const pencil = screen.getByTestId("project-new-session");
+    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
+    // Genuinely absent on touch — not merely clipped — so it leaves the a11y
+    // tree and tab order, unlike the kebab.
+    // Separate assertions: toHaveClass with multiple classes only fails when
+    // ALL are present, so a partial regression (e.g. adding just `sr-only`)
+    // would slip past a combined negation while clipping the pencil invisible
+    // on hover+fine.
+    expect(pencil).not.toHaveClass("sr-only");
+    expect(pencil).not.toHaveClass("focus-visible:not-sr-only");
 
-    // Open the kebab → a mobile-only "New session" item linking to the same
-    // pre-filed composer.
+    // The menu remains a touch/long-press fallback even when the hover shortcut
+    // is eligible, because a touchscreen tap cannot reveal that shortcut first.
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).toHaveClass("md:hidden");
+    for (const hiddenClass of [
+      "hidden",
+      "md:hidden",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
+    ]) {
+      expect(menuItem).not.toHaveClass(hiddenClass);
+    }
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+  });
+
+  it("keeps the project kebab off the row but reachable without a fine hover pointer", () => {
+    // jsdom can't evaluate @media, so the capability contract is asserted via
+    // classes; the recorded demo is the behavioral guardrail. The base classes
+    // stand for every pointer lacking fine hover — a 390px phone and an 810px
+    // unfolded foldable alike (coarse, hover:none) — where the kebab is
+    // sr-only: absent from the row, zero layout, yet in the a11y tree.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByTestId("project-actions");
+    // sr-only at rest; revealed only where a fine hover pointer exists, at ANY
+    // width — no md gate that would drop it on a narrow hover desktop.
+    expect(kebab).toHaveClass(
+      "sr-only",
+      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
+      "[@media((hover:hover)_and_(pointer:fine))]:flex",
+    );
+    // Never display:none — that would strip it from the a11y tree and tab order
+    // on touch, where the long-press contextmenu isn't reliably dispatched.
+    expect(kebab).not.toHaveClass("hidden");
+    // Keyboard focus un-clips it (`:focus-visible` isn't raised by a touch tap),
+    // so a sighted keyboard/switch user on a touchscreen laptop gets a visible
+    // focus ring instead of one clipped off-screen.
+    expect(kebab).toHaveClass("focus-visible:not-sr-only");
+    // No un-capability-gated display utility at md would re-expose it on a wide
+    // touch screen (the reported foldable bug) — broader than the one literal.
+    for (const cls of kebab.classList) {
+      expect(cls).not.toMatch(
+        /^md:(flex|inline-flex|block|inline-block|inline|grid|inline-grid|table|contents|flow-root)$/,
+      );
+    }
+  });
+
+  it("gives the touch kebab the sr-only (not display:none) class contract", () => {
+    // The touch/coarse case (390px and 810px). No CSS is loaded in jsdom, so a
+    // display:none button is equally findable/focusable here — the meaningful
+    // guard is the class contract: sr-only (kept in the a11y tree, unlike
+    // `hidden`) plus focus-visible:not-sr-only (a focused control becomes
+    // visible). The demo is the behavioral guardrail for the effective render.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
+    expect(kebab).toHaveClass("sr-only", "focus-visible:not-sr-only");
+    expect(kebab).not.toHaveClass("hidden");
+  });
+
+  it("reveals the folder kebab on hover at every width, narrow hover desktops included", () => {
+    // The regression case: a fine-pointer, hover-capable desktop narrower than
+    // md (~500px window) and a wide 1280px desktop share one gate. The reveal
+    // keys off the pointer capability alone (no md), so hover brings the kebab
+    // back at any width instead of stranding a mouse-only user in a narrow
+    // window. jsdom can't evaluate @media; the demo shows the effective reveal.
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const kebab = screen.getByTestId("project-actions");
+    const revealWrapper = kebab.closest("div[class*=transition-opacity]")!;
+    // Opacity reveal is capability-gated with NO md: hidden at rest, shown on
+    // hover, at every width for a fine hover pointer.
+    expect(revealWrapper).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100",
+    );
+    for (const cls of revealWrapper.classList) {
+      expect(cls).not.toMatch(/:md:opacity-0$/);
+    }
+    // A collapsed folder (marker shown) protects that marker from the kebab's
+    // at-rest hit target with the same capability-only (no md) gate, so a
+    // narrow hover desktop doesn't let an invisible control swallow the tap.
+    const outerBox = kebab.closest("div[class*=absolute]")!;
+    expect(outerBox).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto",
+    );
+    for (const cls of outerBox.classList) {
+      expect(cls).not.toMatch(/:md:pointer-events-none$/);
+    }
   });
 });
 
@@ -1744,6 +1908,67 @@ describe("Sidebar collapsed project marker", () => {
 
     const header = screen.getByRole("button", { name: /^Customer X/ });
     expect(within(header).queryByText("Needs response")).toBeNull();
+  });
+
+  // A dot/spinner marker on a collapsed project must sit in the same size-6
+  // centered slot as a row's badge (pulled to the right-1 edge, offsetting the
+  // folder button's px-2), so the dots line up vertically down the sidebar
+  // instead of the folder dot drifting right of the rows above it.
+  it("aligns a collapsed-project dot marker with the row badge slot", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_running", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    // Fixed centered box so the dot centers on the same vertical line as the
+    // rows' dots.
+    expect(slot).toHaveClass("w-6", "justify-center");
+    // Hover-only controls never reserve a rest column, keeping the marker at
+    // the rows' right edge.
+    expect(slot).toHaveClass("-mr-1");
+    expect(slot).not.toHaveClass("mr-14");
+    expect(slot).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
+    // The hover-driven fades track the fine-hover reveal (hover only exists on
+    // fine), so they stay pointer-gated with no md.
+    expect(slot).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
+    );
+    // The focus-within fade tracks the pointer-UNgated focus-visible reveal, so
+    // it is ungated too: a coarse-pointer tablet + keyboard can focus the kebab,
+    // and the spinner must clear there as well or the revealed kebab overlaps
+    // it. Asserted separately below (it must NOT carry the pointer/hover gate).
+    expect(slot).toHaveClass("group-has-[[data-header-controls]:focus-within]/header:opacity-0");
+    expect(slot).not.toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+    );
+    // No width-gated fade survives for a hover-only action — that mismatch is
+    // the narrow-hover overlap regression.
+    for (const cls of slot.classList) {
+      expect(cls).not.toMatch(/:md:group-(hover|has-).*opacity-0$/);
+    }
+  });
+
+  // The "awaiting" pill is wider than the dot markers; constraining it to the
+  // size-6 box would clip its "Needs response" label, so it keeps its natural
+  // width.
+  it("does not constrain the collapsed-project awaiting pill to the dot slot", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_awaiting", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    const slot = screen.getByTestId("session-state-badge").parentElement!;
+    expect(slot).not.toHaveClass("w-6");
   });
 });
 
@@ -1953,6 +2178,18 @@ describe("Sidebar active-row auto-scroll", () => {
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "center" });
 
+    vi.restoreAllMocks();
+  });
+
+  it("hides the draft indicator for the active conversation", () => {
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
+    mockConversations([conv("conv_active", "Claude Code", { title: "Active draft" })]);
+    setSessionDraft("conv_active", { text: "visible in the open composer", files: [] });
+
+    renderAtRoute("/c/conv_active");
+
+    const row = screen.getByText("Active draft").closest("li")!;
+    expect(within(row).queryByTestId("conversation-draft-indicator")).toBeNull();
     vi.restoreAllMocks();
   });
 
