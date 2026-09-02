@@ -431,6 +431,45 @@ def _acknowledge_codex_model_migration(codex_home: Path, model: str, target: str
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
+def _suppress_codex_startup_prompts(codex_home: Path) -> None:
+    """Silence Codex's interactive startup prompts in the private config.
+
+    A runner-owned ``--remote`` TUI runs detached in a tmux pane, so an
+    interactive prompt shown *before* the app-server thread is created has
+    nobody to answer it — the pane sits blocked and thread discovery times
+    out. Pre-set the known startup gates so the TUI boots straight into a
+    usable session:
+
+    * ``check_for_update_on_startup`` off — the "a new Codex is available,
+      press 1 to update" nag;
+    * ``[notice].max_migration_prompt = 0`` — the "a new model is
+      available, press 1 to try it / 2 to keep yours" advertisement, for
+      every session (the per-model ``model_migrations`` acknowledgement
+      only covers a pinned model with a known upgrade target);
+    * the ``[notice]`` warning nudges that can also gate first render.
+
+    These are real Codex config fields, so they are safe even under Codex's
+    strict "error on unknown config" mode. The config is a private per-session
+    copy; the user's shared ``~/.codex/config.toml`` is never touched.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :returns: None.
+    """
+    config_path = codex_home / "config.toml"
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    document["check_for_update_on_startup"] = False
+    notice = document.get("notice")
+    if notice is None:
+        notice = tomlkit.table()
+        document["notice"] = notice
+    notice["max_migration_prompt"] = 0
+    notice["hide_rate_limit_model_nudge"] = True
+    notice["hide_full_access_warning"] = True
+    notice["hide_world_writable_warning"] = True
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
 def _inject_mcp_server_config(
     codex_home: Path,
     bridge_dir: Path,
@@ -1225,6 +1264,10 @@ class CodexNativeAppServer:
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
+            # Same headless rationale as the trust screen: the detached
+            # ``--remote`` TUI cannot answer a startup prompt, so silence the
+            # update nag / model advertisement before it renders.
+            _suppress_codex_startup_prompts(self.codex_home)
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
         # by `codex app-server`, so we write directly to the file.

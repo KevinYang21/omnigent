@@ -1986,6 +1986,34 @@ def test_acknowledge_codex_model_migration_updates_private_config(tmp_path: Path
     assert config["notice"]["model_migrations"] == {"gpt-5.4": "gpt-5.6-terra"}
 
 
+def test_suppress_codex_startup_prompts_disables_update_and_model_prompts(
+    tmp_path: Path,
+) -> None:
+    """Startup-prompt suppression turns off the update nag and model advert.
+
+    The detached ``--remote`` TUI cannot answer either prompt, so both must
+    be silenced in the private config before it renders — for any session,
+    not just a pinned model with a known migration target.
+    """
+    from omnigent.codex_native_app_server import _suppress_codex_startup_prompts
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    # A pre-existing user notice and top-level key must survive the merge.
+    config_path.write_text('model = "gpt-5"\n[notice]\nmodel_migrations = {}\n', encoding="utf-8")
+
+    _suppress_codex_startup_prompts(codex_home)
+
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert config["model"] == "gpt-5"
+    assert config["check_for_update_on_startup"] is False
+    assert config["notice"]["max_migration_prompt"] == 0
+    assert config["notice"]["hide_rate_limit_model_nudge"] is True
+    # The user's own notice table is preserved, not clobbered.
+    assert config["notice"]["model_migrations"] == {}
+
+
 def test_routed_spawn_note_appends_then_restores_the_user_base(tmp_path: Path) -> None:
     """The codex routed-spawn note rides ``developer_instructions``, reversibly.
 
