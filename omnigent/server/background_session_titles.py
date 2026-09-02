@@ -18,7 +18,6 @@ from omnigent.entities.conversation import (
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
 from omnigent.runner.background_titles.service import (
-    BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS,
     FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
 )
 from omnigent.stores.conversation_store import ConversationStore
@@ -99,16 +98,14 @@ class RunnerBackgroundTitleGenerator:
             "model_override": request.model_override,
             "sub_agent_name": request.sub_agent_name,
         }
+        # Append the framework language rule after any operator instructions;
+        # a new Runner deduplicates the bare suffix back to the default prompt.
         custom = request.additional_instructions.strip() if request.additional_instructions else ""
-        combined = f"{custom}\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}" if custom else ""
-        if custom and len(combined) > BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS:
-            # Operator instructions take precedence. Do not discard their
-            # trailing language override merely to append the framework rule.
-            body["additional_instructions"] = custom[
-                :BACKGROUND_TITLE_MAX_ADDITIONAL_INSTRUCTIONS_CHARS
-            ]
-        else:
-            body["additional_instructions"] = combined or FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
+        body["additional_instructions"] = (
+            f"{custom}\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
+            if custom
+            else FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION
+        )
         response = await routed.client.post(
             f"/v1/sessions/{request.session_id}/background-title",
             json=body,
