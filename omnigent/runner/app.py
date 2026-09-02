@@ -1512,7 +1512,16 @@ class _SubagentDeliveryAck:
 _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
-_subagent_recovery_scanned_parents: set[str] = set()
+# Parent ids whose restart-recovery scan completed, mapped to a monotonic
+# expiry. A fresh entry keeps sys_read_inbox cheap; expiry bounds how long a
+# terminal-report callback lost AFTER a successful scan can strand a result
+# (the next drain past the deadline re-reads durable server state).
+_subagent_recovery_scan_deadlines: dict[str, float] = {}
+_SUBAGENT_RECOVERY_SCAN_TTL_S = 60.0
+# Per-parent single-flight guard: concurrent initializations (or an init
+# racing a sys_read_inbox drain) must not interleave two scans, or both can
+# pass the registry check and enqueue the same child result twice.
+_subagent_recovery_locks: dict[str, asyncio.Lock] = {}
 
 # Per-(parent, agent_type) monotonic ordinal counter for structured
 # sub-agent names (e.g. "researcher-1", "researcher-2").
@@ -1711,10 +1720,13 @@ def _parent_items_confirm_subagent_drained(
     """
     Return whether persisted parent history proves a child result was drained.
 
-    ``sys_read_inbox`` output contains the child conversation id in the
-    rendered ``[System: sub-agent task ...]`` line.  Comparing item time with
-    the child's latest update distinguishes a prior drain from a later turn
-    completed on the same continued child session.
+    ``sys_read_inbox`` output renders each delivery as a structured
+    ``[System: sub-agent task <child_id> ...]`` line, so the match requires
+    that exact header — a bare substring match would let *another* child's
+    output that merely mentions this conversation id read as an
+    acknowledgement and permanently drop an undelivered result.  Comparing
+    item time with the child's latest update distinguishes a prior drain
+    from a later turn completed on the same continued child session.
 
     :param items: Parent conversation item dictionaries from the sessions API.
     :param child_id: Child conversation id, e.g. ``"conv_child456"``.
@@ -1726,6 +1738,9 @@ def _parent_items_confirm_subagent_drained(
     """
     if not isinstance(completed_at, (int, float)) or isinstance(completed_at, bool):
         return False
+    # The rendered header written by the inbox drain for this child. Keyed on
+    # the delivery payload's handle_id (== the child conversation id).
+    drained_marker = f"sub-agent task {child_id} "
     inbox_call_ids = {
         raw_item.get("call_id")
         for raw_item in items
@@ -1743,7 +1758,7 @@ def _parent_items_confirm_subagent_drained(
         if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
             continue
         output = raw_item.get("output")
-        if created_at >= completed_at and isinstance(output, str) and child_id in output:
+        if created_at >= completed_at and isinstance(output, str) and drained_marker in output:
             return True
     return False
 
@@ -2004,12 +2019,22 @@ async def _recover_subagent_results_from_server(
     parent_window = await _get_compacted_session_api_items(server_client, parent_id)
     if parent_window is None:
         return False
+    # Drain acknowledgements older than the parent's latest compaction live in
+    # the compaction snapshot, not the post-boundary window. Include them so a
+    # compacted acknowledgement still suppresses a replay; when the snapshot
+    # kept no messages the check degrades to at-least-once (a duplicate is
+    # recoverable, a dropped result is not).
+    parent_items = list(parent_window.items)
+    if parent_window.compaction is not None:
+        compacted = parent_window.compaction.get("compacted_messages")
+        if isinstance(compacted, list):
+            parent_items = [item for item in compacted if isinstance(item, dict)] + parent_items
     for child in terminal_children:
         recovered = await _recover_terminal_subagent_child(
             server_client=server_client,
             parent_id=parent_id,
             child=child,
-            parent_items=parent_window.items,
+            parent_items=parent_items,
             schedule_wake=schedule_wake,
         )
         if not recovered:
@@ -4338,7 +4363,8 @@ def create_runner_app(
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
-        _subagent_recovery_scanned_parents.discard(session_id)
+        _subagent_recovery_scan_deadlines.pop(session_id, None)
+        _subagent_recovery_locks.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
         _stranded_wake_parents.discard(session_id)
         _last_rewake_notice.pop(session_id, None)
@@ -4830,27 +4856,45 @@ def create_runner_app(
         :returns: None.
         """
         inbox = _session_inboxes.get(parent_id)
-        if inbox is None or parent_id in _subagent_recovery_scanned_parents:
+        if inbox is None:
             return
-        try:
-            completed = await _recover_subagent_results_from_server(
-                server_client=server_client,
-                parent_id=parent_id,
-                schedule_wake=_schedule_subagent_wake,
-            )
-            if completed:
-                _subagent_recovery_scanned_parents.add(parent_id)
-        except (httpx.HTTPError, RuntimeError, TypeError, ValueError):
-            # Recovery is best-effort during initialization.  A server outage
-            # must not prevent the parent session itself from reconnecting;
-            # the child's terminal-status retry remains the second recovery
-            # path once connectivity returns.
-            _logger.warning(
-                "Failed to recover undrained sub-agent results for %s",
-                parent_id,
-                exc_info=True,
-                extra={"session_id": parent_id},
-            )
+        deadline = _subagent_recovery_scan_deadlines.get(parent_id)
+        if deadline is not None and time.monotonic() < deadline:
+            return
+        # Single-flight per parent: without the lock, an init racing a
+        # sys_read_inbox drain can run two scans that each pass the registry
+        # check before the other registers, double-delivering one result.
+        lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
+        async with lock:
+            deadline = _subagent_recovery_scan_deadlines.get(parent_id)
+            if deadline is not None and time.monotonic() < deadline:
+                return
+            try:
+                completed = await _recover_subagent_results_from_server(
+                    server_client=server_client,
+                    parent_id=parent_id,
+                    schedule_wake=_schedule_subagent_wake,
+                )
+                if completed:
+                    # A TTL rather than a permanent memo: a child that goes
+                    # terminal AFTER a clean scan, whose completion callback
+                    # is lost, must still be recoverable by a later drain.
+                    _subagent_recovery_scan_deadlines[parent_id] = (
+                        time.monotonic() + _SUBAGENT_RECOVERY_SCAN_TTL_S
+                    )
+            except (httpx.HTTPError, httpx.InvalidURL, RuntimeError, TypeError, ValueError):
+                # Recovery is best-effort during initialization.  A server
+                # outage must not prevent the parent session itself from
+                # reconnecting; the child's terminal-status retry remains the
+                # second recovery path once connectivity returns.
+                # (httpx.InvalidURL is construction-time and NOT an
+                # httpx.HTTPError, so it is listed explicitly.)
+                _logger.warning(
+                    "Failed to recover undrained sub-agent results for %s",
+                    parent_id,
+                    exc_info=True,
+                    extra={"session_id": parent_id},
+                )
 
     app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
 
