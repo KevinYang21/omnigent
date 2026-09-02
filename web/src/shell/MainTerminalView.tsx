@@ -59,11 +59,6 @@ interface MainTerminalViewProps {
   runnerOnline?: boolean;
   /** Relaunch or reconnect the session without replaying user input. */
   onResume?: () => void | Promise<void>;
-  /**
-   * Exposes the outer terminal surface so native bottom chrome is shown only
-   * while this surface is actually frontmost.
-   */
-  onSurfaceElement?: (element: HTMLElement | null) => void;
 }
 
 export function MainTerminalView({
@@ -73,7 +68,6 @@ export function MainTerminalView({
   readOnly = false,
   runnerOnline,
   onResume,
-  onSurfaceElement,
 }: MainTerminalViewProps) {
   const { terminals } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
@@ -156,19 +150,13 @@ export function MainTerminalView({
     (terminals.length > 0 ? agentTerminal : null);
   // A user shell opened from the rail takes over the pane chrome-free:
   // a single header row naming the shell plus a close X — no agent tab
-  // (the shell is not the agent). The Chat/Terminal pill is hidden in
-  // this state too (ConnectionIndicator gates on the context's
+  // (the shell is not the agent). The header Chat/Terminal switcher is
+  // hidden in this state too (ViewModeToggle gates on the context's
   // `isShellView`), so the X is the way back to chat.
   const isShellView =
     (terminalFirstCtx?.isTerminalFirst ?? false) &&
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
-  const setSurfaceElement = useCallback(
-    (element: HTMLDivElement | null) => {
-      onSurfaceElement?.(element);
-    },
-    [onSurfaceElement],
-  );
 
   return (
     // Outer wrapper fills the main column. `pt-14` clears the 56px
@@ -178,10 +166,9 @@ export function MainTerminalView({
     // `px-3` gives a
     // 12px gutter on
     // the sides. The card stretches to full width and height of the
-    // available area. The ConnectionIndicator pill renders just below
+    // available area. The ConnectionIndicator band renders just below
     // this wrapper in ChatPage's MainAgentSurface.
     <div
-      ref={setSurfaceElement}
       data-testid="main-terminal-view"
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).

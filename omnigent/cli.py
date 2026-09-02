@@ -57,6 +57,12 @@ from omnigent.config import (
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.daemon_lifecycle import (
+    DAEMON_CONFIG_SIG_ENV_VAR,
+)
+from omnigent.host.daemon_lifecycle import (
+    HostDaemonRecord as _HostDaemonRecord,
+)
+from omnigent.host.daemon_lifecycle import (
     daemon_record_path as _daemon_record_path_for,
 )
 from omnigent.host.daemon_lifecycle import (
@@ -68,6 +74,7 @@ from omnigent.host.daemon_lifecycle import (
 from omnigent.host.daemon_lifecycle import (
     record_flock_is_held as _record_flock_is_held,
 )
+from omnigent.host.daemon_lifecycle import write_daemon_record as _write_daemon_record_impl
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     _pid_alive,
@@ -2423,46 +2430,6 @@ def _is_local_server_request(server: str | None) -> bool:
 
 
 @dataclass(frozen=True)
-class _HostDaemonRecord:
-    """
-    Local registry record for one background host daemon.
-
-    :param pid: Process id of the background daemon, e.g. ``4242``.
-    :param target: Normalized daemon target, e.g.
-        ``"https://example.databricksapps.com"`` or ``"local"``.
-    :param mode: Launch mode, either ``"server"`` or ``"local"``.
-    :param server_url: Normalized requested server URL for ``"server"``
-        mode, e.g. ``"https://example.databricksapps.com"``. ``None``
-        for local mode.
-    :param log_path: Daemon log file path, e.g.
-        ``"/Users/me/.omnigent/logs/host/host-abc.log"``.
-    :param started_at: Unix epoch seconds when the daemon was spawned,
-        e.g. ``1710000000``.
-    :param host_id: Local host id advertised to Omnigent servers, e.g.
-        ``"host_abc123"``. ``None`` for legacy records.
-    :param resolved_server_url: Concrete local server URL discovered for
-        local mode, e.g. ``"http://127.0.0.1:8123"``. ``None`` until
-        discovery succeeds or for remote mode.
-    :param config_sig: Signature of the server-affecting config (resolved
-        auth source) the daemon was spawned under, e.g.
-        ``"3f9a1c2b4d5e6f70"`` (see :func:`_server_config_signature`).
-        ``None`` for legacy records written before config-signature
-        tracking existed; a ``None`` signature is never treated as a
-        config mismatch (we can't know what it was started with).
-    """
-
-    pid: int
-    target: str
-    mode: str
-    server_url: str | None
-    log_path: str | None
-    started_at: int
-    host_id: str | None = None
-    resolved_server_url: str | None = None
-    config_sig: str | None = None
-
-
-@dataclass(frozen=True)
 class _HostHttpResult:
     """
     Decoded Omnigent management HTTP response.
@@ -2701,9 +2668,7 @@ def _write_daemon_record(record: _HostDaemonRecord) -> None:
     :param record: Record to write, e.g. a local daemon record with
         ``target == "local"``.
     """
-    path = _daemon_record_path(record.target)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(record), indent=2, sort_keys=True) + "\n")
+    _write_daemon_record_impl(record, base_dir=_HOST_PID_PATH.parent)
 
 
 def _delete_daemon_record(record: _HostDaemonRecord) -> None:
@@ -3061,34 +3026,26 @@ def _spawn_host_daemon_process(
     return _SpawnedDaemonProcess(pid=proc.pid, log_path=str(log_path))
 
 
-def _persist_spawned_daemon(
-    *,
+_DAEMON_CLAIM_TIMEOUT_S = 10.0
+
+
+def _wait_for_daemon_claim(
     target: str,
     spawned: _SpawnedDaemonProcess,
-    config_sig: str,
-) -> None:
-    """
-    Persist registry and legacy pidfile entries for a spawned daemon.
-
-    :param target: Normalized daemon target, e.g. ``"local"``.
-    :param spawned: Spawned process metadata.
-    :param config_sig: Config signature this daemon was spawned under,
-        e.g. ``"3f9a1c2b4d5e6f70"`` (see :func:`server_config_signature`).
-    """
-    mode = "local" if target == _LOCAL_DAEMON_MARKER else "server"
-    _write_daemon_record(
-        _HostDaemonRecord(
-            pid=spawned.pid,
-            target=target,
-            mode=mode,
-            server_url=None if mode == "local" else target,
-            log_path=spawned.log_path,
-            started_at=int(time.time()),
-            host_id=_load_existing_host_id(),
-            config_sig=config_sig,
-        )
-    )
-    _HOST_PID_PATH.write_text(f"{spawned.pid}\n{target}\n")
+    *,
+    timeout_s: float = _DAEMON_CLAIM_TIMEOUT_S,
+) -> _HostDaemonRecord | None:
+    """Wait for a spawned daemon (or its concurrent winner) to claim *target*."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        record = _find_daemon_record(target)
+        if record is not None and _daemon_owner_is_live(record, target):
+            return record
+        if time.monotonic() >= deadline:
+            return None
+        # A losing child exits promptly, but the winner's process may still be
+        # importing and writing the shared record from a concurrent launcher.
+        time.sleep(0.02 if _pid_alive(spawned.pid) else 0.05)
 
 
 def _foreground_daemon_record(
@@ -3248,17 +3205,23 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
     args = [sys.executable, "-m", "omnigent.host._daemon_entry", *mode_args]
-    spawned = _spawn_host_daemon_process(
-        args=args,
-        env=_build_host_daemon_env(server_url=server_url),
-    )
+    config_sig = server_config_signature(include_features=not server_url)
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
+    spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
         return False
-    _persist_spawned_daemon(
-        target=target,
-        spawned=spawned,
-        config_sig=server_config_signature(include_features=not server_url),
-    )
+    if _wait_for_daemon_claim(target, spawned) is None:
+        # The spawned daemon (or a concurrent winner) never wrote its record:
+        # it likely crashed during startup. Point at its log so the failure is
+        # diagnosable instead of silently absent from `host status`.
+        logging.getLogger(__name__).warning(
+            "host daemon for %s did not claim its registry record within %.0fs; "
+            "see %s for the daemon's own log",
+            target,
+            _DAEMON_CLAIM_TIMEOUT_S,
+            spawned.log_path,
+        )
     return decision.config_changed
 
 
@@ -12333,6 +12296,128 @@ def _ensure_bundled_agent_brain_credential(name: str) -> None:
         return
 
 
+#: Brain-fallback harness priority for bundled agents — mirrors
+#: :func:`_pick_first_run_harness` so the shorthands and bare ``omnigent``
+#: agree on which credentialed harness a launch falls back to.
+_BUNDLED_BRAIN_FALLBACK_PRIORITY = ("claude-sdk", "codex", "pi")
+
+
+def _bundled_agent_brain_harness_fallback(name: str) -> str | None:
+    """Pick a credentialed fallback harness when the brain's family has none.
+
+    Polly's and Debby's brains pin ``claude-sdk``; a user whose only
+    credential serves another family (e.g. a Codex subscription) would
+    otherwise launch a brain with no credential at all — the session starts
+    and every turn dies with another CLI's login error, even though bare
+    ``omnigent`` routes the same config to a working harness. Mirror
+    :func:`_pick_first_run_harness`'s priority over the same ambient-merged
+    config: when NO credential serves the brain's family, fall back to the
+    first harness that resolves a default, announcing the reroute (to
+    stderr) so the user knows which credential the brain runs on.
+
+    Deliberately narrow: any credential serving the brain's family keeps
+    the declared brain (a non-default one is promoted by
+    :func:`_ensure_bundled_agent_brain_credential`), and any config read
+    error degrades to a no-op so the launch surfaces its own error.
+
+    :param name: Bundled example directory name, e.g. ``"polly"``.
+    :returns: The canonical fallback harness id, e.g. ``"codex"``, or
+        ``None`` when the brain should keep its declared harness.
+    """
+    from omnigent.errors import OmnigentError
+    from omnigent.onboarding.configure_models import family_label
+    from omnigent.onboarding.detected import effective_config_with_detected
+    from omnigent.onboarding.provider_config import (
+        default_provider_for_harness,
+        first_available_provider,
+        harness_family,
+        load_config,
+    )
+
+    brain_harness = _bundled_agent_brain_harness(name)
+    if brain_harness is None:
+        return None
+    family = harness_family(brain_harness)
+    if family is None:
+        return None
+    try:
+        config = effective_config_with_detected(load_config())
+        if first_available_provider(config, family) is not None:
+            return None
+        for candidate in _BUNDLED_BRAIN_FALLBACK_PRIORITY:
+            if candidate == brain_harness:
+                continue
+            provider = default_provider_for_harness(config, candidate)
+            if provider is None:
+                continue
+            credential_name = _credential_label(provider.name, provider)
+            click.echo(
+                f"No {family_label(family)} credential is configured — "
+                f"{name}'s brain runs on {brain_harness} by default. "
+                f"Launching on the {candidate} harness instead, using "
+                f"{credential_name}. Add a {family_label(family)} credential "
+                f"anytime with: {cli_invocation()} setup",
+                err=True,
+            )
+            return candidate
+    except (OSError, yaml.YAMLError, OmnigentError):
+        return None
+    return None
+
+
+def _bundled_brain_fallback_applies(run_args: tuple[str, ...]) -> bool:
+    """Whether this bundled launch may reroute its brain harness.
+
+    The credential-driven fallback (:func:`_bundled_agent_brain_harness_fallback`)
+    only applies to a fresh, local, unpinned launch: an explicit
+    ``--harness`` / ``--model`` is the user's own pick, a
+    resume/continue/fork re-enters a conversation whose brain is already
+    decided, and a remote ``--server`` (flag or configured default) can
+    supply the brain's routing server-side (e.g. a managed gateway), so a
+    missing local credential there is not evidence the brain can't run.
+
+    The forwarded args are parsed with ``run``'s own Click parser in
+    resilient mode (no callbacks, no prompts, errors swallowed) so
+    flag-shape handling — attached short options (``-rID``), option values
+    that merely look like flags (``-p --harness``) — agrees exactly with the
+    downstream dispatch instead of re-implementing Click's rules by hand.
+
+    :param run_args: Unparsed pass-through CLI args for ``run``.
+    :returns: ``True`` when the fallback may inject ``--harness``.
+    """
+    try:
+        with run.make_context("omnigent run", list(run_args), resilient_parsing=True) as ctx:
+            params = dict(ctx.params)
+    except click.ClickException:
+        # Malformed args — the forwarded run re-parses and reports them.
+        # (Resilient parsing swallows most of these; a partial parse at
+        # worst prints the reroute notice before the real parse rejects
+        # the command — nothing launches or mutates.)
+        return False
+    # A real --help never launches, so keep the fallback (and its notice)
+    # out. A "--help" consumed as an option VALUE (e.g. ``-p --help``) is
+    # prompt text, not a help request — the parse above resolves which.
+    if "--help" in run_args and all(
+        value != "--help" for value in params.values() if isinstance(value, str)
+    ):
+        return False
+    if params.get("harness") is not None or params.get("model") is not None:
+        return False
+    if (
+        params.get("resume") is not None
+        or params.get("resume_latest")
+        or params.get("fork_session_id") is not None
+    ):
+        return False
+    server = params.get("server")
+    if server is not None:
+        return _is_local_server_request(server)
+    configured = _load_effective_config().get("server")
+    if isinstance(configured, str) and configured and not _is_local_server_request(configured):
+        return False
+    return True
+
+
 def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
     """Reject Kiro-owned resume flags in passthrough args."""
     reserved = {"--resume", "--resume-id", "--resume-picker"}
@@ -12386,11 +12471,23 @@ def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     # Polly/Debby launch with the first available credential for their
     # brain's family when no specific one is configured up front.
     _ensure_bundled_agent_brain_credential(name)
+    # When NO credential serves the brain's family at all (e.g. a Codex-only
+    # user launching polly's claude-sdk brain), reroute the brain to the first
+    # credentialed harness — mirroring bare ``omnigent``'s first-run pick — so
+    # the session doesn't start with a credential-less brain whose every turn
+    # dies with another CLI's login error. An explicit --harness/--model or a
+    # resume/fork/remote-server launch is left alone (the user's pick, an
+    # already-decided conversation, or server-side routing wins).
+    extra_args: tuple[str, ...] = ()
+    if _bundled_brain_fallback_applies(run_args):
+        fallback_harness = _bundled_agent_brain_harness_fallback(name)
+        if fallback_harness is not None:
+            extra_args = ("--harness", fallback_harness)
     # standalone_mode=False propagates ClickExceptions to main()'s handler
     # (CLI diagnostics logging + setup hint) instead of exiting inline,
     # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
     run.main(
-        args=[_bundled_example_path(name), *run_args],
+        args=[_bundled_example_path(name), *extra_args, *run_args],
         prog_name="omnigent run",
         standalone_mode=False,
     )

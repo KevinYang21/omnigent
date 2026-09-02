@@ -117,6 +117,7 @@ from omnigent.process_logging import (
     env_truthy,
     open_process_log_file,
     process_log_dir,
+    should_log_to_stderr,
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
@@ -3874,6 +3875,7 @@ def run_host_process(
     config_path: Path | None = None,
     *,
     daemon_target: str | None = None,
+    lifecycle_lock: DaemonLifecycleLock | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -3888,12 +3890,18 @@ def run_host_process(
         ``"local"`` or a server URL. When given, the daemon binds its lifetime
         to that record (flock + self-terminate on delete/reassign). ``None``
         (the historical default) runs without the lifecycle guard.
+    :param lifecycle_lock: A lock already acquired by an auto-launched daemon
+        before it claimed the registry record. When provided, it is retained
+        for the host process lifetime instead of acquiring another handle.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
-    host_log_path = configure_process_logging("host")
+    host_log_path = configure_process_logging(
+        "host",
+        log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
+    )
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -3936,9 +3944,8 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
-    lifecycle_lock = (
-        DaemonLifecycleLock.for_target(daemon_target) if daemon_target is not None else None
-    )
+    if lifecycle_lock is None and daemon_target is not None:
+        lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     host = HostProcess(identity, server_url, lifecycle_lock=lifecycle_lock)
     try:
         asyncio.run(host.run())

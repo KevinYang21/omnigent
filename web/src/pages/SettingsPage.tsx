@@ -1183,10 +1183,10 @@ function DefaultBaseBranchControl() {
 }
 
 /**
- * Desktop UI font size stepper. Maps one of the supported discrete px values
- * into typography tokens via --desktop-ui-font-size (see
- * lib/uiFontPreferences.ts) without resizing layout or icons. Mobile keeps its
- * independent responsive size.
+ * UI font size stepper. Maps one of the supported discrete px values into
+ * typography tokens via --desktop-ui-font-size (see lib/uiFontPreferences.ts)
+ * without resizing layout or icons. Desktop reads the value directly; mobile
+ * scales its own base from it, so the setting applies on both surfaces.
  */
 function UiFontSizeControl() {
   // `px` is the committed value: clamped, persisted, and applied to the UI.
@@ -1235,7 +1235,7 @@ function UiFontSizeControl() {
       <div className="flex flex-col">
         <span className="text-ui font-medium">Interface font size</span>
         <span className="text-sm text-muted-foreground">
-          Set text across the desktop interface. Icons and spacing stay fixed.
+          Set text across the interface. Icons and spacing stay fixed.
         </span>
       </div>
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
@@ -1665,18 +1665,26 @@ function LocalCliSection() {
             </div>
           )}
 
-          <p className="text-sm text-muted-foreground">
-            For security, a custom path can only be set from the connect screen — this prevents a
-            connected server from pointing the app at a different binary. Open it from the Server
-            menu (Change Server…) and use the settings gear.
-          </p>
+          {status.customizationDisabled ? (
+            <p className="text-sm text-muted-foreground">
+              Managed by your organization. Host enrollment uses <code>isaac omni</code>.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                For security, a custom path can only be set from the connect screen — this prevents
+                a connected server from pointing the app at a different binary. Open it from the
+                Server menu (Change Server…) and use the settings gear.
+              </p>
 
-          {status.source === "configured" && (
-            <div>
-              <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
-                Reset to auto-detected
-              </Button>
-            </div>
+              {status.source === "configured" && (
+                <div>
+                  <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
+                    Reset to auto-detected
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
