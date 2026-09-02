@@ -62,6 +62,7 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
@@ -946,6 +947,28 @@ function resolvedCliPath() {
   const resolved = omnigentCli.resolveCliPath(configured);
   cachedCli = { configuredPath: configured, path: resolved ? resolved.path : null };
   return cachedCli.path;
+}
+
+/**
+ * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
+ * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
+ * Databricks-managed HTTPS server); every other window keeps the configured /
+ * auto-detected public Omnigent CLI. Returns null when the selected launcher
+ * is unavailable.
+ *
+ * @param {string | null | undefined} serverUrl
+ * @returns {string | {
+ *   executable: string,
+ *   prefixArgs: string[],
+ *   displayName: string,
+ * } | null}
+ */
+function hostCliCommand(serverUrl) {
+  const useIsaac = databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
+  if (!useIsaac) return resolvedCliPath();
+  const isaacPath = isaac.resolveIsaacPath();
+  if (!isaacPath) return null;
+  return { executable: isaacPath, prefixArgs: ["omni"], displayName: "isaac omni" };
 }
 
 /**
@@ -2787,7 +2810,10 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-cli-status is only available to the setup page");
     }
-    return omnigentCli.getCliStatus(loadSettings().omnigent_path);
+    return {
+      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+      customizationDisabled: databricksInternalFeaturesEnabled(),
+    };
   });
 
   // Setup page → set an explicit path to the `omnigent` binary. Persisted only
@@ -2798,6 +2824,13 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("set-cli-path is only available to the setup page");
     }
+    if (databricksInternalFeaturesEnabled()) {
+      return {
+        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+        customizationDisabled: true,
+        accepted: false,
+      };
+    }
     return applyCliPath(configuredPath);
   });
 
@@ -2807,6 +2840,7 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("browse-cli-path is only available to the setup page");
     }
+    if (databricksInternalFeaturesEnabled()) return null;
     const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
     const result = await dialog.showOpenDialog(win ?? undefined, {
       title: "Locate the Omnigent CLI binary",
@@ -2838,7 +2872,10 @@ function registerIpc() {
       console.warn("[omnigent] host-get-identity from untrusted sender dropped");
       return null;
     }
-    return { cliInstalled: Boolean(resolvedCliPath()), hostId: omnigentCli.localHostId() };
+    return {
+      cliInstalled: Boolean(hostCliCommand(senderServerUrl(event))),
+      hostId: omnigentCli.localHostId(),
+    };
   });
 
   // SPA (in-app Settings → Local CLI) → is the CLI installed and runnable,
@@ -2848,7 +2885,10 @@ function registerIpc() {
       console.warn("[omnigent] cli-get-status from untrusted sender dropped");
       return null;
     }
-    return omnigentCli.getCliStatus(loadSettings().omnigent_path);
+    return {
+      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+      customizationDisabled: databricksInternalFeaturesEnabled(),
+    };
   });
 
   // SPA → reset to auto-detected (clear the override). Chooses no path itself,
@@ -2860,6 +2900,12 @@ function registerIpc() {
   ipcMain.handle("omnigent:cli-reset-path", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("cli-reset-path is only available to a connected server page");
+    }
+    if (databricksInternalFeaturesEnabled()) {
+      return {
+        ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+        customizationDisabled: true,
+      };
     }
     return clearCliPath();
   });
@@ -2890,9 +2936,16 @@ function registerIpc() {
     }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    const cliPath = resolvedCliPath();
-    if (!cliPath) {
-      return { ok: false, error: "The omnigent CLI was not found. Install it or set its path." };
+    const cliCommand = hostCliCommand(serverUrl);
+    if (!cliCommand) {
+      const internal =
+        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
+      return {
+        ok: false,
+        error: internal
+          ? "The isaac CLI was not found. Install it before connecting this machine."
+          : "The omnigent CLI was not found. Install it or set its path.",
+      };
     }
     let result;
     if (action === "start" || action === "restart") {
@@ -2909,13 +2962,13 @@ function registerIpc() {
       }
       // Ensure the CLI is authenticated for a remote server first (local needs
       // none) — otherwise the host connect would just fail on a 401.
-      const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
+      const auth = await serverManager.ensureServerAuth(cliCommand, serverUrl);
       if (!auth.ok) result = { ok: false, error: auth.error, authError: auth.authError };
       else if (action === "start")
-        result = await serverManager.ensureHostConnected(cliPath, serverUrl);
-      else result = await serverManager.restartHost(cliPath, serverUrl);
+        result = await serverManager.ensureHostConnected(cliCommand, serverUrl);
+      else result = await serverManager.restartHost(cliCommand, serverUrl);
     } else if (action === "stop") {
-      result = await serverManager.disconnectHost(cliPath, serverUrl);
+      result = await serverManager.disconnectHost(cliCommand, serverUrl);
     } else {
       result = { ok: false, error: `unknown host action '${action}'` };
     }

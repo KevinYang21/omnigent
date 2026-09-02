@@ -1665,18 +1665,26 @@ function LocalCliSection() {
             </div>
           )}
 
-          <p className="text-sm text-muted-foreground">
-            For security, a custom path can only be set from the connect screen — this prevents a
-            connected server from pointing the app at a different binary. Open it from the Server
-            menu (Change Server…) and use the settings gear.
-          </p>
+          {status.customizationDisabled ? (
+            <p className="text-sm text-muted-foreground">
+              Managed by your organization. Host enrollment uses <code>isaac omni</code>.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                For security, a custom path can only be set from the connect screen — this prevents
+                a connected server from pointing the app at a different binary. Open it from the
+                Server menu (Change Server…) and use the settings gear.
+              </p>
 
-          {status.source === "configured" && (
-            <div>
-              <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
-                Reset to auto-detected
-              </Button>
-            </div>
+              {status.source === "configured" && (
+                <div>
+                  <Button variant="ghost" size="sm" disabled={busy} onClick={() => void onReset()}>
+                    Reset to auto-detected
+                  </Button>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
