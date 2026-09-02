@@ -2,8 +2,6 @@
 
 Python packages for integrating with omnigent.
 
-CURSOR-PR-VIEW-TEST: dummy sentence for a throwaway PR. No SDK behavior changed.
-
 ## Structure
 
 ```
