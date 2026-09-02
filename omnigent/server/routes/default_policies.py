@@ -46,13 +46,6 @@ from omnigent.telemetry.installation_id import get_installation_id as _get_insta
 _logger = logging.getLogger(__name__)
 
 
-def _redact_for_log(user_id: str) -> str:
-    """Truncate a user id for log lines to avoid full PII in aggregated logs."""
-    if len(user_id) <= 4:
-        return f"{user_id[:1]}***"
-    return f"{user_id[:3]}***(len={len(user_id)})"
-
-
 def _generate_default_policy_id() -> str:
     """Generate a unique default policy identifier.
 
@@ -237,7 +230,7 @@ def create_default_policies_router(
         invalidate_default_policy_specs_cache()
         _logger.info(
             "policies/create: user=%s created policy_id=%s handler=%s",
-            _redact_for_log(user_id) if user_id else "(single-user)",
+            user_id or "(single-user)",
             policy.id,
             policy.handler,
         )
@@ -380,7 +373,7 @@ def create_default_policies_router(
         invalidate_default_policy_specs_cache()
         _logger.info(
             "policies/update: user=%s updated policy_id=%s",
-            _redact_for_log(user_id) if user_id else "(single-user)",
+            user_id or "(single-user)",
             policy_id,
         )
         return _entity_to_response(policy)
@@ -408,7 +401,7 @@ def create_default_policies_router(
         invalidate_default_policy_specs_cache()
         _logger.info(
             "policies/delete: user=%s deleted policy_id=%s",
-            _redact_for_log(user_id) if user_id else "(single-user)",
+            user_id or "(single-user)",
             policy_id,
         )
         try:
