@@ -22,6 +22,25 @@ vi.mock("@dnd-kit/core", () => ({
   useDroppable: () => ({ setNodeRef: vi.fn(), isOver: false }),
 }));
 
+vi.mock("@/hooks/useConversations", () => ({
+  useConversations: () => ({
+    data: {
+      pages: [
+        {
+          data: [
+            { id: "session-a", title: "First task" },
+            { id: "session-b", title: "Second task" },
+          ],
+        },
+      ],
+    },
+  }),
+}));
+
+vi.mock("@/hooks/useSession", () => ({
+  useSession: () => ({ session: null, isLoading: false, error: null }),
+}));
+
 vi.mock("./ChatPage", () => ({
   ChatPage: ({ conversationId, active = true }: { conversationId?: string; active?: boolean }) => (
     <div data-testid={`chat-${conversationId ?? "landing"}`} data-active={String(active)}>
@@ -98,6 +117,34 @@ describe("WorkspacePage", () => {
     expect(unpinSpy).toHaveBeenCalledWith("session-b");
     pinSpy.mockRestore();
     unpinSpy.mockRestore();
+  });
+
+  it("labels each pane with its session title when split", () => {
+    const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
+    const split = useWorkspaceLayoutStore.getState();
+    if (split.root.kind !== "split") throw new Error("expected split root");
+    const firstPaneId = split.root.children[0].id;
+    const secondPaneId = split.root.children[1].id;
+
+    renderWorkspace("/c/session-b");
+
+    expect(screen.getByTestId(`pane-title-${firstPaneId}`)).toHaveTextContent("First task");
+    expect(screen.getByTestId(`pane-title-${secondPaneId}`)).toHaveTextContent("Second task");
+  });
+
+  it("omits pane chrome for a single pane", () => {
+    renderWorkspace("/c/session-a");
+    expect(screen.queryByTestId(/pane-title-/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Close pane/ })).toBeNull();
+  });
+
+  it("exposes five directional drop zones per pane, including center", () => {
+    const paneId = useWorkspaceLayoutStore.getState().root.id;
+    renderWorkspace("/c/session-a");
+    for (const edge of ["left", "right", "top", "bottom", "center"]) {
+      expect(screen.getByTestId(`drop-zone-${paneId}-${edge}`)).toBeInTheDocument();
+    }
   });
 
   it("keeps the landing and ordinary single-session routes unsplit", async () => {

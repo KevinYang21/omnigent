@@ -104,4 +104,77 @@ describe("SessionDragDropProvider", () => {
       target,
     );
   });
+
+  it("moves the dragged session into the pane on a center drop", () => {
+    render(
+      <MemoryRouter initialEntries={["/c/session-a"]}>
+        <SessionDragDropProvider>
+          <LocationProbe />
+        </SessionDragDropProvider>
+      </MemoryRouter>,
+    );
+
+    const rootPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(rootPaneId, "session-b", "right"));
+    const split = useWorkspaceLayoutStore.getState();
+    if (split.root.kind !== "split") throw new Error("expected split root");
+    const leftPaneId = split.root.children[0].id;
+
+    const active = {
+      id: "session-c",
+      data: { current: { type: "session", label: "Session C", project: null, isPinned: false } },
+    };
+
+    act(() => {
+      dndProps.onDragStart?.({ active });
+      dndProps.onDragEnd?.({
+        active,
+        over: {
+          data: { current: { type: "workspace-pane", paneId: leftPaneId, edge: "center" } },
+        },
+      });
+    });
+
+    const state = useWorkspaceLayoutStore.getState();
+    expect(findWorkspaceLeafBySession(state.root, "session-c")?.id).toBe(leftPaneId);
+    expect(state.focusedPaneId).toBe(leftPaneId);
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/session-c");
+  });
+
+  it("focuses the pane already showing a session dropped on center", () => {
+    render(
+      <MemoryRouter initialEntries={["/c/session-a"]}>
+        <SessionDragDropProvider>
+          <LocationProbe />
+        </SessionDragDropProvider>
+      </MemoryRouter>,
+    );
+
+    const rootPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(rootPaneId, "session-b", "right"));
+    const split = useWorkspaceLayoutStore.getState();
+    if (split.root.kind !== "split") throw new Error("expected split root");
+    const leftPaneId = split.root.children[0].id;
+    const rightPaneId = split.root.children[1].id;
+
+    const active = {
+      id: "session-b",
+      data: { current: { type: "session", label: "Session B", project: null, isPinned: false } },
+    };
+
+    act(() => {
+      dndProps.onDragStart?.({ active });
+      dndProps.onDragEnd?.({
+        active,
+        over: {
+          data: { current: { type: "workspace-pane", paneId: leftPaneId, edge: "center" } },
+        },
+      });
+    });
+
+    const state = useWorkspaceLayoutStore.getState();
+    expect(findWorkspaceLeafBySession(state.root, "session-b")?.id).toBe(rightPaneId);
+    expect(state.focusedPaneId).toBe(rightPaneId);
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/session-b");
+  });
 });

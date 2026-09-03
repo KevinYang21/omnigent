@@ -108,6 +108,24 @@ export function selectWorkspaceSession(
   };
 }
 
+export function setWorkspaceLeafSession(
+  layout: WorkspaceLayout,
+  paneId: string,
+  sessionId: string,
+): WorkspaceLayout {
+  // A session shown in two panes at once is never useful; jumping to the
+  // pane that already has it matches what selecting it would do.
+  const existing = findWorkspaceLeafBySession(layout.root, sessionId);
+  if (existing) return { ...layout, focusedPaneId: existing.id };
+
+  const target = findWorkspaceLeaf(layout.root, paneId);
+  if (!target) return layout;
+  return {
+    root: replaceLeafSession(layout.root, paneId, sessionId),
+    focusedPaneId: paneId,
+  };
+}
+
 export function splitWorkspacePane(
   layout: WorkspaceLayout,
   targetPaneId: string,
@@ -248,6 +266,7 @@ interface WorkspaceLayoutStore extends WorkspaceLayout {
   selectSession: (sessionId: string) => void;
   focusPane: (paneId: string) => void;
   splitPane: (paneId: string, sessionId: string, edge: WorkspaceDropEdge) => void;
+  setLeafSession: (paneId: string, sessionId: string) => void;
   closePane: (paneId: string) => void;
   resizeSplit: (splitId: string, firstSize: number) => void;
   reset: (sessionId?: string | null) => void;
@@ -274,6 +293,9 @@ export const useWorkspaceLayoutStore = create<WorkspaceLayoutStore>((set, get) =
   },
   splitPane: (paneId, sessionId, edge) => {
     persistAndSet(set, splitWorkspacePane(get(), paneId, sessionId, edge));
+  },
+  setLeafSession: (paneId, sessionId) => {
+    persistAndSet(set, setWorkspaceLeafSession(get(), paneId, sessionId));
   },
   closePane: (paneId) => {
     persistAndSet(set, closeWorkspacePane(get(), paneId));

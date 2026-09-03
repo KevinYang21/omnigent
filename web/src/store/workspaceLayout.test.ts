@@ -4,6 +4,8 @@ import {
   closeWorkspacePane,
   createWorkspaceLayout,
   findWorkspaceLeaf,
+  findWorkspaceLeafBySession,
+  setWorkspaceLeafSession,
   readWorkspaceLayout,
   resizeWorkspaceSplit,
   selectWorkspaceSession,
@@ -11,6 +13,30 @@ import {
   useWorkspaceLayoutStore,
   writeWorkspaceLayout,
 } from "./workspaceLayout";
+
+describe("setWorkspaceLeafSession", () => {
+  it("replaces the target leaf's session and focuses it", () => {
+    const initial = createWorkspaceLayout("session-a");
+    const split = splitWorkspacePane(initial, initial.root.id, "session-b", "right");
+    const leftPaneId = split.root.kind === "split" ? split.root.children[0].id : "";
+
+    const next = setWorkspaceLeafSession(split, leftPaneId, "session-c");
+    expect(findWorkspaceLeaf(next.root, leftPaneId)?.sessionId).toBe("session-c");
+    expect(next.focusedPaneId).toBe(leftPaneId);
+  });
+
+  it("focuses the existing leaf instead of duplicating a session", () => {
+    const initial = createWorkspaceLayout("session-a");
+    const split = splitWorkspacePane(initial, initial.root.id, "session-b", "right");
+    const leftPaneId = split.root.kind === "split" ? split.root.children[0].id : "";
+    const rightPaneId = split.root.kind === "split" ? split.root.children[1].id : "";
+
+    const next = setWorkspaceLeafSession(split, leftPaneId, "session-b");
+    expect(findWorkspaceLeaf(next.root, leftPaneId)?.sessionId).toBe("session-a");
+    expect(findWorkspaceLeafBySession(next.root, "session-b")?.id).toBe(rightPaneId);
+    expect(next.focusedPaneId).toBe(rightPaneId);
+  });
+});
 
 describe("workspace layout transitions", () => {
   it("creates horizontal and vertical splits around the target pane", () => {

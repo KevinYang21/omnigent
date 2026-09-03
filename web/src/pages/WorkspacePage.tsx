@@ -1,5 +1,5 @@
 import { useDroppable } from "@dnd-kit/core";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, X } from "lucide-react";
+import { X } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -19,7 +19,10 @@ import {
   type WorkspaceNode,
   type WorkspaceSplit,
 } from "@/store/workspaceLayout";
+import { useConversations } from "@/hooks/useConversations";
+import { useSession } from "@/hooks/useSession";
 import { useSessionDragDrop } from "@/shell/SessionDragDropProvider";
+import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { ChatPage } from "./ChatPage";
 
 export function WorkspacePage() {
@@ -202,7 +205,7 @@ function WorkspaceLeafView({
   return (
     <div
       className={cn(
-        "relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background",
+        "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background",
         leafCount > 1 &&
           focused &&
           "shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--primary)_55%,transparent)]",
@@ -213,78 +216,119 @@ function WorkspaceLeafView({
       onPointerDownCapture={focus}
     >
       {leafCount > 1 && sessionId ? (
-        <button
-          type="button"
-          aria-label={`Close pane ${sessionId}`}
-          onClick={(event) => {
-            event.stopPropagation();
-            close();
-          }}
-          className="absolute top-2 left-9 z-[70] flex size-5 items-center justify-center rounded text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-        >
-          <X className="size-3" />
-        </button>
+        <WorkspacePaneHeader
+          paneId={node.id}
+          sessionId={sessionId}
+          focused={focused}
+          onClose={close}
+        />
       ) : null}
       {sessionId ? (
-        <ChatStoreScopeProvider conversationId={sessionId}>
-          <ChatPage conversationId={sessionId} active={focused} />
-        </ChatStoreScopeProvider>
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <ChatStoreScopeProvider conversationId={sessionId}>
+            <ChatPage conversationId={sessionId} active={focused} />
+          </ChatStoreScopeProvider>
+        </div>
       ) : null}
       <WorkspaceDropZones paneId={node.id} />
     </div>
   );
 }
 
-function WorkspaceDropZones({ paneId }: { paneId: string }) {
-  const { activeDrag } = useSessionDragDrop();
+function WorkspacePaneHeader({
+  paneId,
+  sessionId,
+  focused,
+  onClose,
+}: {
+  paneId: string;
+  sessionId: string;
+  focused: boolean;
+  onClose: () => void;
+}) {
+  const { data: conversationsData } = useConversations("", true);
+  const { session } = useSession(sessionId);
+  const title = useMemo(() => {
+    const listed = conversationsData?.pages
+      .flatMap((page) => page.data)
+      .find((conversation) => conversation.id === sessionId);
+    return listed?.title || session?.title || UNTITLED_CONVERSATION_LABEL;
+  }, [conversationsData, session, sessionId]);
+
   return (
-    <>
-      <WorkspaceDropZone paneId={paneId} edge="left" active={activeDrag !== null} />
-      <WorkspaceDropZone paneId={paneId} edge="right" active={activeDrag !== null} />
-      <WorkspaceDropZone paneId={paneId} edge="top" active={activeDrag !== null} />
-      <WorkspaceDropZone paneId={paneId} edge="bottom" active={activeDrag !== null} />
-    </>
+    <div className="flex h-8 shrink-0 items-center gap-1 border-b bg-muted/30 pr-1.5 pl-3">
+      <span
+        data-testid={`pane-title-${paneId}`}
+        className={cn(
+          "min-w-0 flex-1 truncate text-xs",
+          focused ? "text-foreground" : "text-muted-foreground",
+        )}
+      >
+        {title}
+      </span>
+      <button
+        type="button"
+        aria-label={`Close pane ${sessionId}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          onClose();
+        }}
+        className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        <X className="size-3" />
+      </button>
+    </div>
   );
 }
 
-const DROP_ZONE_ICON = {
-  left: ArrowLeft,
-  right: ArrowRight,
-  top: ArrowUp,
-  bottom: ArrowDown,
-} satisfies Record<WorkspaceDropEdge, typeof ArrowLeft>;
+/* SP2K-style drop targets: a plus/cross of five invisible zones armed only
+ * while a session drag is active. Nothing shows until the pointer enters a
+ * zone, which then lights up with a subtle accent highlight — no icons. */
+function WorkspaceDropZones({ paneId }: { paneId: string }) {
+  const { activeDrag } = useSessionDragDrop();
+  const armed = activeDrag !== null;
+  return (
+    <div aria-hidden className="pointer-events-none absolute inset-0 z-[80] flex flex-col">
+      <WorkspaceDropZone paneId={paneId} edge="top" armed={armed} sizing="h-[18%] w-full" />
+      <div className="flex min-h-0 flex-1">
+        <WorkspaceDropZone paneId={paneId} edge="left" armed={armed} sizing="h-full w-[25%]" />
+        <WorkspaceDropZone paneId={paneId} edge="center" armed={armed} sizing="h-full flex-1" />
+        <WorkspaceDropZone paneId={paneId} edge="right" armed={armed} sizing="h-full w-[25%]" />
+      </div>
+      <WorkspaceDropZone paneId={paneId} edge="bottom" armed={armed} sizing="h-[18%] w-full" />
+    </div>
+  );
+}
 
 function WorkspaceDropZone({
   paneId,
   edge,
-  active,
+  armed,
+  sizing,
 }: {
   paneId: string;
-  edge: WorkspaceDropEdge;
-  active: boolean;
+  edge: WorkspaceDropEdge | "center";
+  armed: boolean;
+  sizing: string;
 }) {
   const { setNodeRef, isOver } = useDroppable({
     id: `workspace-pane:${paneId}:${edge}`,
     data: { type: "workspace-pane", paneId, edge },
-    disabled: !active,
+    disabled: !armed,
   });
-  const Icon = DROP_ZONE_ICON[edge];
 
   return (
     <div
       ref={setNodeRef}
-      aria-label={`Split session ${edge}`}
-      className={cn(
-        "pointer-events-none absolute z-[80] flex items-center justify-center rounded-md border border-transparent opacity-0 transition-[opacity,background-color,border-color] duration-100",
-        edge === "left" && "inset-y-3 left-3 w-[24%]",
-        edge === "right" && "inset-y-3 right-3 w-[24%]",
-        edge === "top" && "inset-x-[27%] top-3 h-[24%]",
-        edge === "bottom" && "inset-x-[27%] bottom-3 h-[24%]",
-        active && "pointer-events-auto opacity-100 bg-background/65 backdrop-blur-[2px]",
-        isOver && "border-primary bg-primary/15 text-primary shadow-sm",
-      )}
+      data-testid={`drop-zone-${paneId}-${edge}`}
+      className={cn("relative", sizing)}
     >
-      <Icon className="size-5" />
+      <div
+        className={cn(
+          "absolute inset-1.5 rounded-md border-[1.5px] border-transparent opacity-0 transition-opacity duration-100",
+          armed && isOver && "border-primary/70 bg-primary/15 opacity-100",
+        )}
+      />
     </div>
   );
 }

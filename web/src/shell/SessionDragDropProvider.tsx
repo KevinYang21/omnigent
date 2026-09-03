@@ -32,7 +32,7 @@ export interface SessionDragState {
 export interface WorkspacePaneDropTarget {
   type: "workspace-pane";
   paneId: string;
-  edge: WorkspaceDropEdge;
+  edge: WorkspaceDropEdge | "center";
 }
 
 type SidebarDropHandler = (drag: SessionDragState, target: SidebarDropTarget) => void;
@@ -78,7 +78,8 @@ function isWorkspaceDropTarget(value: unknown): value is WorkspacePaneDropTarget
     (target.edge === "left" ||
       target.edge === "right" ||
       target.edge === "top" ||
-      target.edge === "bottom")
+      target.edge === "bottom" ||
+      target.edge === "center")
   );
 }
 
@@ -118,7 +119,13 @@ export function SessionDragDropProvider({ children }: { children: ReactNode }) {
 
       const target = event.over?.data.current;
       if (isWorkspaceDropTarget(target)) {
-        useWorkspaceLayoutStore.getState().splitPane(target.paneId, drag.id, target.edge);
+        // Center has no tabs to stack (unlike the SP2K reference), so it moves
+        // the dragged session into the pane; edges split as before.
+        if (target.edge === "center") {
+          useWorkspaceLayoutStore.getState().setLeafSession(target.paneId, drag.id);
+        } else {
+          useWorkspaceLayoutStore.getState().splitPane(target.paneId, drag.id, target.edge);
+        }
         navigate(`/c/${drag.id}`);
         return;
       }
