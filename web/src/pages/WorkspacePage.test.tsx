@@ -5,11 +5,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useWorkspaceLayoutStore } from "@/store/workspaceLayout";
 import { WorkspacePage } from "./WorkspacePage";
 
-const chatStoreMocks = vi.hoisted(() => ({ switchTo: vi.fn() }));
+const chatStoreMocks = vi.hoisted(() => ({ switchTo: vi.fn(), loadInBackground: vi.fn() }));
 
 vi.mock("@/store/chatStore", () => ({
   ChatStoreScopeProvider: ({ children }: { children: ReactNode }) => children,
-  useChatStore: { getState: () => ({ switchTo: chatStoreMocks.switchTo }) },
+  useChatStore: {
+    getState: () => ({
+      switchTo: chatStoreMocks.switchTo,
+      loadInBackground: chatStoreMocks.loadInBackground,
+    }),
+  },
 }));
 
 vi.mock("@dnd-kit/core", () => ({
@@ -67,6 +72,19 @@ describe("WorkspacePage", () => {
     await waitFor(() => expect(screen.queryByTestId(`workspace-pane-${secondPaneId}`)).toBeNull());
     expect(screen.getByTestId("chat-session-a")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Close pane/ })).toBeNull();
+  });
+
+  it("binds a background stream for panes that are not focused", async () => {
+    // After a reload only the route conversation is live; the other pane must
+    // hydrate in the background instead of painting the focused transcript.
+    chatStoreMocks.loadInBackground.mockClear();
+    const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
+
+    renderWorkspace("/c/session-b");
+
+    await waitFor(() => expect(chatStoreMocks.loadInBackground).toHaveBeenCalledWith("session-a"));
+    expect(chatStoreMocks.loadInBackground).not.toHaveBeenCalledWith("session-b");
   });
 
   it("keeps the landing and ordinary single-session routes unsplit", async () => {

@@ -714,6 +714,13 @@ export interface ChatActions {
   ) => Promise<void>;
   stop: () => void;
   switchTo: (conversationId: string | null) => Promise<void>;
+  /**
+   * Hydrate a conversation that is rendered but NOT active (a background
+   * split pane): acquire its entry and bind its stream without touching the
+   * root store. No-op for the active conversation and for entries whose
+   * stream is already live.
+   */
+  loadInBackground: (conversationId: string) => Promise<void>;
   submitApproval: (
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
@@ -2040,6 +2047,28 @@ const baseChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  loadInBackground: async (conversationId) => {
+    // The focused pane's ChatPage owns the active conversation via switchTo.
+    if (get().conversationId === conversationId) return;
+    if (isConversationStreamCurrent(conversationId)) return;
+
+    // Same dead-entry handling as switchTo: a retained entry whose stream
+    // died must re-bind from a clean slate, or hydration prepends onto stale
+    // blocks. Unsent bubbles survive — the server never saw them.
+    const unsentOnRebind =
+      conversationRegistry
+        .peek(conversationId)
+        ?.getState()
+        .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+    conversationRegistry.release(conversationId);
+    const entry = conversationRegistry.acquire(conversationId);
+    entry.setState({
+      loadingConversation: true,
+      ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
+    });
+    await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+  },
+
   submitApproval: async (elicitationId, action, content) => {
     const sessionId = get().conversationId;
     if (!sessionId) return;
@@ -2408,7 +2437,13 @@ export function ChatStoreScopeProvider({
 function scopedChatState(conversationId: string): ChatState {
   const root = baseChatStore.getState();
   const entry = conversationRegistry.peek(conversationId);
-  return entry ? { ...root, ...entry.getState() } : root;
+  if (entry !== undefined && !entry.disposed) {
+    return { ...root, ...entry.getState() };
+  }
+  // A pane whose conversation has no live entry (a restored split layout
+  // before loadInBackground lands, or an evicted entry) must never paint the
+  // root store — that is a DIFFERENT conversation's transcript.
+  return { ...root, ...createInitialConversationState() };
 }
 
 function useScopedChatStoreValue<T>(

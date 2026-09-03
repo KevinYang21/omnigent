@@ -1,6 +1,12 @@
 import { useDroppable } from "@dnd-kit/core";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, X } from "lucide-react";
-import { useLayoutEffect, useMemo, useRef, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { useNavigate, useParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { ChatStoreScopeProvider, useChatStore } from "@/store/chatStore";
@@ -157,6 +163,15 @@ function WorkspaceLeafView({
   const focusPane = useWorkspaceLayoutStore((state) => state.focusPane);
   const closePane = useWorkspaceLayoutStore((state) => state.closePane);
   const sessionId = node.sessionId;
+
+  // Non-focused panes have no route driving switchTo, so hydrate their
+  // conversation in the background — after a reload only the focused pane's
+  // conversation is live, and an unbound pane must not paint the focused
+  // pane's transcript.
+  useEffect(() => {
+    if (!sessionId || focused) return;
+    void useChatStore.getState().loadInBackground(sessionId);
+  }, [sessionId, focused]);
 
   const focus = () => {
     if (!sessionId || focused) return;
