@@ -1791,6 +1791,24 @@ describe("Composer file-attachment focus", () => {
     expect(document.activeElement).not.toBe(ta);
   });
 
+  // A screenshot dragged onto the transcript (or anywhere else on the page)
+  // attaches to the composer: there is nothing else in a session a dropped
+  // image could mean, and unhandled the browser navigates away to render it.
+  it("attaches a file dropped outside the composer box", () => {
+    render(<Composer {...composerProps()} />);
+    // ``types`` is the only file signal available mid-drag, so the cue reads it.
+    fireEvent.dragEnter(document.body, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.getByTestId("file-drop-overlay")).toBeTruthy();
+
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    fireEvent.drop(document.body, { dataTransfer: { types: ["Files"], files: [file] } });
+
+    // The chip proves the drop reached the composer's attachment state
+    // (getAllBy: the chip pairs the visible name with a hover title).
+    expect(screen.getAllByText("shot.png").length).toBeGreaterThan(0);
+    expect(screen.queryByTestId("file-drop-overlay")).toBeNull();
+  });
+
   it("clears the rejection notice once the user types", () => {
     // The rejected file is never attached, so there is no chip to remove and
     // nothing else clears the notice. Left sticky it reads as a blocker on a

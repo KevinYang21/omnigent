@@ -1,5 +1,4 @@
 import {
-  type DragEvent,
   type FormEvent,
   type KeyboardEvent,
   createContext,
@@ -161,6 +160,7 @@ import {
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
+import { useWindowFileDrop } from "@/hooks/useWindowFileDrop";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
 import {
@@ -170,6 +170,7 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { FileDropOverlay } from "@/components/FileDropOverlay";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
@@ -4928,8 +4929,6 @@ export function Composer({
   // "recall replaced the value" (keep cursor).
   const recallingRef = useRef(false);
 
-  const [isDragActive, setIsDragActive] = useState(false);
-
   const addFiles = (incoming: File[]) => {
     // Reject unsupported types (only images, PDF, and text/code) and
     // oversized files up front — before the upload — with a friendly
@@ -4945,33 +4944,10 @@ export function Composer({
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
 
-  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(false);
-    const dropped = Array.from(e.dataTransfer.files);
-    if (dropped.length > 0) addFiles(dropped);
-  };
-
-  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragEnter = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragActive(true);
-  };
-
-  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    // Only clear the active state when the pointer leaves the container
-    // itself, not when it moves between child elements inside it.
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setIsDragActive(false);
-  };
+  // Files dropped anywhere on the page attach here — the composer box is no
+  // longer the only target, since a file dragged into a session has no other
+  // meaning wherever it lands.
+  const isDragActive = useWindowFileDrop(addFiles);
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -5289,6 +5265,8 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+      {/* Page-wide drop cue — files landing anywhere attach to this composer. */}
+      {isDragActive && <FileDropOverlay />}
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}
@@ -5300,16 +5278,7 @@ export function Composer({
           CHAT_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
-        onDrop={handleDrop}
-        onDragOver={handleDragOver}
-        onDragEnter={handleDragEnter}
-        onDragLeave={handleDragLeave}
       >
-        {isDragActive && (
-          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-            <span className="text-ui font-medium text-ring">Drop files here</span>
-          </div>
-        )}
         {/* Slash-command suggestions — floats above the composer box */}
         {menuOpen && (
           <SlashCommandMenu

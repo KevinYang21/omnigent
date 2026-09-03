@@ -23,6 +23,15 @@ network: the chips are local component state.
 The assertion pins to the chip's per-file remove control
 (``aria-label="Remove {filename}"``, ChatPage.tsx) appearing after attach and
 disappearing after the remove click.
+
+Drag-drop is page-wide (``hooks/useWindowFileDrop.ts``): a file dropped on the
+transcript — or anywhere else on the page — attaches to the composer, because
+dropping a screenshot into a session has no other meaning and an unhandled drop
+makes the browser navigate away from the session to render the file. That needs
+a real browser: the listeners are on ``window``, the drag is claimed only when
+``dataTransfer.types`` carries ``"Files"``, and ``preventDefault`` on
+``dragover`` is what makes a ``drop`` event fire at all — all of it jsdom
+approximates rather than implements.
 """
 
 from __future__ import annotations
@@ -250,3 +259,70 @@ def test_failed_upload_restores_the_message(
     expect(page.get_by_text("Unsupported attachment type", exact=False)).to_be_visible()
     # And the message is back in the composer, ready to retry.
     expect(composer).to_have_value("look at this file", timeout=10_000)
+
+
+# Synthesises an OS file drag in the page. Playwright can't drive a real
+# desktop-to-browser drag, but a page-built ``DataTransfer`` carrying a ``File``
+# produces the same events with the same ``types`` the handler reads.
+_DISPATCH_FILE_DROP = """
+([selector, name, body]) => {
+  const target = document.querySelector(selector);
+  if (!target) throw new Error(`no drop target for ${selector}`);
+  // The point of the test: the drop lands outside the composer box.
+  if (target.closest("[data-composer-card]")) {
+    throw new Error("drop target is inside the composer — test proves nothing");
+  }
+  const transfer = new DataTransfer();
+  transfer.items.add(new File([body], name, { type: "text/plain" }));
+  const fire = (type) =>
+    target.dispatchEvent(
+      new DragEvent(type, { dataTransfer: transfer, bubbles: true, cancelable: true }),
+    );
+  fire("dragenter");
+  fire("dragover");
+  return fire("drop");
+}
+"""
+
+
+def test_file_dropped_outside_the_composer_attaches(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A file dropped on the transcript attaches to the composer.
+
+    The drop target used to be the composer box alone, so a screenshot dropped
+    on the transcript fell through to the browser, which navigated away from
+    the session to render the file — losing the page. Now ``window`` claims any
+    file drag: the cue is page-wide and the file lands in composer state
+    wherever it was released.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    # Dragging a file over the transcript lifts the page-wide drop cue.
+    page.evaluate(
+        """
+        ([selector]) => {
+          const transfer = new DataTransfer();
+          transfer.items.add(new File(["x"], "hover.txt", { type: "text/plain" }));
+          document
+            .querySelector(selector)
+            .dispatchEvent(
+              new DragEvent("dragenter", { dataTransfer: transfer, bubbles: true }),
+            );
+        }
+        """,
+        ["[role=log]"],
+    )
+    expect(page.get_by_test_id("file-drop-overlay")).to_be_visible(timeout=10_000)
+
+    # Releasing there attaches the file and clears the cue.
+    handled = page.evaluate(_DISPATCH_FILE_DROP, ["[role=log]", _ATTACH_NAME, _ATTACH_BODY])
+    # ``dispatchEvent`` returns False when the handler called preventDefault —
+    # i.e. the app claimed the drop instead of letting the browser open the file.
+    assert handled is False, "the page-wide handler did not claim the file drop"
+
+    expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_be_visible(timeout=10_000)
+    expect(page.get_by_test_id("file-drop-overlay")).to_have_count(0)
