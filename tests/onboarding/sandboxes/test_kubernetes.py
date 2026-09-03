@@ -273,6 +273,18 @@ def test_build_job_manifest_node_selector_can_override_arch() -> None:
     assert selector["disktype"] == "ssd"
 
 
+def test_build_job_manifest_omits_runtime_class_by_default() -> None:
+    """No runtime_class → no runtimeClassName key: the cluster default runtime."""
+    manifest = build_job_manifest(**_MANIFEST_KW)
+    assert "runtimeClassName" not in _pod_spec(manifest)
+
+
+def test_build_job_manifest_runtime_class_sets_runtime_class_name() -> None:
+    """An operator runtime_class lands verbatim as spec.runtimeClassName."""
+    manifest = build_job_manifest(**{**_MANIFEST_KW, "runtime_class": "kata"})
+    assert _pod_spec(manifest)["runtimeClassName"] == "kata"
+
+
 def test_build_job_manifest_pvc_mounts_land_on_host_container_only() -> None:
     """Each pvc_mounts entry becomes a persistentVolumeClaim volume mounted on host only."""
     manifest = build_job_manifest(
@@ -494,6 +506,37 @@ def test_env_var_name_override_is_validated(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv(k8s.NAMESPACE_ENV_VAR, "Not_A_Valid_NS")
     with pytest.raises(click.ClickException, match="not a valid Kubernetes name"):
         KubernetesSandboxLauncher()._resolve_namespace()
+
+
+def test_pod_ready_timeout_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no config and no env var, the hardcoded default wins."""
+    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
+    assert k8s._resolve_pod_ready_timeout_s(None) == k8s._POD_READY_TIMEOUT_S
+
+
+def test_pod_ready_timeout_env_var_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no explicit config, the env var overrides the hardcoded default."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "300")
+    assert k8s._resolve_pod_ready_timeout_s(None) == 300
+
+
+def test_pod_ready_timeout_config_wins_over_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """sandbox.kubernetes.pod_ready_timeout_s takes precedence over the env var."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "300")
+    assert k8s._resolve_pod_ready_timeout_s(45) == 45
+
+
+def test_pod_ready_timeout_env_var_accepts_float_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A float-looking env value is accepted, matching the E2B lifetime resolver."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "120.0")
+    assert k8s._resolve_pod_ready_timeout_s(None) == 120
+
+
+def test_pod_ready_timeout_env_var_rejects_non_numeric(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A malformed env value fails fast with a clear error instead of a raw ValueError."""
+    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "not-a-number")
+    with pytest.raises(click.ClickException, match="must be a number of seconds"):
+        k8s._resolve_pod_ready_timeout_s(None)
 
 
 # ── SDK-driven tests (fake kubernetes client) ───────────────
@@ -920,6 +963,47 @@ def test_launch_host_times_out_with_reason(
         )
 
 
+@pytest.mark.parametrize(
+    ("wait_state", "expected"),
+    [
+        ("undiscovered", "did not create a child pod within 1s"),
+        ("replaced", "could not be rediscovered before the 1s deadline"),
+        ("read-error", "could not be read before the 1s deadline"),
+        ("pending", "did not start within 1s"),
+    ],
+)
+def test_configured_pod_ready_timeout_bounds_entire_job_wait(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    wait_state: str,
+    expected: str,
+) -> None:
+    """The configured budget bounds discovery, replacement, reads, and Pending."""
+    core, _batch = fake_clients
+    pod = _pod(phase="Pending")
+    if wait_state != "undiscovered":
+        core.pod_list_items = [pod]
+    if wait_state == "replaced":
+        core.read_default = _FakeApiException(status=404, reason="Not Found")
+    elif wait_state == "read-error":
+        core.read_default = _FakeApiException(status=500, reason="Internal Server Error")
+    else:
+        core.read_default = pod
+
+    ticks = iter((0.0, 1.0))
+    monkeypatch.setattr(k8s.time, "monotonic", lambda: next(ticks))
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pod_ready_timeout_s=1,
+    )
+
+    with pytest.raises(click.ClickException, match=expected):
+        launcher._wait_for_pod_running("omnigent-sandboxes", "omnigent-job-timeout")
+
+
 def test_terminate_deletes_job_and_secret(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
@@ -930,6 +1014,24 @@ def test_terminate_deletes_job_and_secret(
     assert batch.last_delete_body.propagation_policy == "Foreground"
     assert core.deleted_pods == ["omnigent-job-6"]
     assert core.deleted_secrets == ["omnigent-job-6-token"]
+
+
+def test_resume_recycles_job_and_token_secret(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """Resume clears stale launch resources so start_host can recreate the same id."""
+    core, batch = fake_clients
+    launcher = _launcher()
+
+    assert launcher.can_resume is True
+    assert launcher.capabilities.resume_stopped is True
+
+    launcher.resume("omnigent-job-resume")
+
+    assert batch.deleted_jobs == ["omnigent-job-resume"]
+    assert batch.last_delete_body.propagation_policy == "Foreground"
+    assert core.deleted_pods == ["omnigent-job-resume"]
+    assert core.deleted_secrets == ["omnigent-job-resume-token"]
 
 
 def test_terminate_is_idempotent_on_404(

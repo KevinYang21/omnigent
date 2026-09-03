@@ -291,11 +291,16 @@ async def test_host_tunnel_deregisters_on_disconnect(
         await asyncio.sleep(0.1)
 
     assert registry.get(_HOST_ID) is None
-    disconnect = next(record for record in caplog.records if hasattr(record, "ws_close_code"))
-    assert disconnect.ws_close_code == 1001
-    assert disconnect.ws_close_reason == "rolling restart"
-    assert disconnect.ws_stage == "connected"
-    assert disconnect.ws_registered is True
+    disconnect = next(
+        record
+        for record in caplog.records
+        if "ws_close_code" in getattr(record, "attributes", {})
+    )
+    attributes = disconnect.attributes
+    assert attributes["ws_close_code"] == 1001
+    assert attributes["ws_close_reason"] == "rolling restart"
+    assert attributes["ws_stage"] == "connected"
+    assert attributes["ws_registered"] is True
 
 
 async def test_host_tunnel_upserts_db_on_connect(
@@ -696,6 +701,47 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
     assert host.status == "online"
 
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_malformed_host_id_refused_with_400_before_accept(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A non-UUID host_id is refused with HTTP 400 + body, not a bare close.
+
+    Regression for the customer case where a host dialed in with a
+    human-readable id (``superagent-databricks-host``). A pre-accept bare
+    close reaches the client as an opaque 403 with an empty body,
+    indistinguishable from an auth failure; a 400 denial response naming
+    the cause lets the host surface an actionable error.
+    """
+    app, registry, _store = host_app
+    scope = _websocket_scope("/v1/hosts/superagent-databricks-host/tunnel")
+    # Advertise the denial-response extension, as uvicorn does in prod.
+    scope["extensions"] = {"websocket.http.response": {}}
+    comm = ApplicationCommunicator(app, scope)
+    await comm.send_input({"type": "websocket.connect"})
+
+    start = await comm.receive_output(timeout=1.0)
+    assert start["type"] == "websocket.http.response.start"
+    assert start["status"] == 400
+    body = await comm.receive_output(timeout=1.0)
+    assert body["type"] == "websocket.http.response.body"
+    assert b"UUID" in body["body"]
+    assert registry.get("superagent-databricks-host") is None
+
+
+async def test_malformed_host_id_refused_with_close_when_no_denial_extension(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Without the denial-response extension, the refusal falls back to a close."""
+    app, registry, _store = host_app
+    comm = ApplicationCommunicator(app, _websocket_scope("/v1/hosts/not-a-uuid/tunnel"))
+    await comm.send_input({"type": "websocket.connect"})
+
+    closed = await comm.receive_output(timeout=1.0)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4009
+    assert registry.get("not-a-uuid") is None
 
 
 # ── Managed-host launch-token auth ──────────────────────────

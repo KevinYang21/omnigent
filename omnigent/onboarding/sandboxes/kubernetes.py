@@ -16,7 +16,7 @@ creates the Job — an init container prepares the workspace (``mkdir`` + option
 which dials back over the existing managed launch-token tunnel. Because the host
 is never started by ``exec``-ing into an already-running container, this launcher
 needs no ``pods/exec`` rights and no exec transport — it implements only
-``prepare`` / ``provision`` / ``start_host`` / ``terminate``.
+``prepare`` / ``provision`` / ``start_host`` / ``resume`` / ``terminate``.
 
 Platform notes that shape this launcher:
 
@@ -172,9 +172,19 @@ _INIT_CONTAINER_NAME: str = "workspace-prep"
 # Pod-start wait budget, consumed inside start_host BEFORE the
 # shared _wait_for_host_online poll, so a Pod that can't schedule / pull its
 # image / clone its repo fails fast with a clear reason instead of as a generic
-# online timeout. Kept tight; a cold image pull is the usual slow case.
+# online timeout. Kept tight; a cold image pull is the usual slow case —
+# deployments whose host image regularly takes longer to pull can raise the
+# budget via ``sandbox.kubernetes.pod_ready_timeout_s``, or, when that isn't
+# set, via :data:`_POD_READY_TIMEOUT_ENV_VAR`.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
+
+# Env var fallback for the pod-ready wait budget, mirroring
+# omnigent.onboarding.sandboxes.e2b.MAX_LIFETIME_ENV_VAR. Only consulted when
+# the launcher wasn't constructed with an explicit pod_ready_timeout_s (i.e.
+# sandbox.kubernetes.pod_ready_timeout_s is unset in the bundle) — the
+# explicit config key always wins when both are present.
+_POD_READY_TIMEOUT_ENV_VAR: str = "OMNIGENT_K8S_POD_READY_TIMEOUT_S"
 
 # Per-request client timeout for the blocking calls. Without it a stalled
 # apiserver socket blocks indefinitely and the wait deadline never fires.
@@ -197,6 +207,16 @@ _JOB_BACKOFF_LIMIT: int = 6
 # sandboxes when no explicit terminate arrives.  7 days matches the managed
 # launch-token TTL.
 _JOB_ACTIVE_DEADLINE_S: int = 7 * 24 * 3600
+
+# How long a Job's objects (and its terminated Pod) stick around after the
+# Job itself reaches a terminal state (Complete or Failed), before the
+# cluster garbage-collects them. Backstop for the case where nothing ever
+# calls terminate() on a Job that ends on its own — a crash-loop exhausting
+# backoffLimit, or activeDeadlineSeconds finally expiring — so a
+# credential-bearing Pod object doesn't linger indefinitely just because
+# application-level cleanup never ran. 24h leaves a window to inspect a
+# failed Job's status/logs before it's swept.
+_JOB_TTL_SECONDS_AFTER_FINISHED: int = 24 * 3600
 
 # Lines of container log tail surfaced in a start-failure message (e.g. the git
 # clone error from the init container).
@@ -285,6 +305,34 @@ def _ensure_sdk() -> None:
         raise click.ClickException(
             "The Kubernetes client is required for the 'kubernetes' sandbox "
             "provider. Install it with `pip install 'omnigent[kubernetes]'`."
+        ) from exc
+
+
+def _resolve_pod_ready_timeout_s(configured: int | None) -> int:
+    """
+    Resolve the pod-ready wait budget for :meth:`_wait_for_pod_running`.
+
+    Precedence: the explicit ``sandbox.kubernetes.pod_ready_timeout_s``
+    config value (``configured``, already parsed by the caller) wins when
+    set; otherwise :data:`_POD_READY_TIMEOUT_ENV_VAR` overrides the
+    :data:`_POD_READY_TIMEOUT_S` default, mirroring
+    ``omnigent.onboarding.sandboxes.e2b.resolve_max_lifetime_s``.
+
+    :param configured: The launcher's ``pod_ready_timeout_s`` constructor
+        argument, or ``None`` when the bundle didn't set it.
+    :returns: The timeout in seconds to wait for the Pod to reach ``Running``.
+    :raises click.ClickException: When the env override is not a number.
+    """
+    if configured is not None:
+        return configured
+    raw = os.environ.get(_POD_READY_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return _POD_READY_TIMEOUT_S
+    try:
+        return int(float(raw))
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{_POD_READY_TIMEOUT_ENV_VAR} must be a number of seconds"
         ) from exc
 
 
@@ -526,6 +574,8 @@ def build_job_manifest(
     agent_name: str | None = None,
     backoff_limit: int = _JOB_BACKOFF_LIMIT,
     active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
+    ttl_seconds_after_finished: int = _JOB_TTL_SECONDS_AFTER_FINISHED,
+    runtime_class: str | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Job manifest as a plain dict.
@@ -538,10 +588,14 @@ def build_job_manifest(
     ``restartPolicy: OnFailure`` so the kubelet automatically restarts a
     crashed host container with exponential backoff (10 s, 20 s, 40 s, …
     capped at 5 min).  The Job's ``backoffLimit`` caps the total retry count,
-    and ``activeDeadlineSeconds`` enforces a hard lifetime.  Because
-    ``OnFailure`` restarts the SAME Pod in place, the Pod name is stable
-    across retries — the token Secret ``secretKeyRef`` keeps resolving and the
-    ``sandbox_id`` tracking in the managed-host machinery is unaffected.
+    and ``activeDeadlineSeconds`` enforces a hard lifetime.
+    ``ttlSecondsAfterFinished`` is a backstop on top of both: once a Job
+    reaches a terminal state on its own, the cluster garbage-collects it
+    even if this launcher's own ``terminate()`` never runs or never lands.
+    Because ``OnFailure`` restarts the SAME Pod in place, the Pod name is
+    stable across retries — the token Secret ``secretKeyRef`` keeps
+    resolving and the ``sandbox_id`` tracking in the managed-host machinery
+    is unaffected.
 
     The host's existing WebSocket reconnect logic (exponential backoff in
     ``omnigent/host/connect.py``) re-registers the tunnel automatically after
@@ -585,6 +639,10 @@ def build_job_manifest(
       container start. Refresh is eventually consistent (kubelet sync, up to
       ~1 min), so the in-sandbox consumer must re-read the file each use — a
       value cached at start defeats the rotation.
+    - An operator *runtime_class* becomes ``spec.runtimeClassName``, scheduling
+      the Pod onto a sandboxed container runtime the cluster provides via a
+      ``RuntimeClass`` object (e.g. Kata Containers micro-VMs, gVisor). Unset
+      keeps the cluster's default runtime — today's behaviour exactly.
 
     :param job_name: DNS-label-safe Job name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Job is created in.
@@ -628,6 +686,8 @@ def build_job_manifest(
     :param backoff_limit: Maximum container restart attempts before the Job
         is marked Failed.
     :param active_deadline_seconds: Hard lifetime cap for the Job.
+    :param runtime_class: ``RuntimeClass`` name set as ``spec.runtimeClassName``,
+        or ``None`` to keep the cluster's default container runtime.
     :returns: The Job manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -786,6 +846,10 @@ def build_job_manifest(
                 _AGENT_LABEL,
                 job_name,
             )
+    if runtime_class is not None:
+        # Opt-in only: an absent key (not an explicit None/null) keeps the
+        # manifest byte-compatible with pre-runtime_class deployments.
+        pod_spec["runtimeClassName"] = runtime_class
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -797,6 +861,7 @@ def build_job_manifest(
         "spec": {
             "backoffLimit": backoff_limit,
             "activeDeadlineSeconds": active_deadline_seconds,
+            "ttlSecondsAfterFinished": ttl_seconds_after_finished,
             "template": {
                 "metadata": {"labels": labels},
                 "spec": pod_spec,
@@ -982,7 +1047,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
     Server-managed only and entrypoint-as-host: :meth:`provision` reserves a Job
     name, :meth:`start_host` creates a per-Job token Secret and a Job whose Pod
     template's init container prepares the workspace and whose main container runs
-    ``omnigent host``, and :meth:`terminate` deletes both.  The Job uses
+    ``omnigent host``. :meth:`resume` removes a dormant Job and its stale token
+    Secret so the managed-host wake path can recreate both under the same sandbox
+    id, while :meth:`terminate` permanently deletes them. The Job uses
     ``restartPolicy: OnFailure`` so the kubelet automatically restarts a crashed
     host container, providing automatic failover within the Job's
     ``backoffLimit``.  All transport rides the official ``kubernetes`` client's
@@ -992,6 +1059,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
     """
 
     provider: ClassVar[str] = "kubernetes"
+    can_resume: ClassVar[bool] = True
 
     @property
     def capabilities(self) -> SandboxCapabilities:
@@ -999,7 +1067,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             cli_bootstrap=False,
             managed_launch=True,
             local_port_forward=False,
-            resume_stopped=False,
+            resume_stopped=True,
             programmatic_terminate=True,
             classifies_runner_by_agent=True,
         )
@@ -1018,6 +1086,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
+        pod_ready_timeout_s: int | None = None,
+        runtime_class: str | None = None,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1039,6 +1109,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
+        self._pod_ready_timeout_s = pod_ready_timeout_s
+        self._runtime_class = runtime_class
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
@@ -1330,6 +1402,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
                     agent_name=agent_name,
+                    runtime_class=self._runtime_class,
                 )
                 # Secret before Job so the Pod's secretKeyRef resolves
                 # immediately.
@@ -1370,7 +1443,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         Filters out Pods with a ``deletionTimestamp`` (being torn down) and
         prefers a running Pod over a pending one when a replacement exists.
         Re-raises 401/403 so RBAC misconfigurations surface immediately
-        instead of masquerading as a 90s timeout.
+        instead of masquerading as a readiness timeout.
 
         :param namespace: Namespace the Job lives in.
         :param job_name: The Job whose child Pod to find.
@@ -1427,7 +1500,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        deadline = time.monotonic() + _POD_READY_TIMEOUT_S
+        timeout_s = _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
+        deadline = time.monotonic() + timeout_s
         last_reason: str | None = None
         pod_name: str | None = None
         while True:
@@ -1438,7 +1512,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     if time.monotonic() >= deadline:
                         raise click.ClickException(
                             f"Kubernetes sandbox job '{job_name}' did not create a "
-                            f"child pod within {_POD_READY_TIMEOUT_S}s."
+                            f"child pod within {timeout_s}s."
                         )
                     time.sleep(_POD_READY_POLL_S)
                     continue
@@ -1455,7 +1529,17 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 if getattr(exc, "status", None) == 404:
                     # Under OnFailure the Job may replace the Pod (eviction,
                     # preemption, node drain) — re-discover instead of failing.
+                    replaced_pod_name = pod_name
                     pod_name = None
+                    if time.monotonic() >= deadline:
+                        raise click.ClickException(
+                            self._pod_failure_message(
+                                namespace,
+                                replaced_pod_name,
+                                "disappeared and could not be rediscovered before the "
+                                f"{timeout_s}s deadline",
+                            )
+                        ) from exc
                     time.sleep(_POD_READY_POLL_S)
                     continue
                 last_reason = _api_reason(exc)
@@ -1464,8 +1548,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            "could not be read before the "
-                            f"{_POD_READY_TIMEOUT_S}s deadline ({last_reason})",
+                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1477,8 +1560,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            "could not be read before the "
-                            f"{_POD_READY_TIMEOUT_S}s deadline ({last_reason})",
+                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1512,7 +1594,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     self._pod_failure_message(
                         namespace,
                         pod_name,
-                        f"did not start within {_POD_READY_TIMEOUT_S}s "
+                        f"did not start within {timeout_s}s "
                         f"(last phase '{phase or 'unknown'}'{detail})",
                     )
                 )
@@ -1738,6 +1820,23 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             self._close_clients()
         if first_error is not None:
             raise first_error
+
+    def resume(self, sandbox_id: str) -> None:
+        """
+        Prepare a dormant Kubernetes sandbox for recreation in place.
+
+        Kubernetes Jobs cannot be restarted after their host process exits.
+        Remove the old Job and launch-token Secret so the shared managed-host
+        wake path can call :meth:`start_host` with the same sandbox id and a
+        freshly armed token. Operator-managed PVCs are external resources and
+        are not touched.
+
+        :param sandbox_id: The dormant Job name to recreate.
+        :raises click.ClickException: On an API delete failure other than
+            not-found.
+        """
+        click.echo(f"▸ Resuming Kubernetes sandbox '{sandbox_id}'")
+        self.terminate(sandbox_id)
 
     def _delete_with_retry(self, kind: str, name: str, delete: Callable[[], object]) -> None:
         """
