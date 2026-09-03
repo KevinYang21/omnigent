@@ -36,11 +36,7 @@ import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { attachmentKey, validateAttachments } from "@/lib/attachments";
-import {
-  serverSwitcherHiddenForSurface,
-  useSurfaceFrontmost,
-} from "@/hooks/useNativeServerSwitcher";
-import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import { onNativeSidebarDrag } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import {
@@ -1438,21 +1434,6 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
-  const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
-  // True only while the chat/terminal surface is the frontmost thing on screen.
-  // Drives both native overlays so neither floats over an opened drawer.
-  const surfaceFrontmost = useSurfaceFrontmost(
-    showTerminal ? terminalSurfaceEl : containerEl,
-    !!conversationId,
-  );
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    setNativeServerSwitcherHidden(serverSwitcherHiddenForSurface(surfaceFrontmost));
-  }, [surfaceFrontmost]);
-  useEffect(() => {
-    if (!isIOSShell()) return;
-    return () => setNativeServerSwitcherHidden(true);
-  }, []);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -1582,7 +1563,6 @@ function MainAgentSurface({
           visible={isShown}
           runnerOnline={isActive ? runnerOnline : undefined}
           onResume={isActive ? handleTerminalResume : undefined}
-          onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />
         {isShown && (

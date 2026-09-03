@@ -1079,10 +1079,10 @@ export function Sidebar({
               />
             </div>
 
-            {/* Native-shell server picker, pinned below the scrolling session
-          list. Self-hiding: renders nothing outside a shell with the picker
-          bridge (see SidebarServerPicker), so browsers keep an unchanged
-          sidebar that ends with the list. */}
+            {/* The server picker for every native shell (Electron, iOS,
+          Android), pinned below the scrolling session list. Self-hiding:
+          renders nothing outside a native shell (see SidebarServerPicker), so
+          browsers keep an unchanged sidebar that ends with the list. */}
             <SidebarServerPicker />
           </>
         )}

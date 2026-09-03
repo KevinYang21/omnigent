@@ -9,13 +9,13 @@ import {
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
+  openServerSetup,
   PRE_MANIFEST_BASELINE,
   type ServerManifest,
   serverManifestOf,
   setBadgeCount as bridgeSetBadge,
-  setNativeServerSwitcherHidden,
   setThemeSource,
-  supportsNativeServerPicker,
+  startNativeShellLiveness,
   supportsBrowser,
   switchServer,
 } from "./nativeBridge";
@@ -34,19 +34,27 @@ const iosUnsubscribe = vi.fn();
 const iosOnNotificationActivated = vi.fn().mockReturnValue(iosUnsubscribe);
 const iosOnSidebarDragUnsubscribe = vi.fn();
 const iosOnSidebarDrag = vi.fn().mockReturnValue(iosOnSidebarDragUnsubscribe);
-const iosSetServerSwitcherHidden = vi.fn();
-const iosSetSidebarOpen = vi.fn();
-const iosGetServerPicker = vi.fn();
-const iosSwitchServer = vi.fn().mockResolvedValue(undefined);
 
-// The Android WebView bridge mock, installed on window.omnigentNative. The MVP
-// Android shell exposes the shell-agnostic subset (notifications + badge); the
-// optional iOS-only chrome (sidebar drag, server switcher, view mode) is absent.
+// The Android WebView bridge mock, installed on window.omnigentNative. The
+// optional iOS-only chrome (sidebar drag, view mode) is absent; the server
+// picker trio is optional and toggled per test.
 const androidSetBadge = vi.fn();
 const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
 const androidSetColorScheme = vi.fn();
+
+// The generalized server-picker trio, shared by whichever shell a test
+// installs it on (Electron preload, iOS WKWebView script, Android
+// document-start script — the same optional contract on all three).
+const shellGetServerPicker = vi.fn();
+const shellSwitchServer = vi.fn().mockResolvedValue(undefined);
+const shellOpenServerSetup = vi.fn();
+const pickerTrio = {
+  getServerPicker: (...args: unknown[]) => shellGetServerPicker(...args),
+  switchServer: (...args: unknown[]) => shellSwitchServer(...args),
+  openServerSetup: (...args: unknown[]) => shellOpenServerSetup(...args),
+};
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -56,7 +64,12 @@ const androidSetColorScheme = vi.fn();
  * capability marker `supportsBrowser()` probes; off by default so it stands in
  * for a desktop build that predates the embedded browser feature.
  */
-function setElectron(on: boolean, withClickRouting = true, withBrowser = false): void {
+function setElectron(
+  on: boolean,
+  withClickRouting = true,
+  withBrowser = false,
+  withPicker = false,
+): void {
   if (on) {
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
@@ -70,39 +83,27 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
           }
         : {}),
       ...(withBrowser ? { browserOpenOrNavigate: () => Promise.resolve({ ok: true }) } : {}),
+      ...(withPicker ? pickerTrio : {}),
     };
   } else {
     delete (window as unknown as Record<string, unknown>).omnigentDesktop;
   }
 }
 
-/**
- * Simulate running inside / outside the iOS shell via the WKWebView bridge.
- * `withServerPicker` toggles the optional server-picker trio so tests can also
- * exercise a shell too old to host the sidebar picker (which then keeps its
- * own floating pill).
- */
-function setIOS(on: boolean, withClickRouting = true, withServerPicker = false): void {
+/** Simulate running inside / outside the iOS shell via the WKWebView bridge. */
+function setIOS(on: boolean, withClickRouting = true, withPicker = false): void {
   if (on) {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "ios",
       setBadgeCount: (...args: unknown[]) => iosSetBadge(...args),
       notify: (...args: unknown[]) => iosNotify(...args),
-      setServerSwitcherHidden: (...args: unknown[]) => iosSetServerSwitcherHidden(...args),
-      setSidebarOpen: (...args: unknown[]) => iosSetSidebarOpen(...args),
       onSidebarDrag: (...args: unknown[]) => iosOnSidebarDrag(...args),
       ...(withClickRouting
         ? {
             onNotificationActivated: (...args: unknown[]) => iosOnNotificationActivated(...args),
           }
         : {}),
-      ...(withServerPicker
-        ? {
-            getServerPicker: (...args: unknown[]) => iosGetServerPicker(...args),
-            switchServer: (...args: unknown[]) => iosSwitchServer(...args),
-            openServerSetup: () => {},
-          }
-        : {}),
+      ...(withPicker ? pickerTrio : {}),
     };
   } else {
     delete (window as unknown as Record<string, unknown>).omnigentNative;
@@ -110,7 +111,7 @@ function setIOS(on: boolean, withClickRouting = true, withServerPicker = false):
 }
 
 /** Simulate running inside / outside the Android shell via the WebView bridge. */
-function setAndroid(on: boolean, withClickRouting = true): void {
+function setAndroid(on: boolean, withClickRouting = true, withPicker = false): void {
   if (on) {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "android",
@@ -123,6 +124,7 @@ function setAndroid(on: boolean, withClickRouting = true): void {
               androidOnNotificationActivated(...args),
           }
         : {}),
+      ...(withPicker ? pickerTrio : {}),
     };
   } else {
     delete (window as unknown as Record<string, unknown>).omnigentNative;
@@ -165,7 +167,7 @@ describe("isNativeShell / isElectronShell", () => {
   });
 
   it("treats the Android bridge as native but not Electron or iOS", () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     expect(isElectronShell()).toBe(false);
     expect(isIOSShell()).toBe(false);
     expect(isAndroidShell()).toBe(true);
@@ -176,7 +178,7 @@ describe("isNativeShell / isElectronShell", () => {
     setIOS(true);
     expect(isAndroidShell()).toBe(false);
     setIOS(false);
-    setAndroid(true);
+    setAndroid(true, true, true);
     expect(isIOSShell()).toBe(false);
   });
 
@@ -296,7 +298,7 @@ describe("setThemeSource", () => {
   });
 
   it("routes the selected theme through the Android bridge", () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     setThemeSource("light");
     expect(androidSetColorScheme).toHaveBeenCalledWith("light");
   });
@@ -341,7 +343,7 @@ describe("nativeNotify", () => {
   });
 
   it("routes the notification through the Android bridge when present", async () => {
-    setAndroid(true);
+    setAndroid(true, true, true);
     await expect(nativeNotify({ title: "Session 1", body: "done" })).resolves.toBe(true);
     expect(androidNotify).toHaveBeenCalledWith({
       title: "Session 1",
@@ -507,89 +509,92 @@ describe("setBadgeCount", () => {
   });
 });
 
-describe("setNativeServerSwitcherHidden", () => {
-  it("is a no-op outside the shell", () => {
-    setNativeServerSwitcherHidden(true);
-    expect(iosSetServerSwitcherHidden).not.toHaveBeenCalled();
-  });
+describe("server picker trio (getServerPicker / switchServer / openServerSetup)", () => {
+  const info = {
+    currentOrigin: "http://localhost:8000",
+    recentServers: ["https://managed.example.com/", "https://recent.example.com/"],
+  };
 
-  it("routes switcher visibility through the iOS bridge", () => {
-    setIOS(true);
-    setNativeServerSwitcherHidden(true);
-    setNativeServerSwitcherHidden(false);
-    expect(iosSetServerSwitcherHidden).toHaveBeenNthCalledWith(1, true);
-    expect(iosSetServerSwitcherHidden).toHaveBeenNthCalledWith(2, false);
-    expect(iosSetSidebarOpen).not.toHaveBeenCalled();
-  });
-
-  it("falls back to the legacy sidebar bridge name", () => {
-    setIOS(true);
-    delete (window as unknown as { omnigentNative: Record<string, unknown> }).omnigentNative
-      .setServerSwitcherHidden;
-    setNativeServerSwitcherHidden(true);
-    expect(iosSetSidebarOpen).toHaveBeenCalledWith(true);
-  });
-
-  it("does not throw when the bridge setter throws", () => {
-    setIOS(true);
-    iosSetServerSwitcherHidden.mockImplementationOnce(() => {
-      throw new Error("bridge down");
-    });
-    expect(() => setNativeServerSwitcherHidden(true)).not.toThrow();
-  });
-});
-
-describe("supportsNativeServerPicker", () => {
-  it("is false in a plain browser", () => {
-    expect(supportsNativeServerPicker()).toBe(false);
-  });
-
-  it("is false on an iOS shell without the picker bridge (floating-pill era)", () => {
-    setIOS(true);
-    expect(supportsNativeServerPicker()).toBe(false);
-  });
-
-  it("is true on an iOS shell exposing the picker bridge", () => {
-    setIOS(true, true, true);
-    expect(supportsNativeServerPicker()).toBe(true);
-  });
-
-  it("is false when a version-skewed shell exposes only part of the trio", () => {
-    setIOS(true, true, true);
-    delete (window as unknown as { omnigentNative: Record<string, unknown> }).omnigentNative
-      .openServerSetup;
-    expect(supportsNativeServerPicker()).toBe(false);
-  });
-});
-
-describe("getServerPicker / switchServer over the iOS bridge", () => {
-  it("resolves the iOS shell's picker payload", async () => {
-    setIOS(true, true, true);
-    const info = {
-      currentOrigin: "https://ios.example.test",
-      managedServers: [],
-      recentServers: ["https://ios.example.test/", "https://other.example.test/"],
-    };
-    iosGetServerPicker.mockResolvedValue(info);
-
+  it.each([
+    ["iOS", () => setIOS(true, true, true)],
+    ["Android", () => setAndroid(true, true, true)],
+    ["Electron", () => setElectron(true, true, false, true)],
+  ])("fetches picker info through the %s shell", async (_kind, install) => {
+    install();
+    shellGetServerPicker.mockResolvedValue(info);
     await expect(getServerPicker()).resolves.toEqual(info);
+    expect(shellGetServerPicker).toHaveBeenCalledOnce();
   });
 
-  it("resolves null on an iOS shell without the picker bridge", async () => {
+  it.each([
+    ["iOS", () => setIOS(true, true, true)],
+    ["Android", () => setAndroid(true, true, true)],
+    ["Electron", () => setElectron(true, true, false, true)],
+  ])("routes a server switch through the %s shell", async (_kind, install) => {
+    install();
+    await switchServer("https://recent.example.com/");
+    expect(shellSwitchServer).toHaveBeenCalledWith("https://recent.example.com/");
+  });
+
+  it.each([
+    ["iOS", () => setIOS(true, true, true)],
+    ["Android", () => setAndroid(true, true, true)],
+    ["Electron", () => setElectron(true, true, false, true)],
+  ])("opens server setup through the %s shell", (_kind, install) => {
+    install();
+    openServerSetup();
+    expect(shellOpenServerSetup).toHaveBeenCalledOnce();
+  });
+});
+
+describe("mobile shell compatibility handshake", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("announces readiness and keeps a protocol-1 shell alive", () => {
+    const ready = vi.fn();
+    const heartbeat = vi.fn();
+    setAndroid(true, true, true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentNative as object, {
+      nativeBridgeVersion: 1,
+      nativeWebReady: ready,
+      nativeHeartbeat: heartbeat,
+    });
+
+    const stop = startNativeShellLiveness();
+    expect(ready).toHaveBeenCalledWith(1);
+    vi.advanceTimersByTime(5_000);
+    expect(heartbeat).toHaveBeenCalledWith(1);
+    stop();
+    vi.advanceTimersByTime(5_000);
+    expect(heartbeat).toHaveBeenCalledOnce();
+  });
+
+  it("handshakes when Android installs its fallback bridge after mount", () => {
+    const ready = vi.fn();
+    const heartbeat = vi.fn();
+    const stop = startNativeShellLiveness();
+    setAndroid(true, true, true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentNative as object, {
+      nativeBridgeVersion: 1,
+      nativeWebReady: ready,
+      nativeHeartbeat: heartbeat,
+    });
+
+    window.dispatchEvent(new Event("omnigent-native-bridge-ready"));
+    expect(ready).toHaveBeenCalledWith(1);
+    stop();
+  });
+
+  it("is inert in browsers and replaces an old shell with full-screen incompatibility", () => {
+    const stopBrowser = startNativeShellLiveness();
     setIOS(true);
-    await expect(getServerPicker()).resolves.toBeNull();
-    expect(iosGetServerPicker).not.toHaveBeenCalled();
-  });
-
-  it("routes a switch request through the iOS bridge", async () => {
-    setIOS(true, true, true);
-    await switchServer("https://other.example.test/");
-    expect(iosSwitchServer).toHaveBeenCalledWith("https://other.example.test/");
-  });
-
-  it("resolves null when the iOS picker bridge rejects", async () => {
-    setIOS(true, true, true);
-    iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
-    await expect(getServerPicker()).resolves.toBeNull();
+    const stopOldShell = startNativeShellLiveness();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(document.getElementById("omnigent-native-incompatible")).toHaveTextContent(
+      "App update required",
+    );
+    stopBrowser();
+    stopOldShell();
   });
 });

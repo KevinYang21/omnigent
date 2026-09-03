@@ -18,42 +18,42 @@ import {
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
-/** Short display label for a server URL — its host, e.g. "localhost:8000". */
-function hostOf(url: string): string {
+/** Compact display label that keeps path-based deployments distinguishable. */
+function serverLabel(url: string): string {
   try {
-    return new URL(url).host;
+    const parsed = new URL(url);
+    const path = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/$/, "");
+    return `${parsed.host}${path}`;
   } catch {
     return url;
   }
 }
 
-/** Origin of a server URL, for matching recents against the current origin. */
-function originOf(url: string): string | null {
+/** Browser-canonical server identity, retaining path and query. */
+function serverKey(url: string): string {
   try {
-    return new URL(url).origin;
+    const parsed = new URL(url);
+    parsed.hash = "";
+    if (parsed.pathname.length > 1) parsed.pathname = parsed.pathname.replace(/\/$/, "");
+    return parsed.href;
   } catch {
-    return null;
+    return `raw:${url}`;
   }
 }
 
 /**
- * Server picker for the native shells (Electron desktop and iOS), pinned to
+ * The server picker for every native shell (Electron, iOS, Android), pinned to
  * the sidebar's bottom.
  *
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
  * menu of organization-provided and recently-connected servers — selecting one
- * re-points the whole window via the shell — plus "Connect to new server…",
- * which returns the window to the shell's setup page.
+ * re-points the whole surface via the shell; setup opens from the final item.
  *
- * This deliberately lives at the bottom of the sidebar rather than in the
- * chat surface's top strip. The macOS shell hides the native title bar
- * (titleBarStyle "hiddenInset"), and the previous picker filled that freed
- * strip with a centered "<thread> — <host>" label. But the chat header
- * occupies the same strip (`absolute top-0`, and taller at h-14), so on a
- * narrow window the centered label ran into the header's action cluster. The
- * iOS shell repeated the same mistake with its floating pill, which crowded
- * the chat header's title and floating controls on a notched iPhone. Docking
- * the picker here takes it out of that contested space on both shells.
+ * This deliberately lives at the bottom of the sidebar rather than in any
+ * shell's own chrome. On desktop the chat header already contests the freed
+ * title-bar strip; on iOS/Android a floating top pill fought the header band
+ * and needed inset/visibility choreography. Docking the picker here gives all
+ * three shells one picker with none of that.
  *
  * Renders nothing until the shell confirms this page is a connected server
  * (getServerPicker resolves non-null) — so it's absent in plain browsers, under
@@ -63,6 +63,12 @@ function originOf(url: string): string | null {
  */
 export function SidebarServerPicker() {
   const [info, setInfo] = useState<ServerPickerInfo | null>(null);
+
+  const refresh = () => {
+    void getServerPicker().then((result) => {
+      if (result) setInfo(result);
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -76,28 +82,34 @@ export function SidebarServerPicker() {
 
   if (!info) return null;
 
+  const currentUrl = info.currentServerUrl ?? info.currentOrigin;
+  const currentKey = serverKey(currentUrl);
+  const matchesCurrent =
+    info.currentServerUrl === undefined
+      ? (url: string) => {
+          try {
+            return new URL(url).origin === info.currentOrigin;
+          } catch {
+            return false;
+          }
+        }
+      : (url: string) => serverKey(url) === currentKey;
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
-  const managedOrigins = new Set(managed.map(originOf).filter((origin) => origin !== null));
-  const currentIsManaged = managedOrigins.has(info.currentOrigin);
+  const managedKeys = new Set(managed.map(serverKey));
+  const currentIsManaged = managed.some(matchesCurrent);
   // The current server leads its section even when settings were edited out
-  // from under us. Managed origins are not repeated under Recents.
+  // from under us. Managed servers are not repeated under Recents.
   const recentOthers = info.recentServers.filter((url) => {
-    const origin = originOf(url);
-    return origin !== info.currentOrigin && (origin === null || !managedOrigins.has(origin));
+    const key = serverKey(url);
+    return !matchesCurrent(url) && !managedKeys.has(key);
   });
-  const currentHost = hostOf(info.currentOrigin);
+  const currentLabel = serverLabel(currentUrl);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
     // list above (flex-1) gives up space instead of squashing it.
     <div className="shrink-0 px-2 pt-1 pb-2" data-testid="sidebar-server-picker-row">
-      <DropdownMenu
-        onOpenChange={(open) => {
-          // Re-read when opened so a newly applied/removed MDM profile appears
-          // without restarting the server-served SPA.
-          if (open) void getServerPicker().then(setInfo);
-        }}
-      >
+      <DropdownMenu onOpenChange={(open) => open && refresh()}>
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
@@ -108,34 +120,36 @@ export function SidebarServerPicker() {
             className={cn(
               SIDEBAR_ROW,
               "w-full justify-start border-0 font-normal",
+              // Touch drawers need a 44px target while desktop stays compact.
+              "min-h-11 md:min-h-0",
               "text-muted-foreground",
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",
             )}
-            aria-label={`Server: ${currentHost}. Switch server`}
+            aria-label={`Server: ${currentLabel}. Switch server`}
             data-testid="sidebar-server-picker"
           >
             <ServerIcon className="ui-icon text-muted-foreground" />
-            <span className="truncate">{currentHost}</span>
+            <span className="truncate">{currentLabel}</span>
             {/* Points up: the menu opens upward from the sidebar's bottom. */}
             <ChevronUpIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
         {/* side="top" — the trigger sits at the bottom of the window, so the
             menu must grow upward rather than off-screen. */}
-        <DropdownMenuContent side="top" align="start" className="min-w-56">
+        <DropdownMenuContent side="top" align="start" collisionPadding={8} className="min-w-56">
           {managed.length > 0 ? (
             <>
               <DropdownMenuLabel className="text-muted-foreground">
                 Provided by your organization
               </DropdownMenuLabel>
               {managed.map((url) => {
-                const isCurrent = originOf(url) === info.currentOrigin;
+                const isCurrent = matchesCurrent(url);
                 return (
                   <DropdownMenuItem
                     key={url}
                     disabled={isCurrent}
-                    className={cn("gap-2", isCurrent && "opacity-100")}
+                    className={cn("gap-2 min-h-11 md:min-h-0", isCurrent && "opacity-100")}
                     onSelect={isCurrent ? undefined : () => void switchServer(url)}
                   >
                     {isCurrent ? (
@@ -144,7 +158,7 @@ export function SidebarServerPicker() {
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
                     <span className={cn("truncate", isCurrent && "font-medium")}>
-                      {hostOf(url)}
+                      {serverLabel(url)}
                     </span>
                   </DropdownMenuItem>
                 );
@@ -156,25 +170,28 @@ export function SidebarServerPicker() {
               {managed.length > 0 ? <DropdownMenuSeparator /> : null}
               <DropdownMenuLabel className="text-muted-foreground">Recents</DropdownMenuLabel>
               {!currentIsManaged ? (
-                <DropdownMenuItem disabled className="gap-2 opacity-100">
+                <DropdownMenuItem disabled className="gap-2 min-h-11 opacity-100 md:min-h-0">
                   <CheckIcon className="size-4 shrink-0" />
-                  <span className="truncate font-medium">{currentHost}</span>
+                  <span className="truncate font-medium">{currentLabel}</span>
                 </DropdownMenuItem>
               ) : null}
               {recentOthers.map((url) => (
                 <DropdownMenuItem
                   key={url}
-                  className="gap-2"
+                  className="gap-2 min-h-11 md:min-h-0"
                   onSelect={() => void switchServer(url)}
                 >
                   <span className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="truncate">{hostOf(url)}</span>
+                  <span className="truncate">{serverLabel(url)}</span>
                 </DropdownMenuItem>
               ))}
             </>
           ) : null}
           <DropdownMenuSeparator />
-          <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
+          <DropdownMenuItem
+            className="gap-2 min-h-11 md:min-h-0"
+            onSelect={() => openServerSetup()}
+          >
             <PlusIcon className="size-4 shrink-0" />
             Connect to new server…
           </DropdownMenuItem>

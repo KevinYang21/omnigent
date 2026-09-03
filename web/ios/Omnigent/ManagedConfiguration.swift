@@ -56,15 +56,12 @@ struct OmnigentManagedConfiguration: Decodable, Equatable {
           "'serverUrls' has \(raw.count) entries; at most \(Self.maxServerURLs) are allowed.")
     }
 
-    var origins: Set<String> = []
+    var serverKeys: Set<String> = []
     var urls: [URL] = []
     for entry in raw {
       let url = try Self.normalize(entry)
-      // Same origin comparison the rest of the shell uses, so a duplicate is
-      // dropped rather than offered twice. Note this does not canonicalize a
-      // redundant `:443`, matching `URL.omnigentOrigin` everywhere else.
-      guard let origin = url.omnigentOrigin else { throw Self.invalidURL(entry) }
-      if origins.insert(origin).inserted {
+      guard let key = url.omnigentServerKey else { throw Self.invalidURL(entry) }
+      if serverKeys.insert(key).inserted {
         urls.append(url)
       }
     }
@@ -138,20 +135,24 @@ struct OmnigentManagedConfiguration: Decodable, Equatable {
 /// `SettingsStore`, so withdrawing a configuration removes them cleanly and
 /// they never consume the recents cap and evict a server the user chose.
 enum ManagedServers {
-  /// `recents` minus any origin the administrator already presets, so a preset
+  /// `recents` minus any exact server the administrator already presets, so a preset
   /// server is offered once rather than twice.
   static func recents(_ recents: [String], excludingManaged managed: [URL]) -> [String] {
     guard !managed.isEmpty else { return recents }
-    let managedOrigins = Set(managed.compactMap(\.omnigentOrigin))
+    let managedKeys = Set(managed.compactMap(\.omnigentServerKey))
     return recents.filter { value in
-      guard let origin = URL(string: value)?.omnigentOrigin else { return true }
-      return !managedOrigins.contains(origin)
+      guard let key = URL(string: value)?.omnigentServerKey else { return true }
+      return !managedKeys.contains(key)
     }
   }
 
   /// Every server to offer, administrator-preset ones first.
   static func merged(managed: [URL], recents: [String]) -> [String] {
-    managed.map(\.absoluteString) + Self.recents(recents, excludingManaged: managed)
+    var seen = Set<String>()
+    return (managed.map(\.absoluteString) + recents).filter { value in
+      guard let key = URL(string: value)?.omnigentServerKey else { return false }
+      return seen.insert(key).inserted
+    }
   }
 
   /// Picks between the two configuration channels. A declarative configuration

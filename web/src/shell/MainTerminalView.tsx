@@ -62,11 +62,6 @@ interface MainTerminalViewProps {
   runnerOnline?: boolean;
   /** Relaunch or reconnect the session without replaying user input. */
   onResume?: () => void | Promise<void>;
-  /**
-   * Exposes the outer terminal surface so the iOS native shell can show its
-   * server switcher only while this surface is actually frontmost.
-   */
-  onSurfaceElement?: (element: HTMLElement | null) => void;
 }
 
 export function MainTerminalView({
@@ -76,7 +71,6 @@ export function MainTerminalView({
   readOnly = false,
   runnerOnline,
   onResume,
-  onSurfaceElement,
 }: MainTerminalViewProps) {
   const { terminals } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
@@ -166,12 +160,6 @@ export function MainTerminalView({
     (terminalFirstCtx?.isTerminalFirst ?? false) &&
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
-  const setSurfaceElement = useCallback(
-    (element: HTMLDivElement | null) => {
-      onSurfaceElement?.(element);
-    },
-    [onSurfaceElement],
-  );
 
   return (
     // Outer wrapper fills the main column. `pt-14` clears the 56px
@@ -184,7 +172,6 @@ export function MainTerminalView({
     // available area. The ConnectionIndicator band renders just below
     // this wrapper in ChatPage's MainAgentSurface.
     <div
-      ref={setSurfaceElement}
       data-testid="main-terminal-view"
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).

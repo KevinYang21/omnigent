@@ -26,6 +26,7 @@ import {
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
+  startNativeShellLiveness,
   supportsBrowser,
   updateBridge,
 } from "@/lib/nativeBridge";
@@ -181,6 +182,7 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 }
 
 export function AppShell() {
+  useEffect(() => startNativeShellLiveness(), []);
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
