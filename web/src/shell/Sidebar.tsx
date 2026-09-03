@@ -3330,8 +3330,10 @@ function ConversationRow({
   const activeRootId = useActiveRootSessionId(activeId ?? null);
   const isActive = (activeRootId ?? activeId) === conversation.id;
   // Warm the `["session", id]` snapshot on hover (100ms debounced) / focus so
-  // clicking the row opens an already-fetched conversation. Shared scheduler
-  // keeps at most one prefetch in flight while skimming.
+  // the Infinity-staleTime consumers (permission level, Agents rail, header
+  // pickers) hit a warm cache when the row opens. Shared scheduler keeps at
+  // most one prefetch in flight while skimming. (bindStream re-reads the
+  // snapshot itself with refresh_state, so this uses the light read.)
   const prefetchHandlers = useSessionRowPrefetch(conversation.id);
   const navigate = useNavigate();
   // Mobile has no real hover, so a tap that navigates would also trip the

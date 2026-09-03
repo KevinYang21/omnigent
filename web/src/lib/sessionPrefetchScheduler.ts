@@ -1,7 +1,15 @@
 // Warms the `["session", id]` snapshot cache while the user skims the sidebar,
-// so clicking a row opens an already-fetched conversation. The open path
-// (chatStore.bindStream) fetches the SAME query key, so a warmed entry is a
-// direct cache hit — no duplicate request.
+// so consumers that read it with `staleTime: Infinity` — `useSession`
+// (permission level), the Agents-rail root walk, the chat header/pickers —
+// hit a warm cache the moment the row is opened instead of fetching then.
+//
+// NOTE: this does NOT short-circuit `bindStream`'s own load. Bind refetches the
+// snapshot with `staleTime: 0` (and `refresh_state=true`) on purpose — a cached
+// snapshot can miss items committed while another conversation was open — so it
+// always re-reads regardless of what's warmed. The prefetch therefore uses the
+// LIGHT read (no `refresh_state`): warming the cheap snapshot for the
+// Infinity-staleTime consumers, without paying for the heavy runner-state
+// refresh that bind will redo anyway.
 //
 // "At most one in-flight prefetch while skimming": a hover/focus over one row
 // after another shouldn't fire a burst of concurrent fetches. The scheduler
@@ -38,7 +46,7 @@ export class SessionPrefetchScheduler {
     void this.queryClient
       .prefetchQuery({
         queryKey: ["session", conversationId],
-        queryFn: () => getSessionSlim(conversationId, { refreshState: true }),
+        queryFn: () => getSessionSlim(conversationId),
         staleTime: Infinity,
       })
       .finally(() => {
