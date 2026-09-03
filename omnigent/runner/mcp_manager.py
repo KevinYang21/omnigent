@@ -35,14 +35,10 @@ def _schema_requires_fields(params: ElicitRequestParams) -> bool:
     :param params: The elicitation params from the MCP server.
     :returns: ``True`` when at least one property is required.
     """
+    from omnigent.tools._elicitation_schema import schema_requires_fields
+
     schema = getattr(params, "requestedSchema", None)
-    if not isinstance(schema, dict):
-        return False
-    properties = schema.get("properties")
-    if not (isinstance(properties, dict) and properties):
-        return False
-    required = schema.get("required")
-    return isinstance(required, list) and bool(required)
+    return schema_requires_fields(schema if isinstance(schema, dict) else None)
 
 
 def _validated_content(

@@ -383,3 +383,27 @@ def test_proxy_input_response_bare_accept_and_decline() -> None:
 
     assert accept == {"action": "accept"}
     assert decline == {"action": "decline"}
+
+
+def test_proxy_input_response_declines_a_bare_accept_when_fields_are_required() -> None:
+    """A content-less approve against a required-field schema declines.
+
+    Mirrors the inline path's required-aware gate: forwarding
+    ``{"action": "accept"}`` with no content for a schema whose fields are
+    ``required`` is malformed — the server rejects it and the MRTR retry loop
+    spins ("Approval loop exceeded") — so the proxy declines instead of
+    sending a body the server's own schema will refuse.
+    """
+    from omnigent.runner.proxy_mcp_manager import _input_response
+
+    required_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"answer": {"type": "string", "enum": ["dev", "staging", "prod"]}},
+        "required": ["answer"],
+    }
+
+    entry = _input_response(
+        pending_approvals.Verdict(approved=True), _mrtr_request(required_schema)
+    )
+
+    assert entry == {"action": "decline"}

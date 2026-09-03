@@ -81,7 +81,11 @@ def validate_content_against_schema(
 
     :param content: The content the person's verdict carried, or ``None``.
     :param schema: The elicitation's ``requestedSchema``, or ``None``.
-    :returns: The content when it conforms, otherwise ``None``.
+    :returns: The content when it conforms, otherwise ``None``. ``None`` means
+        "nothing to forward": either the verdict carried no content, or what it
+        carried did not fit the schema. A caller that must tell those apart
+        checks the supplied content's own truthiness — an answer that was given
+        but rejected fails closed, while no answer at all falls back.
     """
     if not content:
         return None
@@ -100,6 +104,28 @@ def validate_content_against_schema(
     ):
         return None
     return content
+
+
+def schema_requires_fields(schema: dict[str, Any] | None) -> bool:
+    """
+    Whether a ``requestedSchema`` names fields it requires.
+
+    A schema with no properties is a bare consent prompt, and one whose
+    properties are all optional legally accepts an answer with no content —
+    only a non-empty ``required`` list makes an empty accept malformed, so a
+    surface that collected nothing should decline rather than send one the
+    server will reject.
+
+    :param schema: The elicitation's ``requestedSchema``, or ``None``.
+    :returns: ``True`` when the schema declares at least one required field.
+    """
+    if not isinstance(schema, dict):
+        return False
+    properties = schema.get("properties")
+    if not (isinstance(properties, dict) and properties):
+        return False
+    required = schema.get("required")
+    return isinstance(required, list) and bool(required)
 
 
 def build_accept_content_from_schema(

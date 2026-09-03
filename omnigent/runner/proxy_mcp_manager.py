@@ -78,7 +78,10 @@ def _input_response(
         carrying ``params.requestedSchema``; ``None`` when unavailable.
     :returns: The wire object for this elicitation id.
     """
-    from omnigent.tools._elicitation_schema import validate_content_against_schema
+    from omnigent.tools._elicitation_schema import (
+        schema_requires_fields,
+        validate_content_against_schema,
+    )
 
     if not verdict.approved:
         return {"action": "decline"}
@@ -93,6 +96,17 @@ def _input_response(
         _logger.warning(
             "MCP proxy elicitation answer does not conform to the "
             "requestedSchema — declining instead of forwarding it"
+        )
+        return {"action": "decline"}
+    if content is None and schema_requires_fields(
+        cast("dict[str, object]", schema) if schema is not None else None
+    ):
+        # A bare accept (no content) against a schema that requires fields is
+        # malformed — the server rejects it and the MRTR retry loop spins — so
+        # decline, matching the inline elicitation path's required-aware gate.
+        _logger.info(
+            "MCP proxy elicitation accepted with no content for a schema "
+            "that requires fields — declining instead"
         )
         return {"action": "decline"}
     response: _JsonObject = {"action": "accept"}
