@@ -10,6 +10,7 @@ import {
 import { useNavigate, useParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { ChatStoreScopeProvider, useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   findWorkspaceLeaf,
   useWorkspaceLayoutStore,
@@ -172,6 +173,14 @@ function WorkspaceLeafView({
     if (!sessionId || focused) return;
     void useChatStore.getState().loadInBackground(sessionId);
   }, [sessionId, focused]);
+
+  // A visible pane's conversation must never lose its stream slot: eviction
+  // would drop the entry and the pane would fall back to an empty transcript.
+  useEffect(() => {
+    if (!sessionId) return;
+    conversationRegistry.pin(sessionId);
+    return () => conversationRegistry.unpin(sessionId);
+  }, [sessionId]);
 
   const focus = () => {
     if (!sessionId || focused) return;

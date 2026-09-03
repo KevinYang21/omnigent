@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { useWorkspaceLayoutStore } from "@/store/workspaceLayout";
 import { WorkspacePage } from "./WorkspacePage";
 
@@ -81,10 +82,22 @@ describe("WorkspacePage", () => {
     const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
     act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
 
-    renderWorkspace("/c/session-b");
+    const pinSpy = vi.spyOn(conversationRegistry, "pin");
+    const unpinSpy = vi.spyOn(conversationRegistry, "unpin");
+    const { unmount } = renderWorkspace("/c/session-b");
 
     await waitFor(() => expect(chatStoreMocks.loadInBackground).toHaveBeenCalledWith("session-a"));
     expect(chatStoreMocks.loadInBackground).not.toHaveBeenCalledWith("session-b");
+
+    // Both pane conversations are pinned against stream-slot eviction while
+    // visible, and released once the workspace unmounts.
+    expect(pinSpy).toHaveBeenCalledWith("session-a");
+    expect(pinSpy).toHaveBeenCalledWith("session-b");
+    unmount();
+    expect(unpinSpy).toHaveBeenCalledWith("session-a");
+    expect(unpinSpy).toHaveBeenCalledWith("session-b");
+    pinSpy.mockRestore();
+    unpinSpy.mockRestore();
   });
 
   it("keeps the landing and ordinary single-session routes unsplit", async () => {

@@ -8,6 +8,12 @@ function StatusProbe({ label }: { label: string }) {
   return <div data-testid={label}>{status}</div>;
 }
 
+function TodosProbe({ label, seen }: { label: string; seen: unknown[] }) {
+  const todos = useChatStore((state) => state.todos);
+  seen.push(todos);
+  return <div data-testid={label}>{todos.length}</div>;
+}
+
 describe("ChatStoreScopeProvider", () => {
   beforeEach(() => {
     conversationRegistry.clear();
@@ -51,5 +57,21 @@ describe("ChatStoreScopeProvider", () => {
       </ChatStoreScopeProvider>,
     );
     expect(screen.getByTestId("session-missing")).toHaveTextContent("idle");
+  });
+
+  it("returns stable snapshots while the scoped entry is missing", () => {
+    // useSyncExternalStore tears when getSnapshot returns a fresh reference
+    // per call: every field of the fallback state must keep its identity
+    // across renders, or array/object selectors loop "Maximum update depth".
+    bindConversationForTest("session-a");
+    const seen: unknown[] = [];
+    render(
+      <ChatStoreScopeProvider conversationId="session-missing">
+        <TodosProbe label="todos" seen={seen} />
+      </ChatStoreScopeProvider>,
+    );
+    expect(screen.getByTestId("todos")).toHaveTextContent("0");
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((todos) => todos === seen[0])).toBe(true);
   });
 });

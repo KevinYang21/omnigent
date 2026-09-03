@@ -2052,21 +2052,35 @@ const baseChatStore = create<ChatState>((_rootSet, get) => ({
     if (get().conversationId === conversationId) return;
     if (isConversationStreamCurrent(conversationId)) return;
 
-    // Same dead-entry handling as switchTo: a retained entry whose stream
-    // died must re-bind from a clean slate, or hydration prepends onto stale
-    // blocks. Unsent bubbles survive — the server never saw them.
-    const unsentOnRebind =
-      conversationRegistry
-        .peek(conversationId)
-        ?.getState()
-        .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
-    conversationRegistry.release(conversationId);
-    const entry = conversationRegistry.acquire(conversationId);
-    entry.setState({
-      loadingConversation: true,
-      ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
-    });
-    await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+    // StrictMode double-fires the pane mount effect, so concurrent binds are
+    // normal. A second bind that released the first entry would double the
+    // stream slots held and evict other panes under the dev-slot budget.
+    const inFlight = backgroundBindPromises.get(conversationId);
+    if (inFlight !== undefined) return inFlight;
+
+    const bindPromise = (async () => {
+      // Same dead-entry handling as switchTo: a retained entry whose stream
+      // died must re-bind from a clean slate, or hydration prepends onto
+      // stale blocks. Unsent bubbles survive — the server never saw them.
+      const unsentOnRebind =
+        conversationRegistry
+          .peek(conversationId)
+          ?.getState()
+          .pendingUserMessages.filter((p) => p.posted !== true) ?? [];
+      conversationRegistry.release(conversationId);
+      const entry = conversationRegistry.acquire(conversationId);
+      entry.setState({
+        loadingConversation: true,
+        ...(unsentOnRebind.length > 0 ? { pendingUserMessages: unsentOnRebind } : {}),
+      });
+      await bindStream(conversationId, entrySetter(entry), entryGetter(entry), true);
+    })();
+    backgroundBindPromises.set(conversationId, bindPromise);
+    try {
+      await bindPromise;
+    } finally {
+      backgroundBindPromises.delete(conversationId);
+    }
   },
 
   submitApproval: async (elicitationId, action, content) => {
@@ -2434,16 +2448,49 @@ export function ChatStoreScopeProvider({
   return createElement(ChatStoreScopeContext.Provider, { value: conversationId }, children);
 }
 
+interface ScopedStateCacheEntry {
+  root: ChatState;
+  conversation: ConversationState;
+  merged: ChatState;
+}
+
+// getSnapshot must return a reference-stable result while nothing changed,
+// or useSyncExternalStore tears and array/object selectors re-render forever.
+// Merge only when the root or the conversation snapshot actually moved.
+const scopedStateCache = new Map<string, ScopedStateCacheEntry>();
+
+let missingEntryStateCache: ConversationState | null = null;
+
+function missingEntryState(): ConversationState {
+  missingEntryStateCache ??= createInitialConversationState();
+  return missingEntryStateCache;
+}
+
+/** In-flight background binds, keyed so concurrent calls share one stream. */
+const backgroundBindPromises = new Map<string, Promise<void>>();
+
 function scopedChatState(conversationId: string): ChatState {
   const root = baseChatStore.getState();
   const entry = conversationRegistry.peek(conversationId);
-  if (entry !== undefined && !entry.disposed) {
-    return { ...root, ...entry.getState() };
-  }
   // A pane whose conversation has no live entry (a restored split layout
   // before loadInBackground lands, or an evicted entry) must never paint the
-  // root store — that is a DIFFERENT conversation's transcript.
-  return { ...root, ...createInitialConversationState() };
+  // root store — that is a DIFFERENT conversation's transcript — so it
+  // reads the initial conversation state instead.
+  const conversation =
+    entry !== undefined && !entry.disposed ? entry.getState() : missingEntryState();
+  const cached = scopedStateCache.get(conversationId);
+  if (cached !== undefined && cached.root === root && cached.conversation === conversation) {
+    return cached.merged;
+  }
+  if (scopedStateCache.size >= 32) {
+    // Bound the cache: pane conversations are few, but a long session should
+    // not accumulate one merged state per conversation ever shown in a pane.
+    const oldest = scopedStateCache.keys().next();
+    if (!oldest.done) scopedStateCache.delete(oldest.value);
+  }
+  const merged = { ...root, ...conversation };
+  scopedStateCache.set(conversationId, { root, conversation, merged });
+  return merged;
 }
 
 function useScopedChatStoreValue<T>(

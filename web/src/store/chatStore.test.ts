@@ -608,6 +608,25 @@ describe("chatStore — loadInBackground", () => {
     await useChatStore.getState().loadInBackground("conv_b");
     expect(fetchMock.mock.calls.length).toBe(afterBackgroundBind);
   });
+
+  it("dedupes concurrent binds for the same conversation", async () => {
+    // StrictMode double-fires the pane mount effect; a second bind while the
+    // first is still opening would release the first entry and double the
+    // stream slots, evicting other panes under the dev-slot budget.
+    seedSession("conv_a", [userMessage("resp_a", "in a")]);
+    seedSession("conv_b", [userMessage("resp_b", "in b")]);
+
+    await useChatStore.getState().switchTo("conv_a");
+    await Promise.all([
+      useChatStore.getState().loadInBackground("conv_b"),
+      useChatStore.getState().loadInBackground("conv_b"),
+    ]);
+    const streamOpens = fetchMock.mock.calls.filter(
+      ([url]) => String(url).split("?")[0] === "/v1/sessions/conv_b/stream",
+    );
+    expect(streamOpens).toHaveLength(1);
+    expect(conversationRegistry.ids().filter((id) => id === "conv_b")).toHaveLength(1);
+  });
 });
 
 describe("chatStore — switchTo", () => {
