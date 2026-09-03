@@ -14,6 +14,7 @@ from omnigent_client import OmnigentError as ClientOmnigentError
 from omnigent_client import QueryResult
 
 import omnigent.chat as chat_module
+import omnigent.inner.databricks_executor as dbx
 from omnigent.chat import (
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
@@ -3062,7 +3063,6 @@ def test_databricks_token_auth_resolves_sdk_once(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.inner.databricks_executor as dbx
 
     class _CountingConfig:
         """Config double whose authenticate() counts calls."""
@@ -3123,7 +3123,6 @@ def test_databricks_token_auth_prefers_stored_profile(
     must resolve credentials via that profile (an explicit identity)
     rather than the host-keyed guess that could pick a service principal.
     """
-    import omnigent.inner.databricks_executor as dbx
 
     class _Cfg:
         def authenticate(self) -> dict[str, str]:

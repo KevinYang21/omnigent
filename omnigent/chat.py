@@ -884,11 +884,11 @@ class _DatabricksTokenAuth(httpx.Auth):
                 # A stored profile names the exact identity chosen at login;
                 # prefer it over host-keyed profile guessing.
                 if profile is not None:
-                    self._sdk_auth, _host = _resolve_databricks_auth(profile=profile)
+                    self._sdk_auth, _ = _resolve_databricks_auth(profile=profile)
                 elif workspace_host is not None:
-                    self._sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
+                    self._sdk_auth, _ = _resolve_databricks_auth(host=workspace_host)
                 else:
-                    self._sdk_auth, _host = _resolve_databricks_auth()
+                    self._sdk_auth, _ = _resolve_databricks_auth()
             except (DatabricksAuthError, ImportError, ValueError):
                 self._sdk_auth = None
             self._sdk_auth_resolved = True

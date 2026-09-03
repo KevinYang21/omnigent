@@ -2183,6 +2183,49 @@ def test_resolve_auth_for_host_selects_user_token_over_sp_token(
     assert host == "https://example.databricks.com"
 
 
+def test_resolve_auth_for_host_warns_when_stale_user_falls_through_to_sp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stale user profile that fails auth must warn before the SP wins.
+
+    Ordering deprioritizes the SP but does not drop it: if the preferred
+    user profile fails to authenticate (e.g. an expired OAuth grant) while
+    the SP's static creds still mint, the host would silently register
+    under the service principal again — the original wrong-identity bug,
+    just triggered by a stale token. The fallback must be loud so the user
+    is not left with an empty host picker without explanation.
+    """
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(_write_sp_and_user_cfg(tmp_path)))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    def _fake_sdk_config(**kwargs: str) -> _StubSdkConfig:
+        # The user's [DEFAULT] OAuth grant is expired; only the SP mints.
+        if kwargs.get("profile") == "sp":
+            return _StubSdkConfig(host="https://example.databricks.com", token="sp-token")
+        raise ValueError("DEFAULT: token expired")
+
+    def _run_databricks(args: list[str], **kwargs: object) -> SimpleNamespace:
+        # The CLI fallback for the expired user profile also fails.
+        return SimpleNamespace(returncode=1, stdout="", stderr="expired")
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _fake_sdk_config)
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(databricks_executor.subprocess, "run", _run_databricks)
+
+    with caplog.at_level("WARNING", logger=databricks_executor.logger.name):
+        auth, _host = databricks_executor._resolve_databricks_auth(
+            host="https://example.databricks.com"
+        )
+
+    # The SP is still used (SP-only reachability is preserved)...
+    assert auth.current_token() == "sp-token"
+    # ...but the fallback is announced, naming the SP and the failed user profile.
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("service principal 'sp'" in m and "DEFAULT" in m for m in warnings), warnings
+
+
 def test_stream_ended_without_finish_reason_with_content_completes() -> None:
     """A truncated stream that still produced text surfaces that text as a
     TurnComplete (not an error) — only the empty case is fatal (#1118)."""

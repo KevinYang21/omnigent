@@ -750,6 +750,12 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
         f"Databricks authentication failed for workspace {host}. "
         f"Run: databricks auth login --host {host}"
     )
+    sp_sections = _databrickscfg_service_principal_sections()
+    # User profiles that matched the host but failed to authenticate (e.g. an
+    # expired OAuth grant). Tracked so we can warn if a lower-priority service
+    # principal is then selected — otherwise the host would silently register
+    # under the SP again, the exact wrong-identity symptom the ordering fixes.
+    failed_user_profiles: list[str] = []
     for profile_name in _host_profile_selection_order(host):
         try:
             cfg = _sdk_config(profile=profile_name)
@@ -769,7 +775,22 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
                     profile_name,
                     host,
                 )
+                if profile_name not in sp_sections:
+                    failed_user_profiles.append(profile_name)
                 continue
+        if profile_name in sp_sections and failed_user_profiles:
+            logger.warning(
+                "Authenticating to %s as service principal %r because "
+                "your user profile(s) %s matched the host but failed to "
+                "authenticate (likely an expired login). This host will "
+                "register under the service principal, not you — run "
+                "`databricks auth login --host %s` (or pass the right "
+                "profile) to re-authenticate as yourself.",
+                host,
+                profile_name,
+                ", ".join(repr(p) for p in failed_user_profiles),
+                host,
+            )
         return _DatabricksBearerAuth(cfg, profile_name=profile_name), cfg.host or host
     try:
         host_cfg = _sdk_config(host=host, auth_type="databricks-cli")
@@ -840,6 +861,9 @@ def _databrickscfg_service_principal_sections() -> set[str]:
         config.read(cfg_path)
     except configparser.Error:
         return set()
+    # auth_type literals mirror the databricks-sdk's known types. A future
+    # SDK auth type not listed here falls through to the client_id +
+    # client_secret heuristic below, which still catches M2M SP sections.
     user_auth_types = {"databricks-cli", "external-browser", "pat", "runtime"}
     sections: set[str] = set()
     for section in config.sections():
