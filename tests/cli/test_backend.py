@@ -1961,7 +1961,12 @@ def _patch_auth_preflight(
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
     login_calls: list[str] = []
 
-    def _capture_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
+    def _capture_login(
+        server: str,
+        workspace_host: str,
+        org_id: str | None = None,
+        profile: str | None = None,
+    ) -> None:
         login_calls.append(f"{server} {workspace_host}")
 
     monkeypatch.setattr(cli, "_databricks_login", _capture_login)
@@ -2049,6 +2054,7 @@ def test_databricks_preflight_silent_sdk_refresh_skips_login(
         workspace: str,
         user_id: str | None = None,
         org_id: str | None = None,
+        profile: str | None = None,
     ) -> None:
         stored.append((server, workspace, org_id))
 
@@ -2117,6 +2123,7 @@ def test_databricks_preflight_uses_cli_workspace_id_for_workspace_mount(
         workspace: str,
         user_id: str | None = None,
         org_id: str | None = None,
+        profile: str | None = None,
     ) -> None:
         stored.append((server, workspace, org_id))
 
@@ -2201,6 +2208,7 @@ def test_databricks_preflight_refresh_handles_duplicate_workspace_profiles(
         workspace: str,
         user_id: str | None = None,
         org_id: str | None = None,
+        profile: str | None = None,
     ) -> None:
         stored.append((server, workspace, org_id))
 
@@ -2449,7 +2457,9 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
     )
     monkeypatch.setattr(
         "omnigent.cli_auth.store_databricks_auth",
-        lambda server, workspace, user_id=None, org_id=None: stored.append((server, workspace)),
+        lambda server, workspace, user_id=None, org_id=None, profile=None: stored.append(
+            (server, workspace)
+        ),
     )
 
     cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
@@ -2496,7 +2506,9 @@ def _capture_preflight(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]
     """
     calls: list[tuple[str, bool]] = []
 
-    def _capture(server: str, *, non_interactive: bool = False) -> None:
+    def _capture(
+        server: str, *, non_interactive: bool = False, profile: str | None = None
+    ) -> None:
         calls.append((server, non_interactive))
 
     monkeypatch.setattr(cli, "_ensure_databricks_server_auth", _capture)

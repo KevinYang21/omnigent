@@ -1530,8 +1530,11 @@ class HostProcess:
                 "~/.databrickscfg, or the single-user 'local' owner before "
                 "the server switched to accounts auth). Run "
                 f"`{cli_invocation()} host reset-id` to mint a fresh host id "
-                "for this machine and retry, or ask an administrator to "
-                "remove the existing host registration. " + self._login_fix_hint()
+                "for this machine, then re-register — pass "
+                f"`{cli_invocation()} host --profile <your-user-profile>` if a "
+                "service principal claimed the old id, so the new registration "
+                "uses your own identity. Or ask an administrator to remove the "
+                "existing host registration. " + self._login_fix_hint()
             )
         # Any other permanent 4xx (e.g. a 400 for a malformed host id, or an
         # edge/proxy rejection): the server's own body is the authoritative

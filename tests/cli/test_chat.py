@@ -3113,6 +3113,48 @@ def test_databricks_token_auth_resolves_sdk_once(
     assert cfg.authenticate_calls == 4
 
 
+def test_databricks_token_auth_prefers_stored_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored profile resolves the token by profile, not by workspace host.
+
+    The read side of the ``--profile`` fix: when ``omnigent login
+    --profile`` persisted an identity, the transcript-forwarder client
+    must resolve credentials via that profile (an explicit identity)
+    rather than the host-keyed guess that could pick a service principal.
+    """
+    import omnigent.inner.databricks_executor as dbx
+
+    class _Cfg:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer tok-profile"}
+
+    resolved: dict[str, object] = {}
+
+    def _fake_resolve(
+        profile: str | None = None, *, host: str | None = None
+    ) -> tuple[object, str]:
+        resolved["profile"] = profile
+        resolved["host"] = host
+        return dbx._DatabricksBearerAuth(_Cfg(), profile_name=profile), "https://ex.databricks.com"
+
+    monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda _url: "https://ex.databricks.com",
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_profile", lambda _url: "my-user")
+
+    auth = chat_module._DatabricksTokenAuth(server_url="https://ex.databricks.com")
+    header = _first_auth_header(auth, "https://ex.databricks.com/v1/x")
+
+    assert header == "Bearer tok-profile"
+    # Resolution went through the profile, NOT the host-keyed guess.
+    assert resolved == {"profile": "my-user", "host": None}
+
+
 def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every SDK-client request carries the workspace-routing header.
 
