@@ -3,6 +3,7 @@
 from omnigent.entities.account import Account, AccountToken
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.comment import Comment, CommentsFingerprint
+from omnigent.entities.connection import ProviderConnection
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     NON_CONTENT_ITEM_TYPES,
@@ -28,6 +29,7 @@ from omnigent.entities.conversation import (
 from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.elicitation import Elicitation
 from omnigent.entities.file import StoredFile
+from omnigent.entities.github_connection import GithubConnection
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
@@ -59,6 +61,7 @@ __all__ = [
     "ErrorData",
     "FunctionCallData",
     "FunctionCallOutputData",
+    "GithubConnection",
     "ItemData",
     "LoadedAgent",
     "MessageData",
@@ -67,6 +70,7 @@ __all__ = [
     "PagedList",
     "Policy",
     "Project",
+    "ProviderConnection",
     "ReasoningData",
     "ResolvedAccess",
     "ResourceEventData",
