@@ -119,6 +119,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
     };
   }, []);
   useEffect(() => {
+    if (info === "loading") return;
     if (info.branding?.app_name) document.title = info.branding.app_name;
     const faviconUrl = info.branding?.logos.favicon;
     if (!faviconUrl) return;
