@@ -736,8 +736,8 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     lookup remains as the last resort for cfg-less setups.
 
     When several profiles match the host, they are tried in identity
-    preference order (see :func:`_host_profile_selection_order`): the
-    ``DATABRICKS_CONFIG_PROFILE`` profile first, then user (U2M)
+    preference order (see :func:`_order_profiles_by_identity_preference`):
+    the ``DATABRICKS_CONFIG_PROFILE`` profile first, then user (U2M)
     profiles, then M2M service-principal profiles — so a machine with
     both a user login and an SP for the same workspace authenticates
     as the person, not the service principal.
@@ -930,46 +930,14 @@ def _order_profiles_by_identity_preference(matches: list[str], sp_sections: set[
     return explicit + users + sps
 
 
-def _host_profile_selection_order(host: str) -> list[str]:
-    """Order the host-matching profiles for *host* by identity preference.
-
-    Thin wrapper over :func:`_databrickscfg_host_matches_and_sp_sections`
-    and :func:`_order_profiles_by_identity_preference` for callers/tests
-    that only need the ordered list from a host.
-
-    :param host: Workspace host to match, e.g.
-        ``"https://example.databricks.com"``.
-    :returns: Matching profile names, most-preferred first.
-    """
-    matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(host)
-    return _order_profiles_by_identity_preference(matches, sp_sections)
-
-
-def _databrickscfg_service_principal_sections() -> set[str]:
-    """Section names in ``~/.databrickscfg`` holding M2M service-principal creds.
-
-    See :func:`_section_is_service_principal` for the classification rule.
-
-    :returns: The SP section names (``"DEFAULT"`` included when the
-        default section itself is an SP), or ``set()`` when the config
-        file is missing or unparseable.
-    """
-    config = _read_databrickscfg_no_inheritance()
-    if config is None:
-        return set()
-    # The sentinel default_section makes the file's [DEFAULT] a regular
-    # "DEFAULT" section, so it appears in sections() and is classified here.
-    return {
-        section for section in config.sections() if _section_is_service_principal(config[section])
-    }
-
-
 def _databrickscfg_profiles_for_host(host: str) -> list[str]:
     """List ``~/.databrickscfg`` profile names whose ``host`` is *host*.
 
     Comparison is scheme-insensitive and ignores trailing slashes, so
     ``my-ws.cloud.databricks.com`` in the cfg matches a
-    ``https://my-ws.cloud.databricks.com`` query.
+    ``https://my-ws.cloud.databricks.com`` query. Delegates to
+    :func:`_databrickscfg_host_matches_and_sp_sections` (dropping the
+    service-principal set) so host matching lives in one place.
 
     :param host: Workspace host to match, e.g.
         ``"https://example.databricks.com"``.
@@ -977,30 +945,7 @@ def _databrickscfg_profiles_for_host(host: str) -> list[str]:
         section included when it carries a matching host), or ``[]``
         when the config file is missing or unparseable.
     """
-    import configparser
-    from pathlib import Path
-
-    def _norm(value: str) -> str:
-        value = value.strip().rstrip("/")
-        return value.split("://", 1)[-1].lower()
-
-    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
-    if not cfg_path.exists():
-        return []
-    config = configparser.ConfigParser()
-    try:
-        config.read(cfg_path)
-    except configparser.Error:
-        return []
-    wanted = _norm(host)
-    matches = [
-        section
-        for section in config.sections()
-        if _norm(config[section].get("host", "")) == wanted
-    ]
-    default_host = config.defaults().get("host")
-    if default_host and _norm(default_host) == wanted:
-        matches.append("DEFAULT")
+    matches, _sp_sections = _databrickscfg_host_matches_and_sp_sections(host)
     return matches
 
 

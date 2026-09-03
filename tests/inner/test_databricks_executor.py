@@ -2019,7 +2019,15 @@ def test_host_selection_order_prefers_user_profile_over_m2m_sp(
     tried first it silently wins and the host registers under the wrong
     identity (invisible to the SSO-signed-in app user).
     """
-    from omnigent.inner.databricks_executor import _host_profile_selection_order
+    from omnigent.inner.databricks_executor import (
+        _databrickscfg_host_matches_and_sp_sections,
+        _order_profiles_by_identity_preference,
+    )
+
+    def _host_profile_selection_order(host: str) -> list[str]:
+        return _order_profiles_by_identity_preference(
+            *_databrickscfg_host_matches_and_sp_sections(host)
+        )
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(_write_sp_and_user_cfg(tmp_path)))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
@@ -2039,7 +2047,15 @@ def test_host_selection_order_env_profile_wins_even_when_it_is_an_sp(
     the SP profile's name gets the SP, and one who exports DEFAULT gets
     their own profile even when the SP is first in the file.
     """
-    from omnigent.inner.databricks_executor import _host_profile_selection_order
+    from omnigent.inner.databricks_executor import (
+        _databrickscfg_host_matches_and_sp_sections,
+        _order_profiles_by_identity_preference,
+    )
+
+    def _host_profile_selection_order(host: str) -> list[str]:
+        return _order_profiles_by_identity_preference(
+            *_databrickscfg_host_matches_and_sp_sections(host)
+        )
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(_write_sp_and_user_cfg(tmp_path)))
 
@@ -2065,7 +2081,15 @@ def test_host_selection_order_env_profile_for_other_host_is_ignored(
     doesn't match that host must not jump the queue (it isn't even a
     candidate).
     """
-    from omnigent.inner.databricks_executor import _host_profile_selection_order
+    from omnigent.inner.databricks_executor import (
+        _databrickscfg_host_matches_and_sp_sections,
+        _order_profiles_by_identity_preference,
+    )
+
+    def _host_profile_selection_order(host: str) -> list[str]:
+        return _order_profiles_by_identity_preference(
+            *_databrickscfg_host_matches_and_sp_sections(host)
+        )
 
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -2097,7 +2121,15 @@ def test_host_selection_order_sp_only_config_still_offers_the_sp(
     Deprioritising is not dropping — CI boxes whose only credential is a
     service principal must still resolve auth for the host.
     """
-    from omnigent.inner.databricks_executor import _host_profile_selection_order
+    from omnigent.inner.databricks_executor import (
+        _databrickscfg_host_matches_and_sp_sections,
+        _order_profiles_by_identity_preference,
+    )
+
+    def _host_profile_selection_order(host: str) -> list[str]:
+        return _order_profiles_by_identity_preference(
+            *_databrickscfg_host_matches_and_sp_sections(host)
+        )
 
     cfg_path = tmp_path / "databrickscfg"
     cfg_path.write_text(
@@ -2123,12 +2155,16 @@ def test_sp_sections_not_polluted_by_default_section_inheritance(
     user profile and defeat the deprioritisation.
     """
     from omnigent.inner.databricks_executor import (
-        _databrickscfg_service_principal_sections,
+        _databrickscfg_host_matches_and_sp_sections,
     )
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(_write_sp_and_user_cfg(tmp_path)))
 
-    assert _databrickscfg_service_principal_sections() == {"sp"}
+    # The SP set (second element) classifies every section regardless of host.
+    _matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(
+        "https://example.databricks.com"
+    )
+    assert sp_sections == {"sp"}
 
 
 def test_sp_section_with_explicit_user_auth_type_is_not_an_sp(
@@ -2141,7 +2177,7 @@ def test_sp_section_with_explicit_user_auth_type_is_not_an_sp(
     identity.
     """
     from omnigent.inner.databricks_executor import (
-        _databrickscfg_service_principal_sections,
+        _databrickscfg_host_matches_and_sp_sections,
     )
 
     cfg_path = tmp_path / "databrickscfg"
@@ -2157,7 +2193,10 @@ def test_sp_section_with_explicit_user_auth_type_is_not_an_sp(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
 
-    assert _databrickscfg_service_principal_sections() == {"m2m"}
+    _matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(
+        "https://example.databricks.com"
+    )
+    assert sp_sections == {"m2m"}
 
 
 def test_resolve_auth_for_host_selects_user_token_over_sp_token(

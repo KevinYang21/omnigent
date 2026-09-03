@@ -342,13 +342,18 @@ def test_host_profile_selection_order_puts_user_profiles_before_sp(
     naive first-successful-auth walk.  The selection-order layer must
     reorder: user (U2M) profiles first, M2M SP profiles last.
     """
-    from omnigent.inner.databricks_executor import _host_profile_selection_order
+    from omnigent.inner.databricks_executor import (
+        _databrickscfg_host_matches_and_sp_sections,
+        _order_profiles_by_identity_preference,
+    )
 
     cfg_path = _write_two_profile_cfg(tmp_path)
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
 
-    ordered = _host_profile_selection_order("https://myworkspace.cloud.databricks.com")
+    ordered = _order_profiles_by_identity_preference(
+        *_databrickscfg_host_matches_and_sp_sections("https://myworkspace.cloud.databricks.com")
+    )
 
     sp_idx = ordered.index("sp-profile") if "sp-profile" in ordered else -1
     default_idx = ordered.index("DEFAULT") if "DEFAULT" in ordered else -1
