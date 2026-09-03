@@ -21,6 +21,7 @@ delete is rejected by the N+1 current value.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -268,3 +269,60 @@ async def test_spec_fill_parked_across_delete_discards(tmp_path: Path) -> None:
             "resolver was not called after delete: stale fill may have "
             "populated the spec cache across the session boundary"
         )
+
+
+# ── delete-vs-create race: in-flight init must be cancelled ──────────────────
+
+
+async def test_delete_session_cancels_inflight_init() -> None:
+    """``DELETE`` must cancel a session init that is still running.
+
+    A delete landing during startup used to leave the init task running to
+    completion; it would then re-register the native resources the delete's
+    teardown had already swept (e.g. a freshly spawned ``opencode serve``),
+    orphaning one server per cancelled startup. The delete path must cancel
+    the registered init task and let it unwind before tearing down.
+    """
+    from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
+
+    session_id = f"conv_{uuid.uuid4().hex}"
+    resolver_started = asyncio.Event()
+    resolver_cancelled = asyncio.Event()
+
+    async def parked_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        resolver_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            resolver_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=parked_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        create_request = asyncio.create_task(
+            client.post("/v1/sessions", json={"session_id": session_id, "agent_id": "ag_x"})
+        )
+        try:
+            await asyncio.wait_for(resolver_started.wait(), timeout=5.0)
+
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+
+            assert resp.status_code == 200
+            try:
+                await asyncio.wait_for(resolver_cancelled.wait(), timeout=5.0)
+            except TimeoutError:
+                pytest.fail(
+                    "delete_session left the in-flight session init running; "
+                    "a startup racing a delete leaks whatever it registers next"
+                )
+        finally:
+            create_request.cancel()
+            with contextlib.suppress(BaseException):
+                await create_request
