@@ -95,6 +95,8 @@ class _RestartableProxy:
                 client.recv(4096)
                 client.sendall(_404_RESPONSE)
             except OSError:
+                # The daemon may drop the connection mid-handshake while the
+                # simulated restart window is active; that's expected.
                 pass
             finally:
                 client.close()
@@ -130,6 +132,8 @@ class _RestartableProxy:
                     break
                 dst.sendall(data)
         except OSError:
+            # Either peer closing during the simulated restart tears the pipe
+            # down; the finally block below closes both ends.
             pass
         finally:
             with contextlib.suppress(OSError):
@@ -226,6 +230,8 @@ def _wait_for_host_online(
                     if host["host_id"] == host_id and host["status"] == "online":
                         return
         except httpx.ConnectError:
+            # The proxy/server may still be coming up; keep polling until the
+            # deadline expires.
             pass
         time.sleep(POLL_INTERVAL_S)
     raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
@@ -251,17 +257,18 @@ def test_host_survives_transient_404_during_server_restart(
     parsed = urlparse(live_server)
     assert parsed.hostname is not None and parsed.port is not None
     proxy = _RestartableProxy(parsed.hostname, parsed.port)
-    proxy_url = f"http://127.0.0.1:{proxy.port}"
-
-    # Sanity: the server is reachable through the proxy, like a user URL.
-    assert httpx.get(f"{proxy_url}/health", timeout=10.0).status_code == 200
-
-    proc, host_id, daemon_log = _spawn_host_daemon_via(
-        tmp_path=tmp_path,
-        server_url=proxy_url,
-        mock_llm_server_url=mock_llm_server_url,
-    )
+    proc: subprocess.Popen[bytes] | None = None
     try:
+        proxy_url = f"http://127.0.0.1:{proxy.port}"
+
+        # Sanity: the server is reachable through the proxy, like a user URL.
+        assert httpx.get(f"{proxy_url}/health", timeout=10.0).status_code == 200
+
+        proc, host_id, daemon_log = _spawn_host_daemon_via(
+            tmp_path=tmp_path,
+            server_url=proxy_url,
+            mock_llm_server_url=mock_llm_server_url,
+        )
         _wait_for_host_online(http_client, host_id, timeout=30.0)
 
         # "Restart the server container": the proxy serves 404 for the
@@ -307,7 +314,7 @@ def test_host_survives_transient_404_during_server_restart(
             f"Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
         )
     finally:
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
             try:
                 proc.wait(timeout=5)

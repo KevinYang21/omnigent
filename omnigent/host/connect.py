@@ -3239,9 +3239,7 @@ class HostProcess:
                     ):
                         # Keep the refresh window limited to consecutive auth rejections.
                         self._auth_retry_streak = 0
-                    if not (
-                        isinstance(exc, InvalidStatus) and exc.response.status_code == 404
-                    ):
+                    if not (isinstance(exc, InvalidStatus) and exc.response.status_code == 404):
                         # The 404 streak counts CONSECUTIVE restart-window
                         # rejections only, so escalation reflects one outage.
                         self._transient_404_streak = 0
