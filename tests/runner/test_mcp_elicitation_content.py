@@ -385,21 +385,45 @@ def test_proxy_input_response_bare_accept_and_decline() -> None:
     assert decline == {"action": "decline"}
 
 
-def test_proxy_input_response_declines_a_bare_accept_when_fields_are_required() -> None:
-    """A content-less approve against a required-field schema declines.
+def test_proxy_bare_accept_auto_fills_a_consent_shaped_required_schema() -> None:
+    """A content-less approve against a fillable required schema still accepts.
 
-    Mirrors the inline path's required-aware gate: forwarding
-    ``{"action": "accept"}`` with no content for a schema whose fields are
-    ``required`` is malformed — the server rejects it and the MRTR retry loop
-    spins ("Approval loop exceeded") — so the proxy declines instead of
-    sending a body the server's own schema will refuse.
+    Mirrors the inline path's fallback order: the surface collected nothing
+    (a bare approve card, the REPL's y/n prompt), so a schema the auto-fill
+    can answer — like the policy-ASK ``{"approved": boolean}`` — is filled
+    rather than declined. Declining here inverted the person's yes.
+    """
+    from omnigent.runner.proxy_mcp_manager import _input_response
+
+    policy_ask_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"approved": {"type": "boolean"}},
+        "required": ["approved"],
+    }
+
+    entry = _input_response(
+        pending_approvals.Verdict(approved=True), _mrtr_request(policy_ask_schema)
+    )
+
+    assert entry == {"action": "accept", "content": {"approved": True}}
+
+
+def test_proxy_bare_accept_declines_when_required_fields_cannot_be_filled() -> None:
+    """A content-less approve against an unanswerable required schema declines.
+
+    Mirrors the inline path's required-aware gate: the auto-fill cannot guess
+    a free-form string, and forwarding ``{"action": "accept"}`` with no
+    content for a schema whose fields are ``required`` is malformed — the
+    server rejects it and the MRTR retry loop spins ("Approval loop
+    exceeded") — so the proxy declines instead of sending a body the
+    server's own schema will refuse.
     """
     from omnigent.runner.proxy_mcp_manager import _input_response
 
     required_schema: dict[str, Any] = {
         "type": "object",
-        "properties": {"answer": {"type": "string", "enum": ["dev", "staging", "prod"]}},
-        "required": ["answer"],
+        "properties": {"branch": {"type": "string"}},
+        "required": ["branch"],
     }
 
     entry = _input_response(
@@ -407,3 +431,55 @@ def test_proxy_input_response_declines_a_bare_accept_when_fields_are_required() 
     )
 
     assert entry == {"action": "decline"}
+
+
+# ── Validator tightening (browser→server trust boundary) ────────────────────
+
+
+def _validate(content: dict[str, Any], prop: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate one-field content against a one-property schema."""
+    from omnigent.tools._elicitation_schema import validate_content_against_schema
+
+    schema = {"type": "object", "properties": {"field": prop}}
+    return validate_content_against_schema(cast(Any, {"field": content["field"]}), schema)
+
+
+def test_a_nullable_union_field_rejects_the_wrong_type() -> None:
+    """``anyOf: [string, null]`` (a ``str | None`` field) is not a free pass.
+
+    A union declares its types per branch; an integer satisfies neither, so
+    the answer must fail closed rather than skate past a missing top-level
+    ``type``.
+    """
+    nullable_str = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+
+    assert _validate({"field": 123}, nullable_str) is None
+    assert _validate({"field": "note"}, nullable_str) == {"field": "note"}
+    assert _validate({"field": None}, nullable_str) == {"field": None}
+
+
+def test_numeric_and_length_bounds_are_enforced() -> None:
+    """``maximum`` / ``minLength`` are part of what the server asked for."""
+    assert _validate({"field": 999}, {"type": "integer", "maximum": 100}) is None
+    assert _validate({"field": 42}, {"type": "integer", "maximum": 100}) == {"field": 42}
+    assert _validate({"field": "ab"}, {"type": "string", "minLength": 5}) is None
+    assert _validate({"field": "abcde"}, {"type": "string", "minLength": 5}) == {"field": "abcde"}
+
+
+def test_a_property_level_const_is_enforced() -> None:
+    """A bare ``const`` pins the only acceptable answer."""
+    assert _validate({"field": "dev"}, {"type": "string", "const": "prod"}) is None
+    assert _validate({"field": "prod"}, {"type": "string", "const": "prod"}) == {"field": "prod"}
+
+
+def test_array_items_enum_and_bounds_are_enforced() -> None:
+    """A list answer may not smuggle members the array's ``items`` exclude."""
+    prop: dict[str, Any] = {
+        "type": "array",
+        "items": {"type": "string", "enum": ["dev", "prod"]},
+        "maxItems": 2,
+    }
+
+    assert _validate({"field": ["prod", "smuggled"]}, prop) is None
+    assert _validate({"field": ["dev", "prod", "dev"]}, prop) is None
+    assert _validate({"field": ["prod"]}, prop) == {"field": ["prod"]}

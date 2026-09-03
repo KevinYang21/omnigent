@@ -14,11 +14,84 @@ from typing import Any
 ElicitContent = dict[str, str | int | float | bool | list[str] | None]
 
 
+def _matches_declared_type(value: object, prop_type: object, prop: dict[str, Any]) -> bool:
+    """
+    Whether a value is of one declared JSON-Schema ``type``.
+
+    :param value: The answered value, e.g. ``"prod"``.
+    :param prop_type: The declared type name, e.g. ``"string"`` or ``"null"``.
+    :param prop: The property schema, for ``items`` checks on arrays.
+    :returns: ``True`` when the value is of the declared type.
+    """
+    # ``bool`` is an ``int`` subclass in Python, so exclude it explicitly
+    # from the numeric types — a boolean is not an answer to a number.
+    if prop_type == "string":
+        return isinstance(value, str)
+    if prop_type == "boolean":
+        return isinstance(value, bool)
+    if prop_type == "integer":
+        return not isinstance(value, bool) and isinstance(value, int)
+    if prop_type == "number":
+        return not isinstance(value, bool) and isinstance(value, int | float)
+    if prop_type == "null":
+        return value is None
+    if prop_type == "array":
+        if not isinstance(value, list):
+            return False
+        items = prop.get("items")
+        if isinstance(items, dict):
+            item_enum = items.get("enum")
+            if isinstance(item_enum, list) and item_enum:
+                if not all(v in item_enum for v in value):
+                    return False
+            item_type = items.get("type")
+            if item_type is not None and not all(
+                _matches_declared_type(v, item_type, {}) for v in value
+            ):
+                return False
+        min_items = prop.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            return False
+        max_items = prop.get("maxItems")
+        if isinstance(max_items, int) and len(value) > max_items:
+            return False
+        return True
+    # An unknown or absent type declares nothing to check.
+    return True
+
+
+def _within_value_bounds(value: object, prop: dict[str, Any]) -> bool:
+    """
+    Whether a value satisfies the property's numeric and length bounds.
+
+    :param value: The answered value, e.g. ``42`` or ``"release/2.4"``.
+    :param prop: The property schema, e.g. ``{"type": "integer", "maximum": 100}``.
+    :returns: ``True`` when every declared bound holds.
+    """
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        minimum = prop.get("minimum")
+        if isinstance(minimum, int | float) and value < minimum:
+            return False
+        maximum = prop.get("maximum")
+        if isinstance(maximum, int | float) and value > maximum:
+            return False
+    if isinstance(value, str):
+        min_length = prop.get("minLength")
+        if isinstance(min_length, int) and len(value) < min_length:
+            return False
+        max_length = prop.get("maxLength")
+        if isinstance(max_length, int) and len(value) > max_length:
+            return False
+    return True
+
+
 def _value_matches_property(value: object, prop: dict[str, Any]) -> bool:
     """
     Whether one answered value conforms to one ``requestedSchema`` property.
 
-    Checks the declared ``type``, ``enum`` membership, and ``oneOf`` consts.
+    Checks the declared ``type`` (including ``anyOf`` unions such as
+    ``str | None`` optional fields), ``enum`` membership, ``const`` /
+    ``oneOf`` consts, numeric bounds, and string/array length bounds.
     A property with no declared type accepts any MCP-primitive value.
 
     :param value: The answered value, e.g. ``"prod"``.
@@ -31,17 +104,21 @@ def _value_matches_property(value: object, prop: dict[str, Any]) -> bool:
         return False
 
     prop_type = prop.get("type")
-    # ``bool`` is an ``int`` subclass in Python, so exclude it explicitly
-    # from the numeric types — a boolean is not an answer to a number.
-    if prop_type == "string" and not isinstance(value, str):
+    if prop_type is not None and not _matches_declared_type(value, prop_type, prop):
         return False
-    if prop_type == "boolean" and not isinstance(value, bool):
+
+    # An ``anyOf`` union (e.g. a ``str | None`` optional field) declares its
+    # types per-branch; the value must satisfy at least one branch fully.
+    any_of = prop.get("anyOf")
+    if isinstance(any_of, list) and any_of:
+        branches = [b for b in any_of if isinstance(b, dict)]
+        if branches and not any(_value_matches_property(value, b) for b in branches):
+            return False
+
+    if not _within_value_bounds(value, prop):
         return False
-    if prop_type == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
-        return False
-    if prop_type == "number" and (isinstance(value, bool) or not isinstance(value, int | float)):
-        return False
-    if prop_type == "array" and not isinstance(value, list):
+
+    if "const" in prop and value != prop["const"]:
         return False
 
     allowed = prop.get("enum")

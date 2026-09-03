@@ -79,17 +79,19 @@ def _input_response(
     :returns: The wire object for this elicitation id.
     """
     from omnigent.tools._elicitation_schema import (
+        build_accept_content_from_schema,
         schema_requires_fields,
         validate_content_against_schema,
     )
 
     if not verdict.approved:
         return {"action": "decline"}
+    # The Omnigent server always populates ``params.requestedSchema`` on its
+    # InputRequiredResult; a missing schema with supplied content fails closed.
     params = _json_object(input_request.get("params")) if input_request else None
     schema = _json_object(params.get("requestedSchema")) if params else None
-    content = validate_content_against_schema(
-        verdict.content, cast("dict[str, object]", schema) if schema is not None else None
-    )
+    schema_dict = cast("dict[str, object]", schema) if schema is not None else None
+    content = validate_content_against_schema(verdict.content, schema_dict)
     if content is None and verdict.content:
         # An answer WAS given but does not conform — fail closed instead of
         # forwarding it or letting the server act on a value nobody chose.
@@ -98,17 +100,23 @@ def _input_response(
             "requestedSchema — declining instead of forwarding it"
         )
         return {"action": "decline"}
-    if content is None and schema_requires_fields(
-        cast("dict[str, object]", schema) if schema is not None else None
-    ):
-        # A bare accept (no content) against a schema that requires fields is
-        # malformed — the server rejects it and the MRTR retry loop spins — so
-        # decline, matching the inline elicitation path's required-aware gate.
-        _logger.info(
-            "MCP proxy elicitation accepted with no content for a schema "
-            "that requires fields — declining instead"
-        )
-        return {"action": "decline"}
+    if content is None and schema_requires_fields(schema_dict):
+        # Nobody chose, but the server requires fields — the surface
+        # collected none (a bare approve card, or the REPL's y/n prompt).
+        # Fall back to the schema auto-fill the inline path uses, so a
+        # consent-shaped schema (e.g. the policy-ASK required boolean)
+        # still accepts instead of inverting the person's answer.
+        content = build_accept_content_from_schema(schema_dict) if schema_dict else None
+        if content is None:
+            # Nothing to fall back on either (e.g. a required free-form
+            # field): an accept without the fields the server requires is
+            # malformed — it rejects it and the MRTR retry loop spins — so
+            # decline, matching the inline path's required-aware gate.
+            _logger.info(
+                "MCP proxy elicitation accepted with no content for a schema "
+                "that requires fields — declining instead"
+            )
+            return {"action": "decline"}
     response: _JsonObject = {"action": "accept"}
     if content is not None:
         response["content"] = cast(object, content)
