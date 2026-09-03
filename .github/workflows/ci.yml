@@ -154,6 +154,11 @@ jobs:
           - group: slack
             paths: integrations/slack/tests
             extra: slack
+          # Herdr plugin tests live beside the linked plugin so the directory
+          # can be installed independently through Herdr's plugin manager.
+          - group: herdr
+            paths: integrations/herdr
+            workers: "0"
 
     steps:
       - name: Check out repo

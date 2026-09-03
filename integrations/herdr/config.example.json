@@ -1,0 +1,6 @@
+{
+  "server": "http://127.0.0.1:55777",
+  "omnigent": "/absolute/path/to/omnigent",
+  "max_sessions": 200,
+  "search_debounce_ms": 300
+}

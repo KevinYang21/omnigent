@@ -2,6 +2,9 @@ project-includes = [
     "omnigent/**/*.py",
     "omnigent/**/*.pyi",
     "sdks/python-client/**/*.py",
+    "integrations/herdr/session_picker.py",
+    "integrations/herdr/session_space_sync.py",
+    "integrations/herdr/session_open_supervisor.py",
 ]
 
 project-excludes = []

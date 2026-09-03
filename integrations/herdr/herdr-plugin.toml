@@ -1,0 +1,19 @@
+id = "omnigent.sessions"
+name = "Omnigent Sessions"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Discover and load Omnigent sessions as native Herdr Spaces."
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open-picker"
+title = "Open Omnigent session picker"
+command = ["bash", "open_picker.sh"]
+
+[[panes]]
+id = "session-picker"
+title = "Omnigent sessions"
+placement = "popup"
+width = "88%"
+height = "76%"
+command = ["bash", "run_picker.sh"]
