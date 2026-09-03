@@ -14,7 +14,6 @@ from omnigent_client import OmnigentError as ClientOmnigentError
 from omnigent_client import QueryResult
 
 import omnigent.chat as chat_module
-import omnigent.inner.databricks_executor as dbx
 from omnigent.chat import (
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
@@ -42,7 +41,7 @@ from omnigent.chat import (
     run_chat,
 )
 from omnigent.cli import _build_resume_parts
-from omnigent.inner.databricks_executor import DatabricksCredentials
+from omnigent.inner.databricks_executor import DatabricksCredentials, _DatabricksBearerAuth
 from omnigent.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
@@ -3086,9 +3085,11 @@ def test_databricks_token_auth_resolves_sdk_once(
         # means ambient SDK resolution: neither a profile nor a host is
         # threaded into the resolver anymore.
         assert profile is None and host is None, (profile, host)
-        return dbx._DatabricksBearerAuth(cfg, profile_name=None), "https://ex.databricks.com"
+        return _DatabricksBearerAuth(cfg, profile_name=None), "https://ex.databricks.com"
 
-    monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)  # skip static path
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)  # skip OIDC path
     # No Databricks Apps pointer record stored for this server → the auth
@@ -3135,9 +3136,11 @@ def test_databricks_token_auth_prefers_stored_profile(
     ) -> tuple[object, str]:
         resolved["profile"] = profile
         resolved["host"] = host
-        return dbx._DatabricksBearerAuth(_Cfg(), profile_name=profile), "https://ex.databricks.com"
+        return _DatabricksBearerAuth(_Cfg(), profile_name=profile), "https://ex.databricks.com"
 
-    monkeypatch.setattr(dbx, "_resolve_databricks_auth", _fake_resolve)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
     monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
     monkeypatch.setattr(
