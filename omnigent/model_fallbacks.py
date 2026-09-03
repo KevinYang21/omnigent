@@ -64,6 +64,22 @@ _CODEX_LAUNCH_DEFAULT = StaticModelFallback(
 CODEX_DEFAULT_MODEL = _CODEX_LAUNCH_DEFAULT.model_ids[0]
 
 
+#: The model Claude Code re-issues a safeguard-flagged turn on. Its refusal
+#: route table sends both the cyber and bio categories here, and the swap arms
+#: only when the ``opus`` alias resolves to this exact model, so a launch env
+#: pins ``opus`` to the gateway's spelling of it (``served_alias_pins``).
+_CLAUDE_REFUSAL_FALLBACK = StaticModelFallback(
+    model_ids=("claude-opus-4-8",),
+    owner="Claude SDK alias pins (omnigent.claude_model_vocabulary)",
+    provenance="Claude Code's built-in refusal-fallback route table",
+    discovery_gap=(
+        "no API reports the model the CLI's refusal-fallback targets; it is hardcoded in the CLI"
+    ),
+)
+
+CLAUDE_REFUSAL_FALLBACK_MODEL = _CLAUDE_REFUSAL_FALLBACK.model_ids[0]
+
+
 # ── Smart Routing ───────────────────────────────────────────────────────────
 #
 # The router's static tables. A live per-session catalog wins wherever one is

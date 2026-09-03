@@ -82,10 +82,6 @@ MODEL_VOCABULARY_ENV_VARS: tuple[str, ...] = (
 #: this module stays stdlib-only for hook subprocesses, which also means it
 #: cannot honour a deployment's ``routing.model_prefix`` override.
 _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
-# Claude Code re-issues a safeguard-flagged turn on this canonical model, and
-# only when the ``opus`` alias resolves to it; any other Opus, newer included,
-# makes it decline the fallback (``model_refusal_no_fallback``).
-REFUSAL_FALLBACK_MODEL = "claude-opus-4-8"
 _SEGMENT_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -277,15 +273,20 @@ def served_alias_pins(model_ids: Iterable[str]) -> dict[str, str]:
     family, an id the gateway actually serves so the launch env can pin it.
 
     The newest served id of a family wins, except that ``opus`` pins the
-    served spelling of :data:`REFUSAL_FALLBACK_MODEL` whenever the gateway
-    serves it: the refusal-fallback arms only for that exact model, so a
-    newer Opus pin would leave a flagged turn with no fallback at all.
+    served spelling of Claude Code's refusal-fallback target
+    (:data:`~omnigent.model_fallbacks.CLAUDE_REFUSAL_FALLBACK_MODEL`) whenever
+    the gateway serves it: the refusal-fallback arms only for that exact
+    model, so a newer Opus pin would leave a flagged turn with no fallback.
 
     :param model_ids: The ids a gateway's model listing reports.
     :returns: Alias → served id, e.g. ``{"opus": "databricks-claude-opus-4-8"}``,
         for the families the listing serves. Ids of no Claude family are
         ignored.
     """
+    # Lazy: model_fallbacks pulls in onboarding config, and this module stays
+    # stdlib-only at import time for Claude Code's hook subprocesses.
+    from omnigent.model_fallbacks import CLAUDE_REFUSAL_FALLBACK_MODEL
+
     served = list(model_ids)
     pins: dict[str, str] = {}
     for model_id in served:
@@ -294,9 +295,10 @@ def served_alias_pins(model_ids: Iterable[str]) -> dict[str, str]:
             continue
         if alias not in pins or _model_version_key(model_id) > _model_version_key(pins[alias]):
             pins[alias] = model_id
-    fallback_alias = claude_model_alias(REFUSAL_FALLBACK_MODEL, env={})
-    for model_id in served:
-        if _spells_canonical_model(model_id, REFUSAL_FALLBACK_MODEL):
-            pins[fallback_alias] = model_id
-            break
+    fallback_alias = claude_model_alias(CLAUDE_REFUSAL_FALLBACK_MODEL, env={})
+    if fallback_alias is not None:
+        for model_id in served:
+            if _spells_canonical_model(model_id, CLAUDE_REFUSAL_FALLBACK_MODEL):
+                pins[fallback_alias] = model_id
+                break
     return pins
