@@ -32,19 +32,27 @@ interface PersistedWorkspaceLayout extends WorkspaceLayout {
   version: number;
 }
 
-let generatedId = 0;
-
-function nextId(prefix: "pane" | "split"): string {
-  generatedId += 1;
-  return `${prefix}-${generatedId}`;
+// Ids derive from the current tree rather than a process-local counter, so a
+// restored layout can never collide with ids generated after a reload.
+function maxIdSuffix(root: WorkspaceNode, prefix: "pane" | "split"): number {
+  const own = root.id.startsWith(`${prefix}-`) ? Number(root.id.slice(prefix.length + 1)) : 0;
+  const childMax =
+    root.kind === "split"
+      ? Math.max(maxIdSuffix(root.children[0], prefix), maxIdSuffix(root.children[1], prefix))
+      : 0;
+  return Math.max(Number.isFinite(own) ? own : 0, childMax);
 }
 
-function makeLeaf(sessionId: string | null): WorkspaceLeaf {
-  return { kind: "leaf", id: nextId("pane"), sessionId };
+function nextId(prefix: "pane" | "split", root: WorkspaceNode | null): string {
+  return `${prefix}-${root ? maxIdSuffix(root, prefix) + 1 : 1}`;
+}
+
+function makeLeaf(root: WorkspaceNode | null, sessionId: string | null): WorkspaceLeaf {
+  return { kind: "leaf", id: nextId("pane", root), sessionId };
 }
 
 export function createWorkspaceLayout(sessionId: string | null = null): WorkspaceLayout {
-  const root = makeLeaf(sessionId);
+  const root = makeLeaf(null, sessionId);
   return { root, focusedPaneId: root.id };
 }
 
@@ -135,11 +143,11 @@ export function splitWorkspacePane(
   const target = findWorkspaceLeaf(layout.root, targetPaneId);
   if (!target || findWorkspaceLeafBySession(layout.root, sessionId)) return layout;
 
-  const newLeaf = makeLeaf(sessionId);
+  const newLeaf = makeLeaf(layout.root, sessionId);
   const before = edge === "left" || edge === "top";
   const split: WorkspaceSplit = {
     kind: "split",
-    id: nextId("split"),
+    id: nextId("split", layout.root),
     direction: edge === "left" || edge === "right" ? "horizontal" : "vertical",
     children: before ? [newLeaf, target] : [target, newLeaf],
     sizes: [50, 50],

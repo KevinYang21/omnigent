@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   WORKSPACE_LAYOUT_STORAGE_KEY,
   closeWorkspacePane,
@@ -12,6 +12,7 @@ import {
   splitWorkspacePane,
   useWorkspaceLayoutStore,
   writeWorkspaceLayout,
+  type WorkspaceNode,
 } from "./workspaceLayout";
 
 describe("setWorkspaceLeafSession", () => {
@@ -35,6 +36,49 @@ describe("setWorkspaceLeafSession", () => {
     expect(findWorkspaceLeaf(next.root, leftPaneId)?.sessionId).toBe("session-a");
     expect(findWorkspaceLeafBySession(next.root, "session-b")?.id).toBe(rightPaneId);
     expect(next.focusedPaneId).toBe(rightPaneId);
+  });
+});
+
+describe("id generation after restore", () => {
+  it("keeps node ids unique across a simulated reload", async () => {
+    // A real reload re-evaluates the module: a process-local id sequence
+    // restarts while the persisted tree keeps its ids, so generation must
+    // derive from the restored tree.
+    localStorage.setItem(
+      WORKSPACE_LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        version: 1,
+        root: {
+          kind: "split",
+          id: "split-1",
+          direction: "horizontal",
+          children: [
+            { kind: "leaf", id: "pane-1", sessionId: "session-a" },
+            { kind: "leaf", id: "pane-2", sessionId: "session-b" },
+          ],
+          sizes: [50, 50],
+        },
+        focusedPaneId: "pane-1",
+      }),
+    );
+
+    vi.resetModules();
+    const reloaded = await import("./workspaceLayout");
+    const restored = reloaded.readWorkspaceLayout();
+    if (!restored || restored.root.kind !== "split") throw new Error("expected restored split");
+
+    const next = reloaded.splitWorkspacePane(restored, "pane-1", "session-c", "bottom");
+
+    const ids: string[] = [];
+    const collect = (node: WorkspaceNode) => {
+      ids.push(node.id);
+      if (node.kind === "split") {
+        collect(node.children[0]);
+        collect(node.children[1]);
+      }
+    };
+    collect(next.root);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });
 
