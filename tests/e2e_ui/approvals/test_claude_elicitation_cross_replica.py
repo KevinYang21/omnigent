@@ -23,6 +23,7 @@ one database, which is exactly what multi-replica deployments do:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import subprocess
@@ -92,7 +93,7 @@ def _park_claude_permission_prompt(
             )
             resp.raise_for_status()
             holder["response"] = resp.json() if resp.content else None
-        except Exception as exc:  # noqa: BLE001 — surfaced via holder in the test
+        except Exception as exc:
             holder["error"] = exc
 
     thread = threading.Thread(target=_post, daemon=True)
@@ -154,10 +155,8 @@ def _spawn_replica_b(db_uri: str, tmp_root: Path) -> tuple[subprocess.Popen, str
         time.sleep(0.5)
     proc.terminate()
     tail = ""
-    try:
+    with contextlib.suppress(OSError):
         tail = log_path.read_text()[-2000:]
-    except OSError:
-        pass
     raise RuntimeError(f"replica B never became healthy ({last_error}); log tail:\n{tail}")
 
 
@@ -202,21 +201,15 @@ def test_claude_permission_prompt_is_visible_from_a_replica_that_did_not_park_it
         return bool(_pending_elicitations(base_a, session_id))
 
     _wait_for(_parked)
-    elicitation_id = str(
-        _pending_elicitations(base_a, session_id)[0].get("elicitation_id") or ""
-    )
+    elicitation_id = str(_pending_elicitations(base_a, session_id)[0].get("elicitation_id") or "")
     assert elicitation_id, "parked elicitation carries no elicitation_id"
 
-    proc_b, base_b, log_path = _spawn_replica_b(
-        db_uri, tmp_path_factory.mktemp("cross_replica_b")
-    )
+    proc_b, base_b, log_path = _spawn_replica_b(db_uri, tmp_path_factory.mktemp("cross_replica_b"))
     _log.info("replica A=%s replica B=%s session=%s", base_a, base_b, session_id)
     try:
         # Control: the replica that parked the prompt renders the card.
         page.goto(f"{base_a}/c/{session_id}")
-        expect(page.get_by_role("textbox", name=_COMPOSER)).to_be_visible(
-            timeout=_LOAD_TIMEOUT_MS
-        )
+        expect(page.get_by_role("textbox", name=_COMPOSER)).to_be_visible(timeout=_LOAD_TIMEOUT_MS)
         card_a = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
         expect(card_a).to_be_visible(timeout=_RENDER_TIMEOUT_MS)
         expect(card_a).to_contain_text("Bash")
@@ -224,9 +217,7 @@ def test_claude_permission_prompt_is_visible_from_a_replica_that_did_not_park_it
         # The lakebox journey: the SPA lands on a replica that did NOT park
         # the prompt. Same session, same shared DB — the page loads fine...
         page.goto(f"{base_b}/c/{session_id}")
-        expect(page.get_by_role("textbox", name=_COMPOSER)).to_be_visible(
-            timeout=_LOAD_TIMEOUT_MS
-        )
+        expect(page.get_by_role("textbox", name=_COMPOSER)).to_be_visible(timeout=_LOAD_TIMEOUT_MS)
         # ...and the pending prompt must be visible here too. This is the
         # broken assertion: no approval card renders on replica B.
         card_b = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
