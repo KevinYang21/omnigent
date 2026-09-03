@@ -92,7 +92,7 @@ def _input_response(
     schema = _json_object(params.get("requestedSchema")) if params else None
     schema_dict = cast("dict[str, object]", schema) if schema is not None else None
     content = validate_content_against_schema(verdict.content, schema_dict)
-    if content is None and verdict.content:
+    if content is None and verdict.content is not None:
         # An answer WAS given but does not conform — fail closed instead of
         # forwarding it or letting the server act on a value nobody chose.
         _logger.warning(

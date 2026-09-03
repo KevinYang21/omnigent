@@ -483,3 +483,67 @@ def test_array_items_enum_and_bounds_are_enforced() -> None:
     assert _validate({"field": ["prod", "smuggled"]}, prop) is None
     assert _validate({"field": ["dev", "prod", "dev"]}, prop) is None
     assert _validate({"field": ["prod"]}, prop) == {"field": ["prod"]}
+
+
+# ── {} vs None: an empty submission is an answer, not the absence of one ────
+
+
+async def test_an_empty_submission_is_not_auto_filled() -> None:
+    """``{}`` posted from a rendered form must not become the first enum value.
+
+    The web form omits blank fields, so accepting an optional enum without a
+    selection posts ``{}``. Auto-filling that to ``enum[0]`` would re-create
+    the very bug this fix removes — the server acting on a value nobody
+    chose. ``{}`` conforms to the all-optional schema and travels as-is.
+    """
+    result = await _elicit_with(lambda: pending_approvals.resolve(ELICIT_ID, True, {}))
+
+    assert result.action == "accept"
+    assert result.content in ({}, None)
+    assert result.content != {"answer": "dev"}
+
+
+async def test_an_empty_submission_declines_when_fields_are_required() -> None:
+    """``{}`` against a required field is a non-conforming answer: decline.
+
+    It must not fall through to the schema auto-fill — that path is reserved
+    for surfaces that collected nothing at all (``content is None``).
+    """
+    result = await _elicit_with_schema(
+        {
+            "type": "object",
+            "properties": {"answer": {"type": "string", "enum": ["dev", "staging", "prod"]}},
+            "required": ["answer"],
+        },
+        lambda: pending_approvals.resolve(ELICIT_ID, True, {}),
+    )
+
+    assert result.action == "decline"
+
+
+def test_proxy_empty_submission_is_preserved_not_invented() -> None:
+    """The MRTR entry carries ``{}`` for an all-optional schema, unchanged."""
+    from omnigent.runner.proxy_mcp_manager import _input_response
+
+    entry = _input_response(
+        pending_approvals.Verdict(approved=True, content={}), _mrtr_request(ENV_SCHEMA)
+    )
+
+    assert entry == {"action": "accept", "content": {}}
+
+
+def test_proxy_empty_submission_declines_when_fields_are_required() -> None:
+    """``{}`` against a required-field schema fails closed on the proxy path."""
+    from omnigent.runner.proxy_mcp_manager import _input_response
+
+    required_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"answer": {"type": "string", "enum": ["dev", "staging", "prod"]}},
+        "required": ["answer"],
+    }
+
+    entry = _input_response(
+        pending_approvals.Verdict(approved=True, content={}), _mrtr_request(required_schema)
+    )
+
+    assert entry == {"action": "decline"}

@@ -370,7 +370,7 @@ class RunnerMcpManager:
             # schema (a boolean, a lone enum, an explicit default) has only
             # one sensible value anyway.
             content = _validated_content(verdict.content, params)
-            if content is None and verdict.content:
+            if content is None and verdict.content is not None:
                 # An answer WAS given but does not fit the schema. Guessing a
                 # different one would repeat the very bug this path fixes —
                 # the server acting on a value nobody chose — so fail closed.

@@ -156,16 +156,26 @@ def validate_content_against_schema(
     so the caller can fail closed instead of putting a body on the wire that
     the server's own schema rejects.
 
+    An explicitly submitted empty object ``{}`` is an answer, not the absence
+    of one: for a schema with no required fields it conforms and is preserved
+    (an all-optional form legally submits nothing), while against required
+    fields it fails like any other missing answer. Only ``None`` means "no
+    content was collected at all".
+
     :param content: The content the person's verdict carried, or ``None``.
     :param schema: The elicitation's ``requestedSchema``, or ``None``.
     :returns: The content when it conforms, otherwise ``None``. ``None`` means
         "nothing to forward": either the verdict carried no content, or what it
         carried did not fit the schema. A caller that must tell those apart
-        checks the supplied content's own truthiness — an answer that was given
-        but rejected fails closed, while no answer at all falls back.
+        checks whether the supplied content ``is not None`` — an answer that
+        was given but rejected fails closed, while no answer at all falls back.
     """
-    if not content:
+    if content is None:
         return None
+    if not content:
+        # ``{}`` carries no fields to mismatch; it conforms exactly when the
+        # schema requires none — including a bare consent with no schema.
+        return None if schema_requires_fields(schema) else content
     properties = schema.get("properties") if isinstance(schema, dict) else None
     if not isinstance(properties, dict):
         return None
