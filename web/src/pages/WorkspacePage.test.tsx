@@ -133,6 +133,20 @@ describe("WorkspacePage", () => {
     expect(screen.getByTestId(`pane-title-${secondPaneId}`)).toHaveTextContent("Second task");
   });
 
+  it("uses pane titles without a focused border or global-header clearance", async () => {
+    const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
+
+    const { container } = renderWorkspace("/c/session-b");
+    const unfocusedPane = container.querySelector('[data-workspace-pane-id][data-focused="false"]');
+    expect(unfocusedPane).not.toBeNull();
+    fireEvent.pointerDown(unfocusedPane!);
+    await waitFor(() => expect(unfocusedPane).toHaveAttribute("data-focused", "true"));
+
+    expect(unfocusedPane?.className).not.toContain("shadow-[inset_0_0_0_1px");
+    expect(unfocusedPane?.closest(".pt-14")).toBeNull();
+  });
+
   it("omits pane chrome for a single pane", () => {
     renderWorkspace("/c/session-a");
     expect(screen.queryByTestId(/pane-title-/)).toBeNull();

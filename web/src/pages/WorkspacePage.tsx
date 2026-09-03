@@ -38,15 +38,8 @@ export function WorkspacePage() {
 
   if (!conversationId) return <ChatPage />;
 
-  // ChatHeader is a floating h-14/md:h-12 overlay; in split mode the pane
-  // title strips must start below it instead of rendering underneath.
   return (
-    <div
-      className={cn(
-        "flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background",
-        leafCount > 1 && "pt-14 md:pt-12",
-      )}
-    >
+    <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
       <WorkspaceNodeView node={root} focusedPaneId={focusedPaneId} leafCount={leafCount} />
     </div>
   );
@@ -211,12 +204,7 @@ function WorkspaceLeafView({
 
   return (
     <div
-      className={cn(
-        "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background",
-        leafCount > 1 &&
-          focused &&
-          "shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--primary)_55%,transparent)]",
-      )}
+      className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background"
       data-testid={`workspace-pane-${node.id}`}
       data-workspace-pane-id={node.id}
       data-focused={String(focused)}
