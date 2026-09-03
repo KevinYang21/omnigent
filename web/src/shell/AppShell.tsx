@@ -13,6 +13,7 @@ import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
+import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
@@ -64,6 +65,7 @@ import {
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
   terminalTabKey,
+  useCreateTerminal,
   useDeleteTerminal,
   useTerminals,
 } from "@/hooks/useTerminals";
@@ -71,6 +73,7 @@ import {
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { useGithubInfo } from "@/hooks/useGithub";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -112,6 +115,7 @@ import { CloseShellDialog } from "./CloseShellDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
+import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
@@ -729,6 +733,15 @@ export function AppShell() {
   // it is enough to prove availability without paying for directory contents.
   const environmentQuery = useWorkspaceEnvironment(conversationId);
   const showFilesPanel = environmentQuery.data?.available !== false;
+  // The GitHub tab needs a git checkout on disk: hide it once the session's
+  // GitHub info resolves to "not a git repo" — that panel is a dead end. Other
+  // unavailable reasons keep the tab: `host_outdated` renders an actionable
+  // "update your host" prompt, and `no_os_env` is already covered by the Files
+  // gate. While the info is still loading the tab stays, matching the Files
+  // gate's no-flash default. Shares ChatPage's status-line query cache, so no
+  // extra fetch.
+  const githubInfoQuery = useGithubInfo(conversationId);
+  const showGithubTab = showFilesPanel && githubInfoQuery.data?.reason !== "not_a_git_repo";
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -739,11 +752,11 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // GitHub tab shares the Files gate too — it needs a git checkout on
-        // disk. The panel itself renders the "gh not installed" / "not a git
-        // repo" / "no PR" states, so the tab is present whenever there's a
-        // workspace.
-        github: showFilesPanel,
+        // GitHub tab: workspace gate plus the resolved GitHub info — a
+        // non-git workspace hides the tab instead of opening a dead-end
+        // panel. The panel still renders the "gh not installed" /
+        // "not signed in" / "update your host" states for a real checkout.
+        github: showGithubTab,
         // Browser tab: shown only when the desktop shell hosts the embedded
         // WebContentsView. A plain web build has no embedded browser, and an
         // older desktop build predates the `browser*` bridge — both hide the
@@ -757,7 +770,7 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel],
+    [showFilesPanel, showGithubTab],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1473,6 +1486,38 @@ export function AppShell() {
     },
     [clearFileViewerUrl, conversationId],
   );
+
+  // ⌘⌥T (Ctrl+Alt+T) opens a new shell — the keyboard path for the tab-strip
+  // "+" menu, launching the remembered default type via the same create +
+  // focus path the menu uses (mark-start snapshot, then focus the tab). Gated
+  // on the session declaring shell access and being reachable: an offline
+  // session can't be reconnected from the browser, so the chord is inert there,
+  // matching the menu item's disabled state. Also inert while a create is in
+  // flight, so two quick presses can't spawn two shells (the menu disables its
+  // item on create.isPending for the same reason).
+  const createTerminal = useCreateTerminal(conversationId ?? "");
+  const shellLaunchable =
+    agentSupportsShells &&
+    !!conversationId &&
+    !createTerminal.isPending &&
+    liveness?.kind !== "host_offline" &&
+    liveness?.kind !== "local_stranded";
+  const launchDefaultShell = useCallback(() => {
+    const name = resolveDefaultShell(boundAgent?.terminals ?? []);
+    if (name === null) return;
+    markShellCreateStarted();
+    createTerminal.mutate(name, {
+      onSuccess: (info) => openTerminalTab(terminalTabKey(info)),
+      onError: () => clearShellCreatePending(),
+    });
+  }, [
+    boundAgent,
+    createTerminal,
+    markShellCreateStarted,
+    clearShellCreatePending,
+    openTerminalTab,
+  ]);
+  useNewShellHotkey(launchDefaultShell, shellLaunchable);
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.

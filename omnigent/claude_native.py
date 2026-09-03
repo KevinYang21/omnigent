@@ -199,6 +199,12 @@ _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 #: Kill-switch Claude Code treats as covering nonessential startup traffic;
 #: the probe strips it so speed knobs never mask harness output.
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+#: Starting page size for the cold-resume history fetch. On a 5xx the fetch
+#: halves the page size down to the floor before giving up — a deployed
+#: backend can choke on one oversized page of a big conversation while the
+#: same rows page fine at smaller sizes.
+_CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
+_CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
@@ -479,6 +485,43 @@ def claude_catalog_serves_model(
     return family is not None and any(
         _claude_family(str(row.get("id") or row.get("model") or "")) == family for row in rows
     )
+
+
+def _endpoint_origin(url: str) -> str:
+    """
+    Reduce an endpoint URL to its scheme and host, for log lines.
+
+    :param url: An endpoint URL, e.g. ``"https://user:pw@gw.example/anthropic?sig=1"``.
+    :returns: The origin only, e.g. ``"https://gw.example"``; the URL itself
+        when it has no scheme.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        return url
+    host = f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+    return f"{parsed.scheme}://{host}"
+
+
+def claude_launch_endpoint_label(claude_config: ClaudeNativeUcodeConfig | None) -> str:
+    """
+    Name where a launch config sends Claude Code's inference, for log lines.
+
+    Only the endpoint's origin is named: a custom base URL can carry userinfo
+    or a signed query string that must not reach the logs.
+
+    :param claude_config: The resolved launch config, or ``None`` (Claude
+        Code's own login).
+    :returns: A short phrase, e.g. ``"the gateway at
+        https://example.databricks.com"``.
+    """
+    if claude_config is not None:
+        bedrock_url = claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV)
+        if bedrock_url:
+            return f"the Bedrock endpoint at {_endpoint_origin(bedrock_url)}"
+        base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+        if base_url:
+            return f"the gateway at {_endpoint_origin(base_url)}"
+    return "Claude Code's own login"
 
 
 def resolve_claude_native_model_selection(
@@ -1215,6 +1258,27 @@ async def claude_launch_catalog(
 
     fingerprint = claude_catalog_fingerprint(claude_config)
     return await model_catalog_store.ensure_catalog(
+        "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
+    )
+
+
+async def claude_reprobed_launch_catalog(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[dict[str, object]] | None:
+    """
+    Re-probe this config's catalog now and return the fresh rows.
+
+    For the launch gate's destructive path: a stale entry may predate a
+    provider change, so a pick it does not serve is re-checked against a
+    probe that is awaited rather than left to the background.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: The fresh rows, or ``None`` when the probe failed.
+    """
+    from omnigent import model_catalog_store
+
+    fingerprint = claude_catalog_fingerprint(claude_config)
+    return await model_catalog_store.reprobe_catalog(
         "claude-native", fingerprint, lambda: claude_model_catalog(claude_config)
     )
 
@@ -4781,7 +4845,25 @@ async def _ensure_local_claude_resume_transcript(
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
 
-    items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+    try:
+        items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+    except _ResumeHistoryUnavailableError:
+        # Server history is unreachable (5xx / dropped connections at every
+        # page size), but an intact local transcript from a previous run on
+        # this machine can still resume the conversation — far better than
+        # silently starting blank. It may be somewhat stale relative to the
+        # server, which the resumed session tolerates. 4xx contract errors
+        # (plain ClickException) still propagate: the server explicitly
+        # rejected the conversation, so reviving local history is unsafe.
+        if _is_resumable_claude_transcript(target):
+            _logger.warning(
+                "Could not fetch server history for %r; resuming from the "
+                "existing local transcript %s",
+                session_id,
+                target,
+            )
+            return target
+        raise
     # Items are persisted with unresolved file_id attachment blocks;
     # fetch the bytes back so the rebuilt transcript can reference a
     # live local file instead of silently dropping the attachment.
@@ -4815,6 +4897,47 @@ async def _ensure_local_claude_resume_transcript(
     return target
 
 
+def _is_resumable_claude_transcript(path: Path) -> bool:
+    """
+    Whether *path* holds a transcript ``claude --resume`` can start from.
+
+    ``--resume`` against an empty or non-JSONL file exits fatally instead of
+    starting, which for claude-native (terminal == agent) kills the session.
+    A transcript qualifies when at least one line parses as a JSON object —
+    the minimum Claude Code accepts as a conversation record.
+
+    :param path: Candidate ``<sid>.jsonl`` transcript path.
+    :returns: ``True`` when the file exists and holds a JSON-object line.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    return False
+                return isinstance(record, dict)
+    except (OSError, UnicodeDecodeError):
+        # A binary/non-UTF-8 file raises mid-iteration, outside the per-line
+        # JSON guard — it is just as unresumable as non-JSONL content.
+        return False
+    return False
+
+
+class _ResumeHistoryUnavailableError(click.ClickException):
+    """Server history stayed unreachable after every page-size retry.
+
+    Distinct from a plain :class:`click.ClickException` so callers can tell
+    "the backend cannot serve the rows right now" (a local-transcript
+    fallback is safe) apart from 4xx contract errors (the server explicitly
+    rejected the conversation — resuming local history could revive the
+    wrong session).
+    """
+
+
 async def _fetch_all_session_items_for_claude_resume(
     client: httpx.AsyncClient,
     session_id: str,
@@ -4832,14 +4955,54 @@ async def _fetch_all_session_items_for_claude_resume(
     """
     items: list[_JsonObject] = []
     after: str | None = None
+    limit = _CLAUDE_RESUME_ITEMS_PAGE_LIMIT
     while True:
-        params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+        params: dict[str, str | int] = {"limit": limit, "order": "asc"}
         if after is not None:
             params["after"] = after
-        resp = await client.get(
-            f"/v1/sessions/{url_component(session_id)}/items",
-            params=params,
-        )
+        try:
+            resp = await client.get(
+                f"/v1/sessions/{url_component(session_id)}/items",
+                params=params,
+            )
+        except httpx.TransportError as exc:
+            # A backend choking on one oversized page can also drop the
+            # connection mid-response instead of returning a clean 5xx;
+            # treat it the same way and retry the page smaller. Broad on
+            # purpose: total connectivity loss also degrades to the floor,
+            # then the local-transcript fallback rescues the resume.
+            if limit > _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR:
+                limit = max(limit // 2, _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
+                _logger.warning(
+                    "History page fetch for %r failed (%s); retrying at smaller limit=%d",
+                    session_id,
+                    type(exc).__name__,
+                    limit,
+                )
+                continue
+            raise _ResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r}: {exc}"
+            ) from exc
+        if resp.status_code >= 500 and limit > _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR:
+            # A deployed backend can fail reading one LARGE page of a big
+            # conversation while serving the same rows fine at smaller page
+            # sizes. The history is recoverable, so retry this page smaller
+            # instead of abandoning the resume (which silently launches a
+            # blank session). 4xx responses are contract errors and still
+            # raise immediately below.
+            limit = max(limit // 2, _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
+            _logger.warning(
+                "History page fetch for %r failed (%s); retrying at smaller limit=%d",
+                session_id,
+                resp.status_code,
+                limit,
+            )
+            continue
+        if resp.status_code >= 500:
+            raise _ResumeHistoryUnavailableError(
+                f"Failed to fetch history for {session_id!r} "
+                f"({resp.status_code}): {error_text(resp)}"
+            )
         if resp.status_code >= 400:
             raise click.ClickException(
                 f"Failed to fetch history for {session_id!r} "

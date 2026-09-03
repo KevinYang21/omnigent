@@ -24,7 +24,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.entities import (
+    USER_SESSION_TITLE_MAX_CHARS,
+    MessageData,
+    NewConversationItem,
+)
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
@@ -1639,6 +1643,9 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             "agent_id": agent["id"],
             "model": "skill-agent",
             "has_mcp_servers": False,
+            # No renderer subscribes to the session stream in this test,
+            # so the turn is stamped headless (browser tools stripped).
+            "browser_renderer_available": False,
             # The forwarded message is the meta item; its store id lets the
             # runner dedup it on a cold-cache history reload.
             "persisted_item_id": meta["id"],
@@ -3277,6 +3284,85 @@ async def test_list_session_items_404_for_nonexistent(
     """Items endpoint returns 404 for a session that doesn't exist."""
     resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/items")
     assert resp.status_code == 404
+
+
+async def test_list_session_items_big_page_survives_bounded_read_backend(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    ``limit=1000`` on a large conversation must not 500 when the backend can
+    only serve bounded reads.
+
+    A deployed managed-Postgres backend failed single big-page reads of a
+    large conversation (500 at ``limit>=500``, 200 at ``limit<=400``), which
+    turned every valid ``limit=1000`` request into ``internal_error`` — most
+    visibly breaking claude-native cold resume. The route must assemble the
+    page from bounded per-statement reads, so the same request returns 200
+    with the complete, ordered page. The choke is injected at the engine
+    boundary to mirror that deployed failure signature.
+    """
+    from sqlalchemy import event as _sa_event
+
+    # The deployed signature: reads of <=400 rows serve fine, bigger ones fail.
+    deployed_safe_read_rows = 400
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    appended = store.append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_big",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"item-{i}"}],
+                ),
+            )
+            for i in range(600)
+        ],
+    )
+
+    def _choke_on_oversized_reads(conn, clauseelement, multiparams, params, execution_options):
+        limit_clause = getattr(clauseelement, "_limit_clause", None)
+        value = getattr(limit_clause, "value", None)
+        if (
+            isinstance(value, int)
+            and value > deployed_safe_read_rows
+            and "conversation_items" in str(clauseelement)
+        ):
+            raise RuntimeError(f"simulated backend failure on oversized read (limit={value})")
+
+    _sa_event.listen(store._conv_engine, "before_execute", _choke_on_oversized_reads)
+    try:
+        resp = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 1000},
+        )
+        assert resp.status_code == 200, resp.text
+        page = resp.json()
+        assert [i["id"] for i in page["data"]] == [i.id for i in appended]
+        assert page["has_more"] is False
+        assert page["first_id"] == appended[0].id
+        assert page["last_id"] == appended[-1].id
+
+        # Cursor pagination stays correct across the same bounded backend.
+        first = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 500},
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["has_more"] is True
+        rest = await client.get(
+            f"/v1/sessions/{session['id']}/items",
+            params={"limit": 500, "after": first.json()["last_id"]},
+        )
+        assert rest.status_code == 200, rest.text
+        assert [i["id"] for i in rest.json()["data"]] == [i.id for i in appended[500:]]
+    finally:
+        _sa_event.remove(store._conv_engine, "before_execute", _choke_on_oversized_reads)
 
 
 # ── GET /v1/sessions/{id} snapshot fields ────────────────
@@ -10251,3 +10337,50 @@ async def test_create_session_notifies_runner_with_init_envelope(
         "runner seeds it into the first spawn; got "
         f"{envelope.snapshot.model_override!r}"
     )
+
+
+async def test_external_info_error_item_publishes_and_persists_level(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An external ``error`` item with ``level: "info"`` keeps its level on both
+    the live ``response.output_item.done`` frame and the persisted item.
+
+    This is the runner's fresh-thread notice: the web renders it as a neutral
+    pill live, and again after reload from the items endpoint.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "codex_thread_reset",
+                    "message": "Codex started a fresh thread.",
+                    "level": "info",
+                },
+            },
+        },
+    )
+    assert resp.status_code in (200, 202)
+
+    done = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
+    assert len(done) == 1
+    assert done[0]["item"]["type"] == "error"
+    assert done[0]["item"]["level"] == "info"
+
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    errors = [item for item in items.json()["data"] if item["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["level"] == "info"
