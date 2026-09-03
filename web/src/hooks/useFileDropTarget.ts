@@ -1,12 +1,11 @@
-// Page-wide file drop: a file dragged in from the OS attaches to the composer
-// wherever it lands, not only on the composer box itself. Dropping an image on
-// the transcript (or anywhere else on the page) has no other meaning, and left
-// unhandled the browser navigates away from the session to render the file.
+// Chat-scoped file drop: a file dragged in from the OS attaches to the composer
+// wherever it lands inside the chat column — the transcript, the empty space
+// beside the composer, the composer box itself — not just on the box. The
+// surrounding shell (sidebar, workspace rail) is deliberately excluded: a file
+// dropped there is not a chat attachment.
 //
 // Only drags that carry files are claimed — a text or link drag keeps its
 // native behavior, so dragging selected text into the textarea still works.
-// A drop zone that wants a file for itself can stopPropagation before the
-// event reaches window.
 
 import { useEffect, useRef, useState } from "react";
 
@@ -20,12 +19,14 @@ function carriesFiles(transfer: DataTransfer | null | undefined): boolean {
 }
 
 /**
- * Bind window-level file drag-and-drop and report whether such a drag is in
- * flight (for a drop affordance). ``onFiles`` receives the dropped files.
- *
- * Bind once per page: two live instances would both attach the same drop.
+ * Bind file drag-and-drop on ``target`` and report whether such a drag is in
+ * flight over it (for a drop affordance). ``onFiles`` receives the dropped
+ * files. A null target binds nothing.
  */
-export function useWindowFileDrop(onFiles: (files: File[]) => void): boolean {
+export function useFileDropTarget(
+  target: HTMLElement | null,
+  onFiles: (files: File[]) => void,
+): boolean {
   const [isDragActive, setIsDragActive] = useState(false);
   // Keep the callback in a ref so re-renders don't re-bind the listeners
   // mid-drag (a rebind between dragenter and drop loses the depth count).
@@ -33,6 +34,7 @@ export function useWindowFileDrop(onFiles: (files: File[]) => void): boolean {
   onFilesRef.current = onFiles;
 
   useEffect(() => {
+    if (!target) return;
     // Enter/leave fire in pairs as the pointer crosses child elements; count
     // them so moving between children doesn't clear the affordance.
     let depth = 0;
@@ -54,8 +56,8 @@ export function useWindowFileDrop(onFiles: (files: File[]) => void): boolean {
       // Required for a drop event to fire at all, and it also stops the
       // browser from opening the file over the app.
       e.preventDefault();
-      // Safety net: some drags (a drop from another window, or an enter
-      // swallowed by an iframe) reach us without a matching dragenter.
+      // Safety net: a drag entering from another window can reach us without
+      // a matching dragenter.
       setIsDragActive(true);
     };
 
@@ -68,25 +70,26 @@ export function useWindowFileDrop(onFiles: (files: File[]) => void): boolean {
       if (files.length > 0) onFilesRef.current(files);
     };
 
-    // A cancelled drag (Esc, or a drop outside the window) ends here.
+    // A cancelled drag (Esc, or a drop outside the target) ends here.
     const end = (): void => {
       depth = 0;
       setIsDragActive(false);
     };
 
-    window.addEventListener("dragenter", enter);
-    window.addEventListener("dragleave", leave);
-    window.addEventListener("dragover", over);
-    window.addEventListener("drop", drop);
-    window.addEventListener("dragend", end);
+    target.addEventListener("dragenter", enter);
+    target.addEventListener("dragleave", leave);
+    target.addEventListener("dragover", over);
+    target.addEventListener("drop", drop);
+    target.addEventListener("dragend", end);
     return () => {
-      window.removeEventListener("dragenter", enter);
-      window.removeEventListener("dragleave", leave);
-      window.removeEventListener("dragover", over);
-      window.removeEventListener("drop", drop);
-      window.removeEventListener("dragend", end);
+      target.removeEventListener("dragenter", enter);
+      target.removeEventListener("dragleave", leave);
+      target.removeEventListener("dragover", over);
+      target.removeEventListener("drop", drop);
+      target.removeEventListener("dragend", end);
+      setIsDragActive(false);
     };
-  }, []);
+  }, [target]);
 
   return isDragActive;
 }

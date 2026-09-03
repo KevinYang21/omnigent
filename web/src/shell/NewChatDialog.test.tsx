@@ -3212,20 +3212,32 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  // The whole page is the drop target: a screenshot dragged onto the heading
-  // or the empty space beside the composer has no other meaning here, and
-  // unhandled it would make the browser navigate away to render the file.
-  it("attaches files dropped anywhere on the page, not just on the composer", () => {
+  // The whole landing surface is the drop target: a screenshot dragged onto the
+  // heading or the empty space beside the composer has no other meaning here,
+  // and unhandled it would make the browser navigate away to render the file.
+  it("attaches files dropped anywhere on the landing surface, not just on the composer", () => {
     renderLanding();
-    fireEvent.dragEnter(screen.getByTestId("new-chat-landing"), { dataTransfer: fileDrag() });
+    const surface = screen.getByTestId("new-chat-landing");
+    fireEvent.dragEnter(surface, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     const file = new File(["hello"], "shot.png", { type: "image/png" });
-    fireEvent.drop(document.body, { dataTransfer: fileDrag([file]) });
+    fireEvent.drop(surface, { dataTransfer: fileDrag([file]) });
     expect(screen.getByText("shot.png")).toBeTruthy();
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  it("clears the drop overlay when the drag leaves the page", () => {
+  // Outside that surface — the sidebar and the rest of the shell — a file drag
+  // is not an attachment and is left to whatever owns that region.
+  it("ignores files dropped outside the landing surface", () => {
+    renderLanding();
+    fireEvent.dragEnter(document.body, { dataTransfer: fileDrag() });
+    expect(screen.queryByText("Drop files here")).toBeNull();
+    const file = new File(["hello"], "elsewhere.txt", { type: "text/plain" });
+    fireEvent.drop(document.body, { dataTransfer: fileDrag([file]) });
+    expect(screen.queryByText("elsewhere.txt")).toBeNull();
+  });
+
+  it("clears the drop overlay when the drag leaves the landing surface", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     fireEvent.dragEnter(composer, { dataTransfer: fileDrag() });

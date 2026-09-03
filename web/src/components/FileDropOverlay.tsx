@@ -1,16 +1,23 @@
-// Full-page affordance for a file drag: the whole viewport is the drop target
-// (see useWindowFileDrop), so the cue has to be page-wide rather than a badge
-// on the composer box.
+// Drop affordance for a file drag, covering the chat column it is portalled
+// into (see useFileDropTarget) rather than the whole viewport — the shell
+// around the chat is not a drop target.
 //
-// Portalled to <body> so a transformed ancestor can't re-anchor `fixed`, and
-// pointer-events-none so it never sits between the drag and the page.
+// Portalled into the drop target itself so it spans the transcript and the
+// composer together, and pointer-events-none so it never sits between the drag
+// and the page.
 
 import { createPortal } from "react-dom";
 
-export function FileDropOverlay({ label = "Drop files here" }: { label?: string }) {
+export function FileDropOverlay({
+  container,
+  label = "Drop files here",
+}: {
+  container: HTMLElement;
+  label?: string;
+}) {
   return createPortal(
     <div
-      className="pointer-events-none fixed inset-0 z-[70] flex items-center justify-center bg-background/60 backdrop-blur-[2px]"
+      className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-background/60 backdrop-blur-[2px]"
       data-testid="file-drop-overlay"
     >
       <div className="absolute inset-3 rounded-2xl border-2 border-dashed border-ring" />
@@ -18,6 +25,6 @@ export function FileDropOverlay({ label = "Drop files here" }: { label?: string 
         {label}
       </span>
     </div>,
-    document.body,
+    container,
   );
 }

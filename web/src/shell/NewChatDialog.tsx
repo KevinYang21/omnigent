@@ -193,7 +193,7 @@ import {
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
-import { useWindowFileDrop } from "@/hooks/useWindowFileDrop";
+import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentHarnesses } from "@/hooks/useRecentHarnesses";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
@@ -2185,9 +2185,10 @@ export function NewChatLandingScreen() {
   };
 
   // Drag-and-drop — same behavior as the in-session composer: a file dropped
-  // anywhere on the page attaches here, with an inset ring on the box plus a
-  // page-wide overlay naming the target.
-  const isDragActive = useWindowFileDrop(addFiles);
+  // anywhere on the landing surface attaches here (an inset ring on the box
+  // plus an overlay naming the target), while the shell around it is left
+  // alone. Declared after ``landingSurface``, which is the drop target.
+  const isDragActive = useFileDropTarget(landingSurface, addFiles);
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -4504,8 +4505,9 @@ export function NewChatLandingScreen() {
             </h1>
           ) : null}
         </div>
-        {/* Page-wide drop cue — files landing anywhere attach to this composer. */}
-        {isDragActive && <FileDropOverlay />}
+        {/* Drop cue spanning the landing surface — files landing anywhere in
+            it attach to this composer. */}
+        {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <div className="relative flex w-full flex-col gap-1">
           <form
             onSubmit={(e) => {

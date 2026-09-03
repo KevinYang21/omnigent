@@ -160,7 +160,7 @@ import {
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
-import { useWindowFileDrop } from "@/hooks/useWindowFileDrop";
+import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
 import {
@@ -1473,8 +1473,11 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
       {/* `relative`: positions MainAgentSurface's persistent terminal
-          overlay (absolute inset-0) against the main column. */}
-      <div className="relative flex min-w-0 flex-1 flex-col">{mainAgent}</div>
+          overlay (absolute inset-0) against the main column, and the
+          composer's file-drop overlay, which spans the whole chat column. */}
+      <div data-chat-surface className="relative flex min-w-0 flex-1 flex-col">
+        {mainAgent}
+      </div>
     </div>
   );
 }
@@ -4944,10 +4947,16 @@ export function Composer({
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   };
 
-  // Files dropped anywhere on the page attach here — the composer box is no
-  // longer the only target, since a file dragged into a session has no other
-  // meaning wherever it lands.
-  const isDragActive = useWindowFileDrop(addFiles);
+  // Files dropped anywhere in the chat column attach here — the composer box is
+  // no longer the only target, since a file dragged onto the transcript has no
+  // other meaning. Scoped to the column (resolved from the card's marked
+  // ancestor) so the sidebar and workspace rail keep their own drag behavior;
+  // with no such ancestor (a bare-rendered composer) the card is the target.
+  const [dropTarget, setDropTarget] = useState<HTMLElement | null>(null);
+  const bindComposerCard = useCallback((el: HTMLDivElement | null) => {
+    setDropTarget(el?.closest<HTMLElement>("[data-chat-surface]") ?? el);
+  }, []);
+  const isDragActive = useFileDropTarget(dropTarget, addFiles);
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -5265,12 +5274,14 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-      {/* Page-wide drop cue — files landing anywhere attach to this composer. */}
-      {isDragActive && <FileDropOverlay />}
+      {/* Drop cue spanning the chat column — files landing anywhere in it
+          attach to this composer. */}
+      {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}
       <div
+        ref={bindComposerCard}
         // Opaque card edge for transcript clearance; status shelf below is translucent.
         data-composer-card
         className={cn(
