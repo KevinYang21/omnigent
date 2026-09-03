@@ -191,21 +191,40 @@ def test_bracket_marker_on_a_non_alias_is_not_an_argument() -> None:
     assert claude_model_alias("sonnet[", _PINNED_ENV) is None
 
 
-def test_served_alias_pins_pick_the_newest_served_id_per_family() -> None:
+@pytest.mark.parametrize(
+    "served_fallback",
+    [
+        "databricks-claude-opus-4-8",
+        "anthropic/claude-opus-4-8",
+        "gw-claude-opus-4-8",
+        "claude-opus-4-8[1m]",
+    ],
+)
+def test_served_alias_pins_pin_opus_to_the_served_refusal_fallback_model(
+    served_fallback: str,
+) -> None:
     served = [
         "databricks-claude-opus-4-7",
-        "databricks-claude-opus-4-8",
+        served_fallback,
+        "anthropic/claude-sonnet-4-6",
         "anthropic/claude-sonnet-5",
         "gw-claude-haiku-4-5",
         "databricks-gpt-5-6",
-        "claude-opus-5[1m]",
+        "claude-opus-5",
     ]
     assert served_alias_pins(served) == {
-        # ``claude-opus-5`` outranks ``4-8``; the [1m] marker is not a
-        # different model, so the spelling the gateway listed is kept.
-        "opus": "claude-opus-5[1m]",
+        # Newest per family, except ``opus``: the refusal-fallback arms only
+        # for Opus 4.8, so its served spelling outranks the newer Opus 5.
+        "opus": served_fallback,
         "sonnet": "anthropic/claude-sonnet-5",
         "haiku": "gw-claude-haiku-4-5",
+    }
+
+
+def test_served_alias_pins_pick_the_newest_opus_when_the_fallback_model_is_not_served() -> None:
+    assert served_alias_pins(["databricks-claude-opus-4-7", "claude-opus-5[1m]"]) == {
+        # The [1m] marker is not a different model, so the listed spelling is kept.
+        "opus": "claude-opus-5[1m]",
     }
 
 

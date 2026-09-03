@@ -56,6 +56,10 @@ _SERVED_FALLBACK_MODEL = "gw-claude-opus-4-8"
 _SERVED_MODELS = [
     _LAUNCH_MODEL,
     _SERVED_FALLBACK_MODEL,
+    # A newer Opus the gateway also serves. The fallback must still land on
+    # Opus 4.8: Claude Code declines the swap when ``opus`` pins to anything
+    # else, and a workspace that serves Opus 5 is exactly where this broke.
+    "gw-claude-opus-5",
     "gw-claude-sonnet-5",
     "gw-claude-haiku-4-5",
 ]

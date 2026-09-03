@@ -832,6 +832,7 @@ class TestConstructor(unittest.TestCase):
                     ModelEntry(id="gw-claude-fable-5", family="claude"),
                     ModelEntry(id="gw-claude-opus-4-7", family="claude"),
                     ModelEntry(id="gw-claude-opus-4-8", family="claude"),
+                    ModelEntry(id="gw-claude-opus-5", family="claude"),
                     ModelEntry(id="gw-claude-sonnet-5", family="claude"),
                     ModelEntry(id="gw-claude-haiku-4-5", family="claude"),
                     ModelEntry(id="gw-gpt-5-6", family="openai"),
@@ -851,7 +852,9 @@ class TestConstructor(unittest.TestCase):
                         pass
 
             env = captured["env"]
-            # Newest served generation per family; the non-Claude id is ignored.
+            # Newest served generation per family, except ``opus``: the
+            # refusal-fallback arms only for Opus 4.8, so its served spelling
+            # wins over the newer Opus 5. The non-Claude id is ignored.
             self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-claude-opus-4-8")
             self.assertEqual(env["ANTHROPIC_DEFAULT_FABLE_MODEL"], "gw-claude-fable-5")
             self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "gw-claude-sonnet-5")

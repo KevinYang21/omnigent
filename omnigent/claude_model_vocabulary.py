@@ -82,6 +82,10 @@ MODEL_VOCABULARY_ENV_VARS: tuple[str, ...] = (
 #: this module stays stdlib-only for hook subprocesses, which also means it
 #: cannot honour a deployment's ``routing.model_prefix`` override.
 _CATALOG_PREFIXES: tuple[str, ...] = ("databricks-", "system.ai.")
+# Claude Code re-issues a safeguard-flagged turn on this canonical model, and
+# only when the ``opus`` alias resolves to it; any other Opus, newer included,
+# makes it decline the fallback (``model_refusal_no_fallback``).
+REFUSAL_FALLBACK_MODEL = "claude-opus-4-8"
 _SEGMENT_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -247,26 +251,52 @@ def _model_version_key(model: str) -> tuple[tuple[int, str | int], ...]:
     )
 
 
+def _spells_canonical_model(model_id: str, canonical: str) -> bool:
+    """Whether *model_id* is a gateway's spelling of the *canonical* vendor id.
+
+    :param model_id: A served id, e.g. ``"gw-claude-opus-4-8"``.
+    :param canonical: A canonical id, e.g. ``"claude-opus-4-8"``.
+    :returns: ``True`` for ``databricks-claude-opus-4-8``,
+        ``anthropic/claude-opus-4-8`` or ``claude-opus-4-8[1m]``; ``False`` for
+        another generation such as ``claude-opus-4-8-fast`` or ``claude-opus-5``.
+    """
+    return (
+        re.fullmatch(rf"(?:.*[^a-z0-9])?{re.escape(canonical)}", normalized_model_id(model_id))
+        is not None
+    )
+
+
 def served_alias_pins(model_ids: Iterable[str]) -> dict[str, str]:
-    """Map each family alias to the newest served id of that family.
+    """Map each family alias to a served id of that family.
 
     A gateway that serves Claude under its own ids (``databricks-claude-opus-4-8``,
     ``anthropic/claude-opus-4-8``) leaves Claude Code's alias vocabulary
     unpinned, and an unpinned alias resolves to a canonical vendor id the
     gateway rejects. Every alias surface — the refusal-fallback, ``/model``,
     ``Agent``-tool spawns — then fails ``model_not_found``. This picks, per
-    family, the id the gateway actually serves so the launch env can pin it.
+    family, an id the gateway actually serves so the launch env can pin it.
+
+    The newest served id of a family wins, except that ``opus`` pins the
+    served spelling of :data:`REFUSAL_FALLBACK_MODEL` whenever the gateway
+    serves it: the refusal-fallback arms only for that exact model, so a
+    newer Opus pin would leave a flagged turn with no fallback at all.
 
     :param model_ids: The ids a gateway's model listing reports.
     :returns: Alias → served id, e.g. ``{"opus": "databricks-claude-opus-4-8"}``,
         for the families the listing serves. Ids of no Claude family are
         ignored.
     """
+    served = list(model_ids)
     pins: dict[str, str] = {}
-    for model_id in model_ids:
+    for model_id in served:
         alias = claude_model_alias(model_id, env={})
         if alias not in ALIAS_MODEL_ENV_VARS:
             continue
         if alias not in pins or _model_version_key(model_id) > _model_version_key(pins[alias]):
             pins[alias] = model_id
+    fallback_alias = claude_model_alias(REFUSAL_FALLBACK_MODEL, env={})
+    for model_id in served:
+        if _spells_canonical_model(model_id, REFUSAL_FALLBACK_MODEL):
+            pins[fallback_alias] = model_id
+            break
     return pins
