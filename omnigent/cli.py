@@ -1361,6 +1361,44 @@ def _ensure_sqlite_parent_dir(db_uri: str) -> None:
     Path(url.database).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _require_existing_sqlite_db(db_uri: str) -> None:
+    """Reject a file-backed SQLite URL whose database file does not exist.
+
+    SQLite creates a missing file on first connect (silently "upgrading" a
+    brand-new empty database) and dies with a raw ``sqlite3.OperationalError:
+    unable to open database file`` when the parent directory is absent. An
+    upgrade only makes sense for an existing database, so fail fast with an
+    actionable message naming the missing path instead.
+
+    No-op for non-SQLite URLs and in-memory SQLite.
+
+    :param db_uri: SQLAlchemy database URL, e.g.
+        ``"sqlite:////absolute/path/to/chat.db"``.
+    :raises click.ClickException: If the URL is malformed, or points at a
+        file-backed SQLite database whose file does not exist.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import ArgumentError
+
+    try:
+        url = make_url(db_uri)
+    except ArgumentError as exc:
+        raise click.ClickException(f"Invalid database URL {db_uri!r}: {exc}") from exc
+    if url.get_backend_name() != "sqlite":
+        return
+    # ``url.database`` is the filesystem path for file-backed SQLite; None or
+    # ":memory:" mean in-memory, which has no file to check.
+    if not url.database or url.database == ":memory:":
+        return
+    db_path = Path(url.database)
+    if not db_path.exists():
+        raise click.ClickException(
+            f"Database file {str(db_path)!r} does not exist. Check the path in "
+            f"the database URL — db-upgrade upgrades an existing Omnigent "
+            f"database and will not create one."
+        )
+
+
 def _apply_bind_auth_defaults(host: str) -> None:
     """Set auth env defaults from the server's bind interface.
 
@@ -10592,6 +10630,7 @@ def debug_db_upgrade(url: str) -> None:
 
     from omnigent.db.utils import _run_migrations
 
+    _require_existing_sqlite_db(url)
     click.echo(f"Upgrading {url} ...")
     engine = create_engine(url)
     try:
