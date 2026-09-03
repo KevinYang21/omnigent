@@ -8,6 +8,7 @@ import {
   resizeWorkspaceSplit,
   selectWorkspaceSession,
   splitWorkspacePane,
+  useWorkspaceLayoutStore,
   writeWorkspaceLayout,
 } from "./workspaceLayout";
 
@@ -103,5 +104,34 @@ describe("workspace layout persistence", () => {
 
     localStorage.setItem(WORKSPACE_LAYOUT_STORAGE_KEY, JSON.stringify({ version: 1, root: null }));
     expect(readWorkspaceLayout()).toBeNull();
+  });
+});
+
+describe("workspace layout store", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useWorkspaceLayoutStore.getState().reset("session-a");
+  });
+
+  it("persists split, focus, resize, and close actions", () => {
+    const initial = useWorkspaceLayoutStore.getState();
+    useWorkspaceLayoutStore.getState().splitPane(initial.root.id, "session-b", "right");
+
+    let state = useWorkspaceLayoutStore.getState();
+    expect(findWorkspaceLeaf(state.root, state.focusedPaneId)?.sessionId).toBe("session-b");
+    expect(readWorkspaceLayout()).toMatchObject({ root: state.root });
+
+    if (state.root.kind !== "split") throw new Error("expected split root");
+    useWorkspaceLayoutStore.getState().resizeSplit(state.root.id, 65);
+    state = useWorkspaceLayoutStore.getState();
+    expect(state.root).toMatchObject({ sizes: [65, 35] });
+
+    const firstPaneId = state.root.kind === "split" ? state.root.children[0].id : "";
+    useWorkspaceLayoutStore.getState().focusPane(firstPaneId);
+    expect(useWorkspaceLayoutStore.getState().focusedPaneId).toBe(firstPaneId);
+
+    useWorkspaceLayoutStore.getState().closePane(firstPaneId);
+    state = useWorkspaceLayoutStore.getState();
+    expect(state.root).toMatchObject({ kind: "leaf", sessionId: "session-b" });
   });
 });

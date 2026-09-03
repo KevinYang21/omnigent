@@ -1,3 +1,5 @@
+import { create } from "zustand";
+
 export const WORKSPACE_LAYOUT_STORAGE_KEY = "omnigent:workspace-layout";
 const WORKSPACE_LAYOUT_VERSION = 1;
 const MIN_PANE_SIZE = 20;
@@ -241,3 +243,45 @@ export function writeWorkspaceLayout(layout: WorkspaceLayout): void {
     // Storage failures must not prevent session navigation.
   }
 }
+
+interface WorkspaceLayoutStore extends WorkspaceLayout {
+  selectSession: (sessionId: string) => void;
+  focusPane: (paneId: string) => void;
+  splitPane: (paneId: string, sessionId: string, edge: WorkspaceDropEdge) => void;
+  closePane: (paneId: string) => void;
+  resizeSplit: (splitId: string, firstSize: number) => void;
+  reset: (sessionId?: string | null) => void;
+}
+
+function persistAndSet(
+  set: (layout: Partial<WorkspaceLayoutStore>) => void,
+  layout: WorkspaceLayout,
+): void {
+  writeWorkspaceLayout(layout);
+  set(layout);
+}
+
+const initialWorkspaceLayout = readWorkspaceLayout() ?? createWorkspaceLayout();
+
+export const useWorkspaceLayoutStore = create<WorkspaceLayoutStore>((set, get) => ({
+  ...initialWorkspaceLayout,
+  selectSession: (sessionId) => {
+    persistAndSet(set, selectWorkspaceSession(get(), sessionId));
+  },
+  focusPane: (paneId) => {
+    if (!findWorkspaceLeaf(get().root, paneId)) return;
+    persistAndSet(set, { root: get().root, focusedPaneId: paneId });
+  },
+  splitPane: (paneId, sessionId, edge) => {
+    persistAndSet(set, splitWorkspacePane(get(), paneId, sessionId, edge));
+  },
+  closePane: (paneId) => {
+    persistAndSet(set, closeWorkspacePane(get(), paneId));
+  },
+  resizeSplit: (splitId, firstSize) => {
+    persistAndSet(set, resizeWorkspaceSplit(get(), splitId, firstSize));
+  },
+  reset: (sessionId = null) => {
+    persistAndSet(set, createWorkspaceLayout(sessionId));
+  },
+}));
