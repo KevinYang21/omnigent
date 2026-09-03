@@ -146,6 +146,10 @@ import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
+import {
+  SessionPrefetchSchedulerProvider,
+  useSessionRowPrefetch,
+} from "@/hooks/SessionPrefetchSchedulerContext";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
@@ -250,7 +254,9 @@ function SidebarRowDataProvider({
 }) {
   return (
     <ProjectNamesContext.Provider value={projectNamesById}>
-      <HostsByIdContext.Provider value={hostsById}>{children}</HostsByIdContext.Provider>
+      <HostsByIdContext.Provider value={hostsById}>
+        <SessionPrefetchSchedulerProvider>{children}</SessionPrefetchSchedulerProvider>
+      </HostsByIdContext.Provider>
     </ProjectNamesContext.Provider>
   );
 }
@@ -3323,6 +3329,10 @@ function ConversationRow({
   // unaffected.
   const activeRootId = useActiveRootSessionId(activeId ?? null);
   const isActive = (activeRootId ?? activeId) === conversation.id;
+  // Warm the `["session", id]` snapshot on hover (100ms debounced) / focus so
+  // clicking the row opens an already-fetched conversation. Shared scheduler
+  // keeps at most one prefetch in flight while skimming.
+  const prefetchHandlers = useSessionRowPrefetch(conversation.id);
   const navigate = useNavigate();
   // Mobile has no real hover, so a tap that navigates would also trip the
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
@@ -3652,6 +3662,11 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
+      // Skip warming in selection mode — the row toggles a checkbox, it doesn't
+      // open the conversation.
+      onPointerEnter={selectionMode ? undefined : prefetchHandlers.onPointerEnter}
+      onPointerLeave={selectionMode ? undefined : prefetchHandlers.onPointerLeave}
+      onFocus={selectionMode ? undefined : prefetchHandlers.onFocus}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
