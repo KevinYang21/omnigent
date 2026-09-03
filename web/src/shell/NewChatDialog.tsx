@@ -981,10 +981,19 @@ export function AgentHarnessPicker({
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const triggerDetailText = triggerDetails
-    .map((detail) => compactHarnessTriggerValue(detail.value))
-    .join(" ");
-  const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerDetailText]
+  const triggerModel = triggerDetails.find((detail) => detail.label === "Model");
+  const triggerEffort = triggerDetails.find(
+    (detail) => detail.label === "Effort" || detail.label === "Thinking level",
+  );
+  const triggerModelText = triggerModel ? compactHarnessTriggerValue(triggerModel.value) : "";
+  const triggerEffortText = triggerEffort ? compactHarnessTriggerValue(triggerEffort.value) : "";
+  const visibleModelText = triggerModelText === "Default" ? "" : triggerModelText;
+  const visibleEffortText =
+    triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
+  const triggerAccessibleDetails = triggerDetails
+    .map((detail) => `${detail.label} ${compactHarnessTriggerValue(detail.value)}`)
+    .join(", ");
+  const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerAccessibleDetails]
     .filter(Boolean)
     .join(", ");
 
@@ -1230,12 +1239,27 @@ export function AgentHarnessPicker({
         >
           {triggerIcon}
           <span
-            className={cn("max-w-[12rem] truncate text-ui text-foreground", triggerLabelClassName)}
+            className={cn("inline-flex min-w-0 items-baseline gap-1", triggerLabelClassName)}
             data-testid="new-chat-landing-agent-config-value"
           >
-            {triggerDetailText || (hasAgents ? agentLabel : "No agents")}
+            {(visibleModelText || triggerModel === undefined) && (
+              <span
+                className="min-w-0 truncate text-ui font-medium text-foreground"
+                data-testid="new-chat-landing-agent-model-value"
+              >
+                {visibleModelText || (hasAgents ? agentLabel : "No agents")}
+              </span>
+            )}
+            {visibleEffortText && (
+              <span
+                className="hidden shrink-0 text-ui font-normal text-muted-foreground md:inline"
+                data-testid="new-chat-landing-agent-effort-value"
+              >
+                {visibleEffortText}
+              </span>
+            )}
           </span>
-          <ChevronDownIcon className="size-3.5 opacity-60" />
+          <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
@@ -4035,9 +4059,10 @@ export function NewChatLandingScreen() {
       : sandboxSelected
         ? selectedSandboxLabel
         : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
-  // The chip shows just the branch (the "(existing)" distinction lives in the
-  // popover's warning; appending it here only gets clipped by the chip's cap).
-  const worktreeLabel = branchName.trim() || "Worktree";
+  const worktreeControlAvailable =
+    !sandboxSelected &&
+    (branchName.trim() !== "" ||
+      (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
   // Sandbox repository chip label: repo name (server's clone-dir rule)
   // plus the pinned branch, e.g. "repo#main"; placeholder when unset.
   const sandboxRepoName = deriveRepoName(sandboxRepoUrl);
@@ -4060,6 +4085,12 @@ export function NewChatLandingScreen() {
       : configuredAgentUnavailable
         ? "Agent unavailable"
         : "Select agent";
+  const harnessTriggerTitle = [
+    agentLabel,
+    ...harnessTriggerDetails.map(
+      (detail) => `${detail.label} ${compactHarnessTriggerValue(detail.value)}`,
+    ),
+  ].join(", ");
   const SelectedAgentIcon = selectedAgent ? iconForAgent(selectedAgent) : null;
 
   // Wrap the harness setter so every explicit pick is persisted to
@@ -5110,34 +5141,33 @@ export function NewChatLandingScreen() {
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
             <div
-              className="mt-2 flex min-w-0 items-center gap-1 px-2 pt-1 pb-0"
+              className="mt-2 flex min-w-0 items-center justify-between gap-2 px-2 pt-1 pb-0"
               data-testid="new-chat-landing-actions"
             >
-              {/* Attachment starts the ordered composer action row. */}
-              <div className="flex shrink-0 items-center gap-0.5">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="size-8 md:size-7"
-                  disabled={creating}
-                  onClick={() => fileInputRef.current?.click()}
-                  title="Attach files"
-                  data-testid="new-chat-landing-attach"
-                  componentId="new_chat.attach_files"
-                >
-                  <PlusIcon
-                    className="size-4"
-                    data-icon-size="16"
-                    data-testid="new-chat-landing-attach-icon"
-                  />
-                  <span className="sr-only">Attach files</span>
-                </Button>
-              </div>
               <div
-                className="flex min-w-0 shrink-0 items-center gap-1 overflow-hidden"
+                className="flex min-w-0 flex-1 items-center gap-1 overflow-visible"
                 data-testid="new-chat-landing-left-controls"
               >
+                <div className="flex shrink-0 items-center">
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="size-8 md:size-7"
+                    disabled={creating}
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Attach files"
+                    data-testid="new-chat-landing-attach"
+                    componentId="new_chat.attach_files"
+                  >
+                    <PlusIcon
+                      className="size-4"
+                      data-icon-size="16"
+                      data-testid="new-chat-landing-attach-icon"
+                    />
+                    <span className="sr-only">Attach files</span>
+                  </Button>
+                </div>
                 {/* Host chip */}
                 <DropdownMenu
                   onOpenChange={(open) => {
@@ -5161,12 +5191,17 @@ export function NewChatLandingScreen() {
                           ? `, ${selectedHost.status === "online" ? "Online" : "Offline"}`
                           : ""
                       }`}
-                      className="flex h-8 cursor-pointer items-center gap-1 rounded-lg px-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground dark:hover:bg-muted/50 md:h-7"
+                      title={`Host: ${hostLabel}${
+                        !sandboxSelected && selectedHost != null
+                          ? `, ${selectedHost.status === "online" ? "Online" : "Offline"}`
+                          : ""
+                      }`}
+                      className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg bg-transparent px-1.5 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground dark:hover:bg-muted/50 md:h-7"
                       data-testid="new-chat-landing-host-chip"
                     >
                       <span
                         aria-hidden
-                        className={`size-2 shrink-0 rounded-full ${
+                        className={`size-1 shrink-0 rounded-full ${
                           selectedHost?.status === "online" && !sandboxSelected
                             ? "bg-success"
                             : "bg-muted-foreground/40"
@@ -5175,12 +5210,12 @@ export function NewChatLandingScreen() {
                       />
                       {isCloudHost ? (
                         <MonitorCloudIcon
-                          className="size-4 shrink-0"
+                          className="size-3.5 shrink-0"
                           data-testid="new-chat-landing-host-icon"
                         />
                       ) : (
                         <MonitorIcon
-                          className="size-4 shrink-0"
+                          className="size-3.5 shrink-0"
                           data-testid="new-chat-landing-host-icon"
                         />
                       )}
@@ -5374,15 +5409,16 @@ export function NewChatLandingScreen() {
                     <DropdownMenuTrigger asChild>
                       <button
                         type="button"
-                        className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg bg-muted/70 px-2 text-ui font-normal text-foreground transition-colors hover:bg-muted dark:bg-muted/50 dark:hover:bg-muted/70 md:h-7"
+                        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-lg bg-transparent p-0 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 md:h-7 md:w-auto md:gap-1 md:px-2"
                         aria-label={`${permissionConfigRow.label}: ${permissionConfigRow.value}`}
+                        title={`${permissionConfigRow.label}: ${permissionConfigRow.value}`}
                         data-testid="new-chat-landing-permission-chip"
                       >
-                        <HandIcon className="size-3.5 shrink-0" />
-                        <span className="hidden max-w-28 truncate text-ui sm:block">
+                        <HandIcon className="size-3 shrink-0" />
+                        <span className="hidden max-w-20 truncate text-ui font-normal md:block">
                           {permissionConfigRow.value}
                         </span>
-                        <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
+                        <ChevronDownIcon className="hidden size-4 shrink-0 opacity-60 md:block" />
                       </button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent
@@ -5482,21 +5518,18 @@ export function NewChatLandingScreen() {
 
                 {/* Git worktree chip — hidden for sandbox sessions (worktree
                 creation requires a caller-supplied host_id). */}
-                {!sandboxSelected && (
+                {worktreeControlAvailable && (
                   <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                     <PopoverTrigger asChild>
                       <button
                         type="button"
-                        hidden
                         aria-label={`Worktree: ${branchName.trim() || "None"}`}
-                        className="flex h-6 min-w-0 max-w-40 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                        title={`Worktree: ${branchName.trim() || "None"}`}
+                        className="flex size-8 shrink-0 cursor-pointer items-center justify-center rounded-lg bg-transparent p-0 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground dark:hover:bg-muted/50 md:h-7 md:w-11 md:gap-1"
                         data-testid="new-chat-landing-branch-chip"
                       >
-                        <GitBranchIcon className="ui-icon" />
-                        <span className="hidden min-w-0 max-w-32 truncate text-sm lg:block">
-                          {worktreeLabel}
-                        </span>
-                        <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                        <GitBranchIcon className="size-3.5 shrink-0" />
+                        <ChevronDownIcon className="hidden size-4 shrink-0 opacity-60 md:block" />
                       </button>
                     </PopoverTrigger>
                     <PopoverContent
@@ -5656,8 +5689,11 @@ export function NewChatLandingScreen() {
                 is shown in the hero heading instead of a tray chip; filing on
                 create still uses `selectedProject`. */}
               </div>
-              <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-1 md:flex-none">
-                <div className="flex min-w-0 flex-1 items-center justify-end rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 md:flex-none [&>button]:bg-transparent!">
+              <div
+                className="flex shrink-0 items-center gap-1"
+                data-testid="new-chat-landing-right-controls"
+              >
+                <div className="flex min-w-0 items-center rounded-lg">
                   {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}
                   <AgentHarnessPicker
@@ -5674,15 +5710,21 @@ export function NewChatLandingScreen() {
                     onCreateCustomAgent={() => setCreateAgentOpen(true)}
                     sandboxSelected={sandboxSelected}
                     triggerTooltip={
-                      smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
+                      smartRoutingHarnessSelected
+                        ? AUTO_HARNESS_DESCRIPTION
+                        : harnessTriggerDetails.length > 0
+                          ? harnessTriggerTitle
+                          : undefined
                     }
                     triggerDetails={harnessTriggerDetails}
                     triggerIcon={
                       SelectedAgentIcon ? (
-                        <SelectedAgentIcon
-                          className="size-4 shrink-0 text-foreground"
+                        <span
+                          className="flex size-3.5 shrink-0 items-center justify-center"
                           data-testid="new-chat-landing-agent-icon"
-                        />
+                        >
+                          <SelectedAgentIcon className="size-full text-foreground" />
+                        </span>
                       ) : null
                     }
                     selectedConfigContent={selectedConfigContent}
@@ -5690,7 +5732,7 @@ export function NewChatLandingScreen() {
                     autoHarnessActive={smartRoutingHarnessSelected}
                     onSelectAutoHarness={handleSelectSmartRoutingHarness}
                     contentClassName="w-[17.25rem] min-w-0"
-                    triggerClassName="h-8 min-w-0 w-full max-w-[10rem] gap-1 px-2 sm:max-w-[14rem] md:h-7 md:w-auto md:max-w-[17rem]"
+                    triggerClassName="h-8 min-w-0 w-full max-w-[7.25rem] gap-1 rounded-lg pl-2 pr-0 text-[13px] leading-5 md:h-7 md:w-auto md:max-w-40"
                   />
                 </div>
                 {selectedAgent && selectedAgentHasKnobs && (
