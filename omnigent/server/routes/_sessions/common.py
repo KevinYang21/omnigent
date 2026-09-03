@@ -372,7 +372,19 @@ _browser_action_owners: dict[str, str] = {}  # -> issuing session_id (result POS
 _browser_action_claims: dict[str, str] = {}
 
 
+_browser_action_claim_events: dict[str, asyncio.Event] = {}
+
+
+# The Electron relay claims before doing browser work, so this only budgets
+# event delivery plus the claim round-trip. Keep it short enough that a generic
+# stream subscriber cannot recreate the old 30-second no-renderer stall.
+_BROWSER_ACTION_CLAIM_GRACE_S = 2.0
+
+
 _BROWSER_ACTION_AWAIT_S = 30.0
+
+
+_BROWSER_ACTION_NO_RENDERER_RESULT: dict[str, Any] = {"error": "no browser renderer is connected"}
 
 
 _BROWSER_ACTION_TIMEOUT_RESULT: dict[str, Any] = {
@@ -544,6 +556,12 @@ _session_mcp_startup_cache: dict[str, dict[str, McpServerStartup]] = {}
 _runner_skills_cache: dict[str, list[SkillSummary]] = {}
 
 
+# Sessions whose cached skills need a re-fetch but should keep serving until it
+# lands. A browser reload asks for one, and dropping the entry outright would
+# empty the composer's slash-command menu for the reload that requested it.
+_runner_skills_stale: set[str] = set()
+
+
 _runner_skills_inflight: dict[str, asyncio.Task[None]] = {}
 
 
@@ -687,9 +705,6 @@ _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
 _STOP_RUNNER_RESULT_TIMEOUT_S = 10.0
 
 
-_COMPACT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-
-
 # Derived from the fork_history capability axis (see harness_capabilities). A
 # harness declaring fork_history=REBUILD rebuilds its resumable session file
 # from the copied items (e.g. qwen rebuilds its on-disk chat recording via
@@ -831,6 +846,8 @@ __all__ = [
     "_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_APPROVAL_TYPE",
     "_BROWSER_ACTION_AWAIT_S",
+    "_BROWSER_ACTION_CLAIM_GRACE_S",
+    "_BROWSER_ACTION_NO_RENDERER_RESULT",
     "_BROWSER_ACTION_TIMEOUT_RESULT",
     "_CHILD_PREVIEW_LIMIT",
     "_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY",
@@ -863,7 +880,6 @@ __all__ = [
     "_CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_CODEX_NATIVE_WRAPPER_LABEL_VALUE",
-    "_COMPACT_LOCKS",
     "_COMPACT_TYPE",
     "_CURSOR_FORK_HISTORY_HARNESSES",
     "_CURSOR_NATIVE_HARNESS",
@@ -957,6 +973,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
     "_browser_action_registry",
@@ -979,6 +996,7 @@ __all__ = [
     "_runner_relay_tasks",
     "_runner_skills_cache",
     "_runner_skills_inflight",
+    "_runner_skills_stale",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

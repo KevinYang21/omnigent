@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,6 +117,7 @@ from omnigent.process_logging import (
     env_truthy,
     open_process_log_file,
     process_log_dir,
+    should_log_to_stderr,
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
@@ -139,6 +141,10 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.runtime.websocket_metrics import (
+    record_websocket_connected,
+    record_websocket_disconnected,
+)
 from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
@@ -155,10 +161,39 @@ def _coerce_int(value: object) -> int:
     return int(cast(str | bytes | bytearray | SupportsInt | SupportsIndex, value))
 
 
-# Binary appearance is cheap to probe, so new CLI installs surface quickly.
+# Quick-probe cadence. Binary appearance itself is not cheap to probe on
+# every wakeup: a shutil.which miss walks the whole PATH, and on hosts where
+# each stat is expensive (long PATH, endpoint-security filter drivers) a 5s
+# cadence over several uninstalled harnesses burns a sustained CPU core while
+# the daemon is idle — hence the TTL verdict cache below.
 HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
 # Auth changes and removals need the full, potentially expensive readiness map.
 HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
+# How long a quick-probe verdict stays cached. New-CLI installs surface within
+# this window (a minute of badge staleness is invisible); the quick probe's
+# 5s cadence re-uses the cached verdict for free. Matches the full-refresh
+# cadence so quick-probe staleness never exceeds a full-refresh window.
+HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S = 60.0
+_quick_probe_cache: dict[str, float] = {}
+_quick_probe_cached: dict[str, bool] = {}
+
+
+def _invalidate_quick_probe_cache() -> None:
+    """Drop cached quick-probe verdicts (tests; installs refilled within TTL)."""
+    _quick_probe_cache.clear()
+    _quick_probe_cached.clear()
+
+
+def _harness_now_configured(harness: str) -> bool:
+    """harness_is_configured through the quick-probe TTL cache."""
+    now = time.monotonic()
+    stamp = _quick_probe_cache.get(harness)
+    if stamp is not None and now - stamp < HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S:
+        return _quick_probe_cached[harness]
+    verdict = harness_is_configured(harness)
+    _quick_probe_cache[harness] = now
+    _quick_probe_cached[harness] = verdict
+    return verdict
 
 
 def _unavailable_harness_became_ready(
@@ -167,7 +202,7 @@ def _unavailable_harness_became_ready(
     """Detect newly available binaries; auth changes wait for the full refresh."""
     return any(
         (availability is False or availability == HARNESS_BINARY_MISSING)
-        and harness_is_configured(harness)
+        and _harness_now_configured(harness)
         for harness, availability in previous.items()
     )
 
@@ -563,6 +598,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Keep host and spawned-runner routing decisions aligned when the
+        # host-slice-key kill switch is explicitly disabled.
+        "OMNIGENT_HOST_SLICE_KEY_ENABLED",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -639,6 +677,12 @@ _RETRYABLE_UPGRADE_STATUSES: frozenset[int] = frozenset({408, 429})
 # HAS connected keeps retrying indefinitely, so a deploy restart never
 # kills a live host with running sessions.
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
+
+# Max chars of a rejected-upgrade response body surfaced in the operator-facing
+# error. The server's own refusals (_refuse_upgrade) are short plain text, but
+# an edge/proxy can answer with a multi-KB HTML error page; cap it so a legit
+# refusal reason stays readable and a stray HTML blob can't flood the terminal.
+_UPGRADE_BODY_MAX_CHARS = 300
 
 
 class HostConnectError(Exception):
@@ -835,10 +879,16 @@ class _RunnerHandle:
         ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
         Read back for diagnostics when the runner dies before
         connecting its tunnel.
+    :param session_id: The session this runner was launched for, e.g.
+        ``"conv_abc123"``. Lets a relaunch tear down the session's
+        previous runner (the server rotates the binding token per
+        attempt, so the runner id alone can't identify a predecessor).
+        ``None`` for frames from servers that predate ``session_id``.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
+    session_id: str | None = None
 
 
 class HostRetryableConnectionError(Exception):
@@ -935,6 +985,9 @@ class HostProcess:
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
+        # Strong refs to detached superseded-runner stops (see
+        # _spawn_superseded_stop), for the same GC reason.
+        self._supersede_stop_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
@@ -1328,13 +1381,29 @@ class HostProcess:
                     flush=True,
                 )
             return None
-        return self._classify_http_status(exc.response.status_code)
+        # Carry the upgrade response's body through so a refusal that names its
+        # own cause (the server sends one via _refuse_upgrade — e.g. a malformed
+        # host id, or an edge/proxy 400) surfaces that text verbatim instead of a
+        # guessed, status-only message. Best-effort decode; a bare close has none.
+        raw_body = getattr(exc.response, "body", b"") or b""
+        # Collapse whitespace to one line and cap the length: the body is
+        # interpolated verbatim into the operator-facing error, and an edge/proxy
+        # refusal can be a multi-KB HTML page rather than the server's short
+        # plain-text reason.
+        body = " ".join(raw_body.decode("utf-8", "replace").split())
+        if len(body) > _UPGRADE_BODY_MAX_CHARS:
+            body = body[:_UPGRADE_BODY_MAX_CHARS] + "…"
+        return self._classify_http_status(exc.response.status_code, body)
 
-    def _classify_http_status(self, status: int) -> HostConnectError | None:
+    def _classify_http_status(self, status: int, body: str = "") -> HostConnectError | None:
         """Map a rejected-upgrade HTTP status to a fatal error, or ``None``.
 
         :param status: HTTP status on the failed WS upgrade response, e.g.
             ``403``.
+        :param body: The response body the server sent with the refusal, if any
+            (decoded, stripped). When present it is the authoritative,
+            reason-specific explanation, so it is surfaced verbatim for statuses
+            without their own client-actionable guidance.
         :returns: A :class:`HostConnectError` for a permanent 4xx, or
             ``None`` for a transient status (retryable 4xx in
             :data:`_RETRYABLE_UPGRADE_STATUSES`, or any non-4xx such as a
@@ -1425,6 +1494,12 @@ class HostProcess:
                 "the existing host registration, or reset this machine's host "
                 "id, then retry. " + self._login_fix_hint()
             )
+        # Any other permanent 4xx (e.g. a 400 for a malformed host id, or an
+        # edge/proxy rejection): the server's own body is the authoritative
+        # reason, so surface it verbatim rather than guessing. Fall back to a
+        # generic message only when the refusal carried no body.
+        if body:
+            return HostConnectError(f"Connection refused (HTTP {status}): {body}")
         return HostConnectError(
             f"Connection refused (HTTP {status}): the server rejected the host "
             "tunnel request. This is a permanent error; retrying will not help. "
@@ -1453,7 +1528,12 @@ class HostProcess:
         # first turn dies confusingly inside the executor. ``None`` (an
         # older server, or a session with no resolvable harness) skips the
         # check so version skew fails open.
-        if frame.harness is not None and not harness_is_configured(frame.harness):
+        #
+        # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
+        # CLI, which inline would stall the keepalive pong and every other frame.
+        if frame.harness is not None and not await asyncio.to_thread(
+            harness_is_configured, frame.harness
+        ):
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -1545,7 +1625,29 @@ class HostProcess:
                 error=_runner_exit_error(proc.returncode, log_path),
             )
 
-        self._runners[runner_id] = _RunnerHandle(proc=proc, log_path=log_path)
+        # One live runner per session: the session's previous runner —
+        # whose binding the server has already rotated away — is
+        # superseded, but only now that its replacement is alive (a failed
+        # spawn must not trade a working runner for nothing). Left alive
+        # it would idle forever: tunnel still authenticating, transcript
+        # forwarder still posting — one leaked generation per relaunch.
+        # The pops run under the _runner_lifecycle_lock the frame
+        # dispatcher holds (mirroring _handle_stop, so the watcher reads
+        # the exit as intentional); the SIGTERM/SIGKILL round itself is
+        # detached so a stop that waits out its 5s grace cannot
+        # head-of-line block other sessions' launches on this host.
+        if frame.session_id:
+            superseded = [
+                (rid, handle)
+                for rid, handle in self._runners.items()
+                if handle.session_id == frame.session_id
+            ]
+            for rid, handle in superseded:
+                self._runners.pop(rid, None)
+                self._spawn_superseded_stop(rid, handle, frame.session_id)
+        self._runners[runner_id] = _RunnerHandle(
+            proc=proc, log_path=log_path, session_id=frame.session_id or None
+        )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
@@ -1756,6 +1858,45 @@ class HostProcess:
             request_id=frame.request_id,
             status="stopped",
         )
+
+    def _spawn_superseded_stop(
+        self, runner_id: str, handle: _RunnerHandle, session_id: str
+    ) -> None:
+        """
+        Terminate a superseded runner as a retained background task.
+
+        The handle is already popped from ``self._runners`` (so its watcher
+        reads the exit as intentional); only the SIGTERM/SIGKILL round runs
+        detached, keeping the frame dispatcher's lifecycle lock free while
+        a stubborn runner waits out its termination grace. A failure here
+        is logged loudly — the process would otherwise linger untracked
+        until the orphan reaper collects it post-exit.
+
+        :param runner_id: The superseded runner's id (for logging).
+        :param handle: Its popped :class:`_RunnerHandle`.
+        :param session_id: The session being relaunched (for logging).
+        """
+
+        async def _stop_and_log() -> None:
+            try:
+                await asyncio.to_thread(self._stop_runner_proc, handle.proc)
+                _logger.info(
+                    "Stopped superseded runner %s for session %s",
+                    runner_id,
+                    session_id,
+                )
+            except Exception:  # noqa: BLE001 — must never die unobserved
+                _logger.warning(
+                    "Failed to stop superseded runner %s for session %s; "
+                    "the process may linger until it exits on its own",
+                    runner_id,
+                    session_id,
+                    exc_info=True,
+                )
+
+        task = asyncio.create_task(_stop_and_log())
+        self._supersede_stop_tasks.add(task)
+        task.add_done_callback(self._supersede_stop_tasks.discard)
 
     @staticmethod
     def _stop_runner_proc(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> None:
@@ -2408,11 +2549,12 @@ class HostProcess:
         """Serve a read-only workspace filesystem request from the host.
 
         Runs :class:`omnigent.workspace_fs.WorkspaceReader` against the
-        session's workspace so the web UI's file panel keeps working when
-        the runner is offline but the host still holds the workspace on
-        disk. Read-only and confined to the workspace root; never writes
-        or runs a shell. Called inside a worker thread by the dispatcher
-        because git / directory-walk work can block.
+        session's workspace so the web UI's file and GitHub panels keep
+        working when the runner is offline but the host still holds the
+        workspace on disk. Read-only and confined to the workspace root; it
+        never writes, but does run read-only ``git`` (status/show/diff) and,
+        for the GitHub ops, the developer's own ``gh`` CLI. Called inside a
+        worker thread by the dispatcher because that work can block.
 
         :param frame: The fs request frame (op + workspace + params).
         :returns: A result frame with the runner-shaped payload, or an
@@ -2694,6 +2836,17 @@ class HostProcess:
                 exclude=cast("str | None", params.get("exclude")),
                 limit=_coerce_int(params.get("limit", 500)),
             )
+        if op == "github_info":
+            return r.github_info()
+        if op == "github_changes":
+            return r.github_changes(cast("str | None", params.get("base")))
+        if op == "github_diff":
+            return r.github_file_diff(
+                cast("str | None", params.get("base")),
+                str(params.get("path", "")),
+            )
+        if op == "github_pr_diff":
+            return r.github_pr_diff(cast("str | None", params.get("base")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     async def _handle_create_worktree(
@@ -2720,6 +2873,7 @@ class HostProcess:
                     repo_path=frame.repo_path,
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
+                    existing_branch=frame.existing_branch,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
@@ -2962,6 +3116,23 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # Reap per-session native-harness bridge dirs orphaned by a runner
+        # that died uncleanly (crash / SIGKILL / host restart mid-run). The
+        # runner performs the same sweep at its own startup, but after a
+        # crash no new runner may ever launch on this machine, so the host
+        # (re)start is the reliable moment to reclaim them. Best-effort and
+        # off-loop: a sweep failure must never block host registration.
+        from omnigent.native_bridge_common import reap_orphaned_native_bridge_dirs
+
+        try:
+            reaped_bridge_dirs = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
+            if reaped_bridge_dirs:
+                _logger.info(
+                    "Reaped %d orphaned native bridge dir(s) from prior runs",
+                    reaped_bridge_dirs,
+                )
+        except Exception:  # noqa: BLE001 — housekeeping must never block registration
+            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
         # Detect wake from system suspend (laptop sleep) and force-drop the
         # then-dead tunnel so the reconnect loop reattaches within seconds
         # instead of waiting out the ~90s keepalive ping timeout.
@@ -3281,15 +3452,30 @@ class HostProcess:
             raise
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
+        reconnect = self._ever_connected
         self._ever_connected = True
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
         self._refused_streak = 0
         self._conn_upgrade_accepted = True
-        await self._ensure_owner_user_id()
+        record_websocket_connected("host", reconnect=reconnect)
+        disconnect_error: BaseException | None = None
         try:
+            await self._ensure_owner_user_id()
             await self._serve_frames(ws)
+        except BaseException as exc:
+            disconnect_error = exc
+            raise
         finally:
+            record_websocket_disconnected(
+                "host",
+                disconnect_error,
+                local_shutdown=(
+                    isinstance(disconnect_error, asyncio.CancelledError | KeyboardInterrupt)
+                    or self._lifecycle_lost.is_set()
+                ),
+                resumed_from_suspend=self._woke_from_suspend,
+            )
             # Drop the watcher tasks' send target — exit reports raised
             # between connections park in _unreported_exits instead of
             # racing a half-closed socket.
@@ -3718,6 +3904,7 @@ def run_host_process(
     config_path: Path | None = None,
     *,
     daemon_target: str | None = None,
+    lifecycle_lock: DaemonLifecycleLock | None = None,
 ) -> None:
     """Entry point for ``omnigent host``.
 
@@ -3732,12 +3919,18 @@ def run_host_process(
         ``"local"`` or a server URL. When given, the daemon binds its lifetime
         to that record (flock + self-terminate on delete/reassign). ``None``
         (the historical default) runs without the lifecycle guard.
+    :param lifecycle_lock: A lock already acquired by an auto-launched daemon
+        before it claimed the registry record. When provided, it is retained
+        for the host process lifetime instead of acquiring another handle.
     :raises SystemExit: With :data:`HOST_FATAL_EXIT_CODE` when the tunnel
         fails permanently (auth / authorization / outdated server, or a
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
-    host_log_path = configure_process_logging("host")
+    host_log_path = configure_process_logging(
+        "host",
+        log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
+    )
     # Initialize tracing so the host daemon exports its own spans
     # (e.g. handling launch_runner / stat / list_dir frames) into the
     # same distributed trace as the server that requested them. The
@@ -3749,7 +3942,15 @@ def run_host_process(
     from omnigent.host.identity import CONFIG_PATH
 
     path = config_path or CONFIG_PATH
-    identity = load_or_create_host_identity(path)
+    try:
+        identity = load_or_create_host_identity(path)
+    except ValueError as exc:
+        print(
+            f"\n✗ Could not start host.\n{exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(HOST_FATAL_EXIT_CODE) from None
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
@@ -3772,9 +3973,8 @@ def run_host_process(
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
-    lifecycle_lock = (
-        DaemonLifecycleLock.for_target(daemon_target) if daemon_target is not None else None
-    )
+    if lifecycle_lock is None and daemon_target is not None:
+        lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     host = HostProcess(identity, server_url, lifecycle_lock=lifecycle_lock)
     try:
         asyncio.run(host.run())
