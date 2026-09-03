@@ -348,9 +348,14 @@ class PickerConfigTest(unittest.TestCase):
                 "HERDR_SOCKET_PATH": "/tmp/herdr-a.sock",
                 "HERDR_BIN_PATH": "/opt/herdr",
             }
-            first = PickerConfig.load(env)
-            env["HERDR_SOCKET_PATH"] = "/tmp/herdr-b.sock"
-            second = PickerConfig.load(env)
+            with patch.object(
+                PickerConfig,
+                "_resolve_auto_server_url",
+                return_value="http://omnigent.example:55777",
+            ):
+                first = PickerConfig.load(env)
+                env["HERDR_SOCKET_PATH"] = "/tmp/herdr-b.sock"
+                second = PickerConfig.load(env)
 
         self.assertNotEqual(first.state_file, second.state_file)
         self.assertEqual(first.state_file.parent.name, "state")
@@ -413,6 +418,50 @@ class PickerConfigTest(unittest.TestCase):
         self.assertNotEqual(first.agent_cache_file, other_server.agent_cache_file)
         self.assertNotEqual(first.agent_cache_file, other_socket.agent_cache_file)
         self.assertEqual(first.catalog_cache_file.parent.name, "catalog-cache")
+
+    def test_catalog_cache_uses_the_auto_resolved_omnigent_server(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / "config"
+            config_dir.mkdir()
+            env = {
+                "HERDR_PLUGIN_CONFIG_DIR": str(config_dir),
+                "HERDR_PLUGIN_STATE_DIR": str(Path(directory) / "state"),
+                "HERDR_SOCKET_PATH": "/tmp/herdr-a.sock",
+            }
+
+            with patch(
+                "omnigent.config.load_effective_config",
+                return_value={"server": "http://omnigent.example:55777"},
+            ):
+                first = PickerConfig.load(env)
+            with patch(
+                "omnigent.config.load_effective_config",
+                return_value={"server": "http://omnigent.example:55778"},
+            ):
+                second = PickerConfig.load(env)
+
+        self.assertIsNone(first.server)
+        self.assertIsNone(second.server)
+        self.assertNotEqual(first.catalog_cache_file, second.catalog_cache_file)
+        self.assertNotEqual(first.agent_cache_file, second.agent_cache_file)
+
+    def test_explicit_server_does_not_need_auto_resolution_for_cache_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / "config"
+            config_dir.mkdir()
+            (config_dir / "config.json").write_text(
+                json.dumps({"server": "http://omnigent.example:55777"})
+            )
+            env = {
+                "HERDR_PLUGIN_CONFIG_DIR": str(config_dir),
+                "HERDR_PLUGIN_STATE_DIR": str(Path(directory) / "state"),
+                "HERDR_SOCKET_PATH": "/tmp/herdr-a.sock",
+            }
+
+            with patch.object(PickerConfig, "_resolve_auto_server_url") as resolve_auto:
+                PickerConfig.load(env)
+
+        resolve_auto.assert_not_called()
 
 
 class SessionSpaceBridgeTest(unittest.TestCase):

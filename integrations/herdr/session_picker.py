@@ -793,6 +793,29 @@ class PickerConfig:
     fallback_cwd: Path
     herdr_executable: str
 
+    @staticmethod
+    def _resolve_auto_server_url() -> str | None:
+        """Resolve the CLI-selected server for cache isolation when possible."""
+        try:
+            from yaml import YAMLError
+
+            from omnigent.config import load_effective_config
+        except ImportError:
+            return None
+
+        try:
+            effective_config = load_effective_config()
+            configured = effective_config.get("server")
+            if isinstance(configured, str) and configured.strip():
+                return configured
+
+            from omnigent.host.local_server import local_server_url_if_healthy
+
+            return local_server_url_if_healthy()
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError, YAMLError):
+            # Discovery still reports the authoritative configuration error.
+            return None
+
     @classmethod
     def load(cls, environ: Mapping[str, str] | None = None) -> PickerConfig:
         env = dict(os.environ if environ is None else environ)
@@ -838,7 +861,8 @@ class PickerConfig:
             suffix = hashlib.sha256(state_identity.encode()).hexdigest()[:12]
             state_file = state_dir / f"session-spaces-{suffix}.json"
 
-        omnigent_server = server.rstrip("/").casefold() if server else "<auto>"
+        cache_server = server or cls._resolve_auto_server_url()
+        omnigent_server = cache_server.rstrip("/").casefold() if cache_server else "<auto>"
         config_home = env.get("OMNIGENT_CONFIG_HOME", "<default>")
         cache_identity = "\0".join((herdr_socket, herdr_session, omnigent_server, config_home))
         catalog_cache_scope = hashlib.sha256(cache_identity.encode()).hexdigest()
