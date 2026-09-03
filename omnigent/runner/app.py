@@ -2446,10 +2446,11 @@ def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
     An explicit ``code`` wins over ``type``, which is only the raised
     exception's class name. Preferring ``type`` published transport
     internals as failure codes (``connection_error`` as ``ReadError``,
-    ``context_length_exceeded`` as ``_ContextWindowOverflow``), and the
-    web failure card keys both its code -> sentence table and its
-    retryable-code set on the real code — so a mislabelled failure lost
-    its description and its Retry button.
+    ``context_length_exceeded`` as ``_ContextWindowOverflow``). This code
+    is what lands in the durable ``last_task_error``, which the web
+    rebuilds a failure card from on reconnect, and its headline is
+    ``FAILURE_CODE_DESCRIPTIONS[code]`` — so an exception class name there
+    degrades the card to a bare "Something went wrong".
 
     :param error: Raw error dict from a ``_on_proxy_stream_end`` call,
         e.g. ``{"message": "turn setup failed: ..."}`` or

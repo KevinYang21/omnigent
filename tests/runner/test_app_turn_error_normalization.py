@@ -1,11 +1,11 @@
 """Tests for ``_normalize_turn_error`` — the ``failed`` status error shape.
 
 Every turn failure the UI renders is normalized here into the
-``{code, message}`` pair the wire schema requires. The web failure card
-keys both its code-to-sentence table and its retryable-code set on that
-``code``, so a call site's explicit code has to survive: publishing the
-raised exception's class name instead cost the card its English
-description and its Retry button.
+``{code, message}`` pair the wire schema requires. That ``code`` is what
+lands in the durable ``last_task_error`` the web rebuilds a failure card
+from on reconnect, and the card's headline is looked up by code, so a call
+site's explicit code has to survive: publishing the raised exception's
+class name instead degraded the card to a bare "Something went wrong".
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def test_explicit_code_wins_over_exception_type() -> None:
 
 
 def test_context_overflow_keeps_its_code() -> None:
-    """The overflow failure stays retryable/describable, not ``_ContextWindowOverflow``."""
+    """The overflow failure keeps a describable code, not ``_ContextWindowOverflow``."""
     normalized = _normalize_turn_error(
         {
             "code": "context_length_exceeded",
