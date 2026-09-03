@@ -14,7 +14,7 @@
 // Each row is a Link to the target conversation page so cmd/middle-
 // click opens it in a new tab, matching the sidebar's behavior.
 
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useDeferredValue, useState } from "react";
 import type { ComponentType, SVGProps } from "react";
 import {
   BookOpenIcon,
@@ -111,7 +111,10 @@ interface SubagentsPanelProps {
 type ViewMode = "list" | "graph";
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
-  const { children, isLoading, error } = useChildSessions(rootSessionId);
+  const { children: liveChildren, isLoading, error } = useChildSessions(rootSessionId);
+  // Defer child-session list updates so sub-agent status changes render at
+  // low priority and don't interrupt the active streaming bubble.
+  const children = useDeferredValue(liveChildren);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
@@ -605,7 +608,10 @@ function SubagentRow({
   // This child's own sub-agents, rendered as the next tree level.
   // Disabled (null id) at the depth cap so the fan-out of fetches is
   // bounded; ``useChildSessions`` skips the query entirely for null.
-  const { children: grandchildren } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
+  const { children: liveGrandchildren } = useChildSessions(
+    depth < MAX_TREE_DEPTH ? child.id : null,
+  );
+  const grandchildren = useDeferredValue(liveGrandchildren);
   const hasGrandchildren = grandchildren.length > 0;
   const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
   return (

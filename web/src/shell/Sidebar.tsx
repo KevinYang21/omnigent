@@ -8,6 +8,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -1455,11 +1456,14 @@ function ConversationList({
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
+  // Defer the paginated data so WS-push cache updates re-render the list at
+  // low priority, keeping streaming-bubble frames uncontested.
+  const deferredData = useDeferredValue(conversationsQuery.data);
   // All loaded conversations from the single paginated list (for the flat
   // session list; pinned rows are merged in from the server pinned query).
   const allConversations = useMemo(
-    () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
-    [conversationsQuery.data],
+    () => deferredData?.pages.flatMap((page) => page.data) ?? [],
+    [deferredData],
   );
 
   // Project folders ({ id, name }) for grouping sessions — first-class id

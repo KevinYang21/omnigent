@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { NodeTypes, NodeProps, Node } from "@xyflow/react";
 import { ReactFlow, Background, Position, Handle, useReactFlow } from "@xyflow/react";
 import { useLocation, useNavigate } from "@/lib/routing";
@@ -163,7 +163,9 @@ interface SubagentsGraphViewProps {
 
 export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsGraphViewProps) {
   const { session } = useSession(rootSessionId);
-  const { children: rootChildren } = useChildSessions(rootSessionId);
+  const { children: liveRootChildren } = useChildSessions(rootSessionId);
+  // Defer child-session updates so graph re-layouts render at low priority.
+  const rootChildren = useDeferredValue(liveRootChildren);
 
   const [childrenMap, setChildrenMap] = useState<Map<string, ChildSessionInfo[]>>(() => new Map());
 

@@ -7,7 +7,7 @@
 // parity with the TUI Ctrl+O overlay.
 
 import { BotIcon, ChevronDownIcon, MessageSquareIcon, type LucideIcon } from "lucide-react";
-import { useState } from "react";
+import { useDeferredValue, useState } from "react";
 import { cn } from "@/lib/utils";
 import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -37,7 +37,10 @@ export function SessionRail({
   onExpandExecutionLogs,
   suppressed,
 }: SessionRailProps) {
-  const { children } = useChildSessions(conversationId);
+  const { children: liveChildren } = useChildSessions(conversationId);
+  // Defer child-session list updates so rail re-renders don't compete with
+  // the active streaming bubble.
+  const children = useDeferredValue(liveChildren);
   if (suppressed) return null;
   return <ExecutionLogsCard childSessions={children} onExpand={onExpandExecutionLogs} />;
 }
