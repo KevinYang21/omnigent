@@ -208,6 +208,16 @@ _JOB_BACKOFF_LIMIT: int = 6
 # launch-token TTL.
 _JOB_ACTIVE_DEADLINE_S: int = 7 * 24 * 3600
 
+# How long a Job's objects (and its terminated Pod) stick around after the
+# Job itself reaches a terminal state (Complete or Failed), before the
+# cluster garbage-collects them. Backstop for the case where nothing ever
+# calls terminate() on a Job that ends on its own — a crash-loop exhausting
+# backoffLimit, or activeDeadlineSeconds finally expiring — so a
+# credential-bearing Pod object doesn't linger indefinitely just because
+# application-level cleanup never ran. 24h leaves a window to inspect a
+# failed Job's status/logs before it's swept.
+_JOB_TTL_SECONDS_AFTER_FINISHED: int = 24 * 3600
+
 # Lines of container log tail surfaced in a start-failure message (e.g. the git
 # clone error from the init container).
 _LOG_TAIL_LINES: int = 20
@@ -564,6 +574,7 @@ def build_job_manifest(
     agent_name: str | None = None,
     backoff_limit: int = _JOB_BACKOFF_LIMIT,
     active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
+    ttl_seconds_after_finished: int = _JOB_TTL_SECONDS_AFTER_FINISHED,
     runtime_class: str | None = None,
 ) -> dict[str, object]:
     """
@@ -577,10 +588,14 @@ def build_job_manifest(
     ``restartPolicy: OnFailure`` so the kubelet automatically restarts a
     crashed host container with exponential backoff (10 s, 20 s, 40 s, …
     capped at 5 min).  The Job's ``backoffLimit`` caps the total retry count,
-    and ``activeDeadlineSeconds`` enforces a hard lifetime.  Because
-    ``OnFailure`` restarts the SAME Pod in place, the Pod name is stable
-    across retries — the token Secret ``secretKeyRef`` keeps resolving and the
-    ``sandbox_id`` tracking in the managed-host machinery is unaffected.
+    and ``activeDeadlineSeconds`` enforces a hard lifetime.
+    ``ttlSecondsAfterFinished`` is a backstop on top of both: once a Job
+    reaches a terminal state on its own, the cluster garbage-collects it
+    even if this launcher's own ``terminate()`` never runs or never lands.
+    Because ``OnFailure`` restarts the SAME Pod in place, the Pod name is
+    stable across retries — the token Secret ``secretKeyRef`` keeps
+    resolving and the ``sandbox_id`` tracking in the managed-host machinery
+    is unaffected.
 
     The host's existing WebSocket reconnect logic (exponential backoff in
     ``omnigent/host/connect.py``) re-registers the tunnel automatically after
@@ -846,6 +861,7 @@ def build_job_manifest(
         "spec": {
             "backoffLimit": backoff_limit,
             "activeDeadlineSeconds": active_deadline_seconds,
+            "ttlSecondsAfterFinished": ttl_seconds_after_finished,
             "template": {
                 "metadata": {"labels": labels},
                 "spec": pod_spec,

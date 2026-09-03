@@ -244,6 +244,7 @@ from omnigent.server.schemas import (
     ResponseObject,
     RetryErrorDetail,
     SandboxStatus,
+    SessionChildSessionUpdatedEvent,
     SessionCollaborationModeEvent,
     SessionCreatedEvent,
     SessionCreateMetadata,
@@ -4094,6 +4095,55 @@ def _require_permission_mode_forward(
     return settled if isinstance(settled, str) and settled else mode
 
 
+def _publish_child_status_to_parent(session_id: str, status: str) -> None:
+    """
+    Mirror a status transition onto the session's parent stream.
+
+    A sub-agent's ``busy`` / ``current_task_status`` on the parent's Agents
+    rail comes from ``session.child_session.updated`` events. The runner
+    fans those out only for children it registered in-process, so a child
+    reused after a runner restart, or driven directly rather than through
+    its parent, changes status without the parent's stream ever hearing of
+    it. The server sees every transition in ``_session_status_cache``, so
+    it republishes the child's current summary to the parent from here; a
+    top-level session (no parent) publishes nothing.
+
+    The store reads run on the ordered live-state worker so a ``running``
+    → ``idle`` pair can never fan out reversed, and the event-loop caller
+    only pays a queue put.
+
+    :param session_id: Session whose cached status just changed,
+        e.g. ``"conv_child123"``.
+    :param status: The new status, e.g. ``"running"``. Captured here rather
+        than re-read on the worker so each edge fans out its own value.
+    """
+    store = session_live_state.conversation_store()
+    if store is None:
+        return
+
+    def _fan_out() -> None:
+        conv = store.get_conversation(session_id)
+        if conv is None or conv.parent_conversation_id is None:
+            return
+        parent_id = conv.parent_conversation_id
+        items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
+        summary = _child_session_summary_from_conversation(
+            conv,
+            parent_id,
+            _latest_message_preview(items_by_child.get(conv.id, [])),
+            cached_status=status,
+        )
+        event = SessionChildSessionUpdatedEvent(
+            type="session.child_session.updated",
+            conversation_id=parent_id,
+            child_session_id=conv.id,
+            child=summary.model_dump(mode="json"),
+        )
+        session_stream.publish(parent_id, event.model_dump())
+
+    session_live_state.submit("child_status_fanout", _fan_out)
+
+
 def _publish_status(
     session_id: str,
     status: str,
@@ -4148,7 +4198,10 @@ def _publish_status(
         # snapshot to reopen a streaming bubble.
         _session_active_response_cache.pop(session_id, None)
         return
+    previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    if previous_status != status:
+        _publish_child_status_to_parent(session_id, status)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
@@ -6450,6 +6503,9 @@ async def _dispatch_skill_slash_command_to_runner(
         "agent_id": conv.agent_id,
         "model": agent.name,
         "has_mcp_servers": has_mcp_servers,
+        # Live-renderer hint: the runner drops ``browser_*`` schemas for
+        # the turn when no renderer is subscribed to the session stream.
+        "browser_renderer_available": session_stream.has_subscribers(session_id),
         # The forwarded message carries ``meta_content`` — i.e. the
         # META item (persisted_items[1]), not the user-visible item.
         # Hand the runner that id so a cold-cache reload drops the
@@ -7452,34 +7508,44 @@ async def _apply_pending_policy_ask_writes(
     pending = _pending_policy_ask_writes.get(elicitation_id)
     if pending is None:
         return
-    if data.get("action") != "accept":
-        # Declined — remove the stashed writes (POLICIES.md §7.2:
-        # a denied ASK leaves no trace).
-        _pending_policy_ask_writes.pop(elicitation_id, None)
-        return
     if pending.from_mcp:
         # MCP entries: the retry path (POST /mcp with requestState)
         # pops and applies the writes itself. Applying here too would
         # double-apply non-idempotent ops (e.g. INCREMENT state
         # updates for cost-budget counters). Leave the entry for the
-        # retry path; it owns cleanup.
+        # retry path (it owns cleanup), dropping it only on decline.
+        if data.get("action") != "accept":
+            # Declined — remove the stashed writes (POLICIES.md §7.2:
+            # a denied ASK leaves no trace).
+            _pending_policy_ask_writes.pop(elicitation_id, None)
         return
-    # Non-MCP relay path: pop and apply writes here since no retry
-    # will arrive.
+    # Non-MCP relay path: claim the entry atomically (no await between
+    # the get above and this pop, so duplicate verdicts — a client
+    # transport retry racing its original POST, or a second client —
+    # can never both apply the same non-idempotent writes).
+    pending = _pending_policy_ask_writes.pop(elicitation_id, None)
+    if pending is None:
+        # A concurrent duplicate verdict already claimed the writes.
+        return
+    if data.get("action") != "accept":
+        # Declined — the claim already removed the stashed writes
+        # (POLICIES.md §7.2: a denied ASK leaves no trace).
+        return
     # Resolve the agent spec + build the engine off the event loop: the
     # lookup, cold-cache bundle fetch, and engine construction are all
     # blocking DB/IO.
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
-        _pending_policy_ask_writes.pop(elicitation_id, None)
         return
-    engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
-    )
-    # Pop only after the engine build succeeds: a raise here (e.g. a
-    # concurrent agent rebind) would otherwise lose the approved writes
-    # with no retry possible.
-    _pending_policy_ask_writes.pop(elicitation_id, None)
+    try:
+        engine = await asyncio.to_thread(
+            _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
+        )
+    except BaseException:
+        # A raise here (e.g. a concurrent agent rebind) must not lose the
+        # approved writes with no retry possible — restore the claim.
+        _pending_policy_ask_writes.setdefault(elicitation_id, pending)
+        raise
     # The label/state writes hit the DB synchronously too — keep them
     # off the loop.
     if pending.set_labels:
@@ -8269,6 +8335,15 @@ async def _create_session_worktree(
         raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
 
 
+# Opt-in ``?delete_branch=true`` cannot reach git when the host tunnel
+# is down (users typically see this as ``runner_online: false``). Refuse
+# the delete instead of 404'ing or silently skipping cleanup.
+_DELETE_WORKTREE_OFFLINE_MESSAGE = (
+    "Cannot delete worktree — runner offline. "
+    "Delete session only (delete_branch=false) or wait for the runner to reconnect."
+)
+
+
 async def _remove_session_worktree_best_effort(
     *,
     host_id: str,
@@ -8279,13 +8354,17 @@ async def _remove_session_worktree_best_effort(
     reason: str,
     conversation_store: ConversationStore | None = None,
     exclude_conversation_id: str | None = None,
+    fail_if_unavailable: bool = False,
 ) -> None:
     """
     Best-effort removal of a session's git worktree.
 
     Used for create-rollback (orphan cleanup) and opt-in session-delete
-    cleanup. Never raises — a failure is logged so the caller's primary
-    operation still completes.
+    cleanup. Host-reported git failures are logged so the caller's
+    primary operation still completes. When ``fail_if_unavailable`` is
+    set, an unreachable host raises ``CONFLICT`` instead of skipping —
+    the session is left in place so the caller can retry without
+    worktree cleanup.
 
     :param host_id: Host that owns the worktree, e.g.
         ``"host_a1b2c3d4..."``.
@@ -8305,32 +8384,22 @@ async def _remove_session_worktree_best_effort(
     :param exclude_conversation_id: The conversation whose delete triggered
         this removal, excluded from that check. Required with
         *conversation_store*.
+    :param fail_if_unavailable: When ``True``, raise ``CONFLICT`` if the
+        host cannot be reached to run git. Create-rollback leaves this
+        ``False`` so a failed create still surfaces its original error.
     """
     from omnigent.server.routes._host_worktree import (
+        WorktreeHostUnavailableError,
         WorktreeProxyError,
         remove_worktree_on_host,
     )
 
-    # Host reachability first: both checks below end in "skip", and this one
-    # is an in-memory lookup, so an unreachable host costs no DB work.
-    host_registry = getattr(request.app.state, "host_registry", None)
-    if host_registry is None:
-        return
-    host_conn = host_registry.get(host_id)
-    if host_conn is None:
-        _logger.warning(
-            "Skipping worktree removal (%s) for %s: host %s offline",
-            reason,
-            worktree_path,
-            host_id,
-        )
-        return
-
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
     # leaves their runners on a deleted directory, so leave a shared worktree
-    # alone and let the last session out clean it up. Only a skip is logged;
-    # the caller still deletes its own row.
+    # alone and let the last session out clean it up. Checked before host
+    # reachability so an offline host does not 409 a delete that would not
+    # have touched the directory anyway.
     if conversation_store is not None and exclude_conversation_id is not None:
         shared = await asyncio.to_thread(
             conversation_store.has_other_live_session_in_workspace,
@@ -8345,6 +8414,29 @@ async def _remove_session_worktree_best_effort(
                 reason,
             )
             return
+
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if host_registry is None:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                "host registry is not configured; cannot delete a worktree",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        return
+    host_conn = host_registry.get(host_id)
+    if host_conn is None:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                _DELETE_WORKTREE_OFFLINE_MESSAGE,
+                code=ErrorCode.CONFLICT,
+            )
+        _logger.warning(
+            "Skipping worktree removal (%s) for %s: host %s offline",
+            reason,
+            worktree_path,
+            host_id,
+        )
+        return
     try:
         await remove_worktree_on_host(
             host_registry=host_registry,
@@ -8352,6 +8444,18 @@ async def _remove_session_worktree_best_effort(
             worktree_path=worktree_path,
             branch=branch,
             delete_branch=delete_branch,
+        )
+    except WorktreeHostUnavailableError as exc:
+        if fail_if_unavailable:
+            raise OmnigentError(
+                _DELETE_WORKTREE_OFFLINE_MESSAGE,
+                code=ErrorCode.CONFLICT,
+            ) from exc
+        _logger.warning(
+            "Best-effort worktree removal (%s) failed for %s: host %s unavailable",
+            reason,
+            worktree_path,
+            host_id,
         )
     except WorktreeProxyError:
         _logger.warning(
@@ -8892,6 +8996,7 @@ def _persist_stored_session_bundle(
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
             project_id=metadata.project_id,
+            host_id=metadata.host_id,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)
@@ -9169,6 +9274,8 @@ def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
     last_message_preview: str | None,
+    *,
+    cached_status: str | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -9197,6 +9304,11 @@ def _child_session_summary_from_conversation(
         be missing.
     :param last_message_preview: Preview text derived from a batched
         child-message lookup, or ``None`` when no visible message exists.
+    :param cached_status: Session status to derive ``busy`` /
+        ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
+        live ``_session_status_cache``; a status-edge publisher passes the
+        edge's own value so a burst of transitions fans out one summary per
+        edge instead of the latest status repeated.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -9230,7 +9342,8 @@ def _child_session_summary_from_conversation(
         session_name = None
 
     # Derive busy from the relay-fed cache; tasks table is gone.
-    cached_status = _session_status_cache.get(conv.id)
+    if cached_status is None:
+        cached_status = _session_status_cache.get(conv.id)
     if cached_status in ("running", "waiting"):
         busy = True
     else:
