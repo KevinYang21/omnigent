@@ -3755,6 +3755,68 @@ def test_connected_host_404_streak_escalates_without_going_fatal(
     assert host._transient_404_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
 
 
+async def test_404_streak_resets_on_other_error_between_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A non-404 failure between 404s starts a NEW restart window.
+
+    The 404 streak counts CONSECUTIVE rejections of one outage. A 5xx in
+    between means the previous window ended, so the next 404 is the first
+    of a fresh window: the streak restarts at 1 and the one-time stderr
+    notice prints again rather than being swallowed as a continuation.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy(
+        [
+            None,
+            _invalid_status(404),
+            _invalid_status(503),
+            _invalid_status(404),
+            asyncio.CancelledError(),
+        ]
+    )
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # Two distinct windows => the once-per-window notice printed twice.
+    assert err.count("HTTP 404") == 2
+
+
+async def test_404_streak_resets_on_accepted_upgrade_between_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A successful reconnect between 404 bursts resets the streak.
+
+    Riding out a restart, reconnecting, then hitting a second restart is
+    two separate outages: the accepted upgrade must clear the streak so
+    the second window re-prints the notice and escalation counts only the
+    new outage's consecutive 404s.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy(
+        [
+            None,
+            _invalid_status(404),
+            None,
+            _invalid_status(404),
+            asyncio.CancelledError(),
+        ]
+    )
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    err = capsys.readouterr().err
+    # Each window's first 404 printed its own notice.
+    assert err.count("HTTP 404") == 2
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [

@@ -313,6 +313,14 @@ def test_host_survives_transient_404_during_server_restart(
             f"Host daemon exited (code {proc.poll()}) after the restart window. "
             f"Daemon log tail:\n{daemon_log.read_text()[-2000:]}"
         )
+
+        # Prove the daemon actually reconnected INTO the 404 window (rather
+        # than the poll above observing pre-restart state): its log must show
+        # the ridden-out 404.
+        assert "HTTP 404" in daemon_log.read_text(), (
+            "Daemon log never recorded the 404 window - the test did not "
+            f"exercise the ride-out path. Log tail:\n{daemon_log.read_text()[-2000:]}"
+        )
     finally:
         if proc is not None and proc.poll() is None:
             proc.send_signal(signal.SIGTERM)

@@ -396,7 +396,7 @@ _MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # process listens on the port — the local server is gone, not unreachable.
 _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 
-# Consecutive post-connect 401/403 (or 404) rejections (~5 min at the backoff
+# Consecutive post-connect 401/403 (or 404) rejections (~90 s at the backoff
 # cap) before the retry loop escalates its operator message from a transient
 # hint to a "this may not self-heal" prompt. Operator-facing only — the host
 # keeps retrying and never exits.
@@ -1531,6 +1531,9 @@ class HostProcess:
 
         :returns: ``None`` while an already-connected host should retry the
             404, or a :class:`HostConnectError` for a never-connected host.
+
+        Note: a future "host is gone" signal must use a distinct status
+        (e.g. 410), never 404, or it would be retried forever here.
         """
         if self._ever_connected:
             self._transient_404_streak += 1
