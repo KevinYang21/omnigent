@@ -24,6 +24,7 @@ import {
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
+import { useTransitionInfiniteQuery } from "./useTransitionInfiniteQuery";
 import { authenticatedFetch } from "@/lib/identity";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
@@ -497,14 +498,14 @@ export function useConversations(
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
   const queryClient = useQueryClient();
-  return useInfiniteQuery({
+  return useTransitionInfiniteQuery({
     // Keep the base three-element key for the unfiltered callers (byte-for-byte
     // unchanged, so the sidebar / rename / push-delta paths are untouched); only
     // append `project` for a concrete name. A falsy project (`undefined` or `""`)
     // is "all projects" and shares the base key — there is no distinct "" variant.
-    queryKey: project
+    queryKey: (project
       ? ["conversations", searchQuery, includeArchived, project]
-      : ["conversations", searchQuery, includeArchived],
+      : ["conversations", searchQuery, includeArchived]) as readonly unknown[],
     queryFn: async ({ pageParam }) => {
       const fetchPage = () =>
         fetchConversationsPage({

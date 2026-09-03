@@ -1,4 +1,5 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import type { QueryClient } from "@tanstack/react-query";
+import { useTransitionQuery } from "./useTransitionQuery";
 import { authenticatedFetch } from "@/lib/identity";
 
 /**
@@ -215,7 +216,7 @@ export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
 ): UseChildSessionsResult {
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useTransitionQuery({
     queryKey:
       conversationId === null
         ? ["conversation", null, "child_sessions"]
