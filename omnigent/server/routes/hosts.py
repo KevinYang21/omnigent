@@ -676,9 +676,6 @@ def create_hosts_router(
             "runners": [],
         }
 
-    # The return type cannot be ``dict[str, list[Any]]``: an empty catalog
-    # carries a string ``error`` reason, and a list-only response contract
-    # rejects it — turning an explainable empty picker into a 500.
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(
         request: Request,
