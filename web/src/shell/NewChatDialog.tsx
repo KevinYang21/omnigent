@@ -2117,6 +2117,10 @@ export function NewChatLandingScreen() {
   // Sentinel id for the pending custom agent in the picker dropdown.
   const PENDING_AGENT_ID = "__pending_custom_agent__";
 
+  // The landing surface element — the drop target for drag-and-drop file
+  // attachments (see useFileDropTarget below).
+  const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
+
   // Draft restore is project-scoped: the user's text and attachments always
   // come back, but agent/host/workspace slots parked under another project's
   // visit (or a plain one) must not beat THIS visit's project defaults —
@@ -4474,6 +4478,7 @@ export function NewChatLandingScreen() {
     // pb-12 lifts the content slightly above the geometric center, where
     // the hero reads better optically.
     <div
+      ref={setLandingSurface}
       className="relative flex flex-1 items-center justify-center"
       data-testid="new-chat-landing"
     >

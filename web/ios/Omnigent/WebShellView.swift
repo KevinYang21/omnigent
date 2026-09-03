@@ -83,9 +83,8 @@ struct WebShellView: View {
       }
     }
     .onChange(of: model.isLoading) { _, loading in
-      // Re-push the native bar footprints and the server-picker payload once
-      // each load completes; the JS bridge caches both so later-mounting
-      // subscribers still get them.
+      // Re-push the native bar footprints once each load completes; the JS
+      // bridge caches the value so a later-mounting subscriber still gets it.
       if !loading {
         model.emitInsets(bottomBar: InsetMetrics.bottomBarFootprint)
       }

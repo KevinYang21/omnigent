@@ -52,12 +52,12 @@ _SAFE_TOP_PX = 59
 
 # The native bars' footprints the iOS shell pushes over the bridge — mirror of
 # InsetMetrics in web/ios/Omnigent/WebShellView.swift:
-#   topBar    = serverSwitcherHeight (28) + serverSwitcherTopPadding (8) = 36
 #   bottomBar = barSegmentHeight (34) + barCapsulePadding*2 (8)
 #               + barBottomPadding (6) = 48
+# The switcher metrics mirror the retired pill's geometry, still asserted
+# against so a regression that re-floats a pill lands inside these bounds.
 _SWITCHER_HEIGHT_PX = 28.0
 _SWITCHER_TOP_PADDING_PX = 8.0
-_TOP_BAR_PX = 36
 _BOTTOM_BAR_PX = 48
 
 # Another server the shell remembers, offered by the sidebar picker's
@@ -67,22 +67,29 @@ _ALT_SERVER_HOST = "alt-server.example.test:8443"
 
 # Stand-in for the iOS WKWebView bridge of a shell that hosts the sidebar
 # server picker. Runs before any app script (add_init_script) so nativeApi()
-# in nativeBridge.ts sees an iOS shell: `kind` drives isIOSShell(),
-# onNativeInsets immediately pushes the shell's real cached footprints
-# (exactly as WebShellView re-emits them on each load), the server-picker trio
-# mirrors the payload WebShellView pushes from managed config + recents, and
-# the rest keep unrelated native calls (badge / notify / view mode) from
-# throwing under the stub.
+# in nativeBridge.ts sees an iOS shell: `kind` drives isIOSShell(), the
+# compatibility protocol (nativeBridgeVersion / nativeWebReady /
+# nativeHeartbeat) keeps the shell-compatibility gate from bouncing to the
+# update-required page, onNativeInsets immediately pushes the shell's real
+# cached footprint (exactly as WebShellView re-emits it on each load), the
+# server-picker trio mirrors the payload WebShellView answers from managed
+# config + recents, and the rest keep unrelated native calls (badge / notify /
+# view mode) from throwing under the stub. `setServerSwitcherHidden` is the
+# retired pill-era method: the stub records any call so the test can prove
+# the web never drives the retired pill at all.
 _IOS_SHELL_INIT_SCRIPT = f"""
 window.__switcherHiddenCalls = [];
 window.__switchServerCalls = [];
 window.omnigentNative = {{
   kind: "ios",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {{}},
+  nativeHeartbeat: function () {{}},
   setBadgeCount: function () {{}},
   notify: function () {{ return Promise.resolve(false); }},
   onNotificationActivated: function () {{ return function () {{}}; }},
   onNativeInsets: function (cb) {{
-    cb({{ topBar: {_TOP_BAR_PX}, bottomBar: {_BOTTOM_BAR_PX} }});
+    cb({{ bottomBar: {_BOTTOM_BAR_PX} }});
     return function () {{}};
   }},
   setServerSwitcherHidden: function (hidden) {{
@@ -273,13 +280,13 @@ def test_ios_server_switcher_stays_out_of_chat_header(
         "iOS server switcher must not float inside the chat header: " + "; ".join(violations)
     )
 
-    # The web must also have asked the shell to keep the pill hidden — the
-    # positive half of the contract, so this can't pass merely because the
-    # bridge was never driven.
+    # With the pill retired for picker-hosting shells, the web must never
+    # drive the legacy pill visible over the bridge — the positive half of
+    # the contract: no setServerSwitcherHidden(false) push ever happens.
     hidden_calls = page.evaluate("() => window.__switcherHiddenCalls")
-    assert hidden_calls and all(hidden_calls), (
-        "the web must only ever request the native switcher hidden on a shell "
-        f"with the sidebar picker; got setServerSwitcherHidden calls: {hidden_calls}"
+    assert all(hidden_calls), (
+        "the web must never request the retired native switcher shown on a "
+        f"shell with the sidebar picker; got setServerSwitcherHidden calls: {hidden_calls}"
     )
 
 

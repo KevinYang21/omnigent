@@ -57,6 +57,12 @@ _IPHONE_SAFE_AREA = {"top": 47, "left": 0, "bottom": 34, "right": 0}
 _IOS_SHELL_INIT_SCRIPT = """
 window.omnigentNative = {
   kind: "ios",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
+  getServerPicker: function () { return Promise.resolve(null); },
+  switchServer: function () { return Promise.resolve(); },
+  openServerSetup: function () {},
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function () { return function () {}; },
@@ -64,8 +70,6 @@ window.omnigentNative = {
   onSidebarDrag: function () { return function () {}; },
   onViewModeChanged: function () { return function () {}; },
   setViewMode: function () {},
-  setServerSwitcherHidden: function () {},
-  setSidebarOpen: function () {},
 };
 """
 
@@ -76,6 +80,12 @@ window.omnigentNative = {
 _ANDROID_SHELL_INIT_SCRIPT = """
 window.omnigentNative = {
   kind: "android",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
+  getServerPicker: function () { return Promise.resolve(null); },
+  switchServer: function () { return Promise.resolve(); },
+  openServerSetup: function () {},
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function () { return function () {}; },

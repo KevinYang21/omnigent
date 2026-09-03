@@ -43,27 +43,36 @@ _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 # Minimal stand-in for the iOS WKWebView bridge (``web/ios``'s injected
 # ``window.omnigentNative``). Runs before any app script on every navigation
 # (``add_init_script``) so ``isIOSShell()`` in ``nativeBridge.ts`` sees the iOS
-# shell. ``setViewMode`` records every push so the test can assert what the SPA
-# told the native Chat/Terminal bar to do; ``onNativeInsets`` immediately pushes
-# a realistic footprint (the real shell caches and replays its last emit), so
-# the bottom spacer resolves to the pill's true height. Everything else is a
-# guarded no-op keeping unrelated native calls from throwing under the stub.
+# shell. Hosts the full compatibility protocol (``nativeBridgeVersion`` /
+# ``nativeWebReady`` / ``nativeHeartbeat`` + the server-picker trio) so the
+# web's shell-compatibility gate treats it as a current shell rather than
+# bouncing to the update-required page. ``setViewMode`` records every push so
+# the test can assert what the SPA told the native Chat/Terminal bar to do;
+# ``onNativeInsets`` immediately pushes a realistic footprint (the real shell
+# caches and replays its last emit), so the bottom spacer resolves to the
+# pill's true height. Everything else is a guarded no-op keeping unrelated
+# native calls from throwing under the stub.
 _IOS_SHELL_INIT_SCRIPT = """
 window.__omnigentSetViewModeCalls = [];
 window.omnigentNative = {
   kind: "ios",
+  nativeBridgeVersion: 1,
+  nativeWebReady: function () {},
+  nativeHeartbeat: function () {},
+  getServerPicker: function () { return Promise.resolve(null); },
+  switchServer: function () { return Promise.resolve(); },
+  openServerSetup: function () {},
   setBadgeCount: function () {},
   notify: function () { return Promise.resolve(false); },
   onNotificationActivated: function () { return function () {}; },
   onOpenPath: function () { return function () {}; },
   onSidebarDrag: function () { return function () {}; },
-  setServerSwitcherHidden: function () {},
   setViewMode: function (params) {
     window.__omnigentSetViewModeCalls.push(params);
   },
   onViewModeChanged: function () { return function () {}; },
   onNativeInsets: function (callback) {
-    callback({ topBar: 36, bottomBar: 48 });
+    callback({ bottomBar: 48 });
     return function () {};
   },
 };

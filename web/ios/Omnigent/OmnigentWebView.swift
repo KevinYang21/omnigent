@@ -13,13 +13,6 @@ struct OmnigentWebView: UIViewRepresentable {
   let connectToNewServer: () -> Void
   let loadFailed: (URL, String) -> Void
   let loadSucceeded: () -> Void
-  /// Compose and push the current server-picker payload to the SPA.
-  let pushServerPicker: () -> Void
-  /// Switch the shell to a picker-listed server. The owner validates the
-  /// target against the managed/recent allow list before acting.
-  let requestSwitchServer: (String) -> Void
-  /// Return the shell to its "connect to server" setup page.
-  let openServerSetup: () -> Void
 
   func makeCoordinator() -> Coordinator {
     Coordinator(self)
