@@ -4735,18 +4735,17 @@ export function NewChatLandingScreen() {
   );
 
   return (
-    // pb-12 lifts the content slightly above the geometric center, where
-    // the hero reads better optically.
+    // pb-24 lifts the centered hero and composer by 48px for optical balance.
     <div
       ref={setLandingSurface}
-      className="relative flex flex-1 items-center justify-center"
+      className="relative flex flex-1 items-center justify-center pb-24"
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 800px cap, so the composer renders at
           800 − 80 = 720px max on desktop. px-4 on phones (16px gutters)
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-16 md:select-none md:px-2">
+      <div className="flex w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-16 md:select-none md:px-10">
         <div className="mb-6 flex w-full flex-col items-center justify-center gap-3.5">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
@@ -5111,7 +5110,7 @@ export function NewChatLandingScreen() {
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
             <div
-              className="mt-2 flex min-w-0 items-center gap-0.5 px-2 pb-0"
+              className="mt-2 flex min-w-0 items-center gap-1 px-2 pt-1 pb-0"
               data-testid="new-chat-landing-actions"
             >
               {/* Attachment starts the ordered composer action row. */}
@@ -5120,7 +5119,7 @@ export function NewChatLandingScreen() {
                   type="button"
                   size="icon"
                   variant="ghost"
-                  className="size-9 md:size-8"
+                  className="size-8 md:size-7"
                   disabled={creating}
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach files"
@@ -5128,15 +5127,15 @@ export function NewChatLandingScreen() {
                   componentId="new_chat.attach_files"
                 >
                   <PlusIcon
-                    className="size-[18px]"
-                    data-icon-size="18"
+                    className="size-4"
+                    data-icon-size="16"
                     data-testid="new-chat-landing-attach-icon"
                   />
                   <span className="sr-only">Attach files</span>
                 </Button>
               </div>
               <div
-                className="flex min-w-0 shrink-0 items-center gap-0.5 overflow-hidden"
+                className="flex min-w-0 shrink-0 items-center gap-1 overflow-hidden"
                 data-testid="new-chat-landing-left-controls"
               >
                 {/* Host chip */}
@@ -5162,7 +5161,7 @@ export function NewChatLandingScreen() {
                           ? `, ${selectedHost.status === "online" ? "Online" : "Offline"}`
                           : ""
                       }`}
-                      className="flex h-8 cursor-pointer items-center gap-1.5 rounded-lg px-1.5 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground dark:hover:bg-muted/50"
+                      className="flex h-8 cursor-pointer items-center gap-1 rounded-lg px-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground dark:hover:bg-muted/50 md:h-7"
                       data-testid="new-chat-landing-host-chip"
                     >
                       <span
@@ -5176,12 +5175,12 @@ export function NewChatLandingScreen() {
                       />
                       {isCloudHost ? (
                         <MonitorCloudIcon
-                          className="size-[18px] shrink-0"
+                          className="size-4 shrink-0"
                           data-testid="new-chat-landing-host-icon"
                         />
                       ) : (
                         <MonitorIcon
-                          className="size-[18px] shrink-0"
+                          className="size-4 shrink-0"
                           data-testid="new-chat-landing-host-icon"
                         />
                       )}
@@ -5375,15 +5374,15 @@ export function NewChatLandingScreen() {
                     <DropdownMenuTrigger asChild>
                       <button
                         type="button"
-                        className="flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg bg-muted/70 px-2 text-sm font-normal text-foreground transition-colors hover:bg-muted dark:bg-muted/50 dark:hover:bg-muted/70"
+                        className="flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-lg bg-muted/70 px-2 text-ui font-normal text-foreground transition-colors hover:bg-muted dark:bg-muted/50 dark:hover:bg-muted/70 md:h-7"
                         aria-label={`${permissionConfigRow.label}: ${permissionConfigRow.value}`}
                         data-testid="new-chat-landing-permission-chip"
                       >
-                        <HandIcon className="size-4 shrink-0" />
-                        <span className="hidden max-w-28 truncate text-sm sm:block">
+                        <HandIcon className="size-3.5 shrink-0" />
+                        <span className="hidden max-w-28 truncate text-ui sm:block">
                           {permissionConfigRow.value}
                         </span>
-                        <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                        <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
                       </button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent
@@ -5657,7 +5656,7 @@ export function NewChatLandingScreen() {
                 is shown in the hero heading instead of a tray chip; filing on
                 create still uses `selectedProject`. */}
               </div>
-              <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-0.5 md:flex-none md:gap-2">
+              <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-1 md:flex-none">
                 <div className="flex min-w-0 flex-1 items-center justify-end rounded-lg transition-colors has-[button:not(:disabled)]:hover:bg-muted dark:has-[button:not(:disabled)]:hover:bg-muted/50 has-aria-expanded:bg-muted dark:has-aria-expanded:bg-muted/50 md:flex-none [&>button]:bg-transparent!">
                   {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}
@@ -5691,7 +5690,7 @@ export function NewChatLandingScreen() {
                     autoHarnessActive={smartRoutingHarnessSelected}
                     onSelectAutoHarness={handleSelectSmartRoutingHarness}
                     contentClassName="w-[17.25rem] min-w-0"
-                    triggerClassName="h-9 min-w-0 w-full max-w-[10rem] pr-2 sm:max-w-[14rem] md:h-8 md:w-auto md:max-w-[17rem]"
+                    triggerClassName="h-8 min-w-0 w-full max-w-[10rem] gap-1 px-2 sm:max-w-[14rem] md:h-7 md:w-auto md:max-w-[17rem]"
                   />
                 </div>
                 {selectedAgent && selectedAgentHasKnobs && (
@@ -5754,6 +5753,7 @@ export function NewChatLandingScreen() {
                   />
                 )}
                 <ComposerMicButton
+                  className="size-8 md:size-7"
                   enableHotkey
                   disabled={creating}
                   onVoiceStart={() => {
@@ -5777,7 +5777,7 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
+                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 md:size-7"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />

@@ -1220,20 +1220,30 @@ describe("NewChatLandingScreen", () => {
     const actions = screen.getByTestId("new-chat-landing-actions");
     const landingContent = screen.getByTestId("new-chat-landing").firstElementChild;
 
-    expect(landingContent).toHaveClass("max-w-[800px]", "md:px-2");
+    expect(screen.getByTestId("new-chat-landing")).toHaveClass("pb-24");
+    expect(landingContent).toHaveClass("max-w-[800px]", "md:px-10");
     expect(composerSurface.firstElementChild).toBe(workspace);
     expect(workspace.nextElementSibling).toBe(composer);
     expect(composerSurface).toHaveClass("gap-0");
     expect(workspace).toHaveClass("h-8", "mx-4", "-mb-px");
     expect(composer).toHaveClass("min-h-[105px]");
     expect(composer).toContainElement(actions);
-    expect(actions).toHaveClass("mt-2", "px-2", "pb-0");
+    expect(actions).toHaveClass("mt-2", "gap-1", "px-2", "pt-1", "pb-0");
     const attach = screen.getByTestId("new-chat-landing-attach");
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
     const permission = screen.getByTestId("new-chat-landing-permission-chip");
     const harness = screen.getByTestId("new-chat-landing-agent-select");
     const voice = screen.getByRole("button", { name: "Voice dictation" });
     const submit = screen.getByTestId("new-chat-landing-submit");
+    expect(attach).toHaveClass("size-8", "md:size-7");
+    expect(hostChip).toHaveClass("h-8", "md:h-7", "gap-1", "px-2");
+    expect(permission).toHaveClass("h-8", "md:h-7", "gap-1", "px-2", "text-ui");
+    expect(permission.querySelectorAll("svg")[0]).toHaveClass("size-3.5");
+    expect(permission.querySelectorAll("svg")[1]).toHaveClass("size-4");
+    expect(permission.querySelector("span")).toHaveClass("text-ui");
+    expect(harness).toHaveClass("h-8", "md:h-7", "gap-1", "px-2");
+    expect(voice).toHaveClass("size-8", "md:size-7");
+    expect(submit).toHaveClass("size-8", "md:size-7");
     const orderedControls = [attach, hostChip, permission, harness, voice, submit];
     for (const control of orderedControls) expect(actions).toContainElement(control);
     for (const [index, control] of orderedControls.entries()) {
@@ -1247,11 +1257,18 @@ describe("NewChatLandingScreen", () => {
     expect(harness).toHaveClass("min-w-0", "w-full", "md:w-auto");
     expect(harnessShell).toHaveClass("min-w-0", "flex-1", "md:flex-none");
     expect(trailingControls).toHaveClass("min-w-0", "flex-1", "md:flex-none");
-    expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveClass("size-[18px]");
+    expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveClass("size-4");
+    expect(screen.getByTestId("new-chat-landing-attach-icon")).toHaveAttribute(
+      "data-icon-size",
+      "16",
+    );
+    expect(screen.getByTestId("new-chat-landing-host-icon")).toHaveClass("size-4");
     const leftControls = screen.getByTestId("new-chat-landing-left-controls");
+    expect(leftControls).toHaveClass("gap-1");
     expect(leftControls).not.toHaveClass("absolute");
     expect(leftControls).toContainElement(hostChip);
     expect(leftControls).toContainElement(permission);
+    expect(trailingControls).toHaveClass("gap-1");
     expect(screen.queryByTestId("new-chat-landing-footer")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).not.toBeVisible();
     expect(composerSurface).toContainElement(composer);
@@ -2188,9 +2205,17 @@ describe("NewChatLandingScreen", () => {
       .getByTestId("new-chat-landing-workspace-chip")
       .querySelector("span.truncate");
     expect(workspaceLabel).toHaveClass("min-w-0", "flex-1", "text-sm");
-    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveClass("h-8", "px-1.5");
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveClass(
+      "h-8",
+      "md:h-7",
+      "gap-1",
+      "px-2",
+    );
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveClass(
       "h-8",
+      "md:h-7",
+      "gap-1",
+      "px-2",
       "bg-muted/70",
     );
     expect(screen.getByTestId("new-chat-landing-branch-chip")).not.toBeVisible();
