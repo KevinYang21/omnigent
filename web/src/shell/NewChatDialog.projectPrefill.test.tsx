@@ -893,11 +893,10 @@ describe("NewChatLandingScreen project prefill", () => {
 const ALWAYS_WORKTREE_KEY = "omnigent:always-use-worktree";
 
 describe("NewChatLandingScreen global always-use-worktree default", () => {
-  // The branch chip's label reflects the branch field ("Worktree" when empty),
-  // so it lets a test observe the seeded/retracted branch without opening the
-  // popover the actual input lives in.
+  // The compact icon-only chip exposes branch state through its accessible name.
   function branchLabel(): string {
-    return screen.getByTestId("new-chat-landing-branch-chip").textContent ?? "";
+    const label = screen.getByTestId("new-chat-landing-branch-chip").getAttribute("aria-label");
+    return label === "Worktree: None" ? "Worktree" : (label?.replace(/^Worktree: /, "") ?? "");
   }
 
   it("seeds a worktree in a plain (non-project) git workspace when the global default is on", async () => {
