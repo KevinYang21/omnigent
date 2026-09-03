@@ -3140,13 +3140,26 @@ async function bindStream(
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   try {
-    // One larger page, so opening a session is a single round trip that then
-    // stays still — rather than a small page followed by background growth
-    // the reader sees as the transcript shifting seconds after it settled.
+    // Two-phase snapshot fetch: paint from the cheap DB snapshot (no
+    // refresh_state) in parallel with the transcript, then reconcile
+    // runner-backed state (skills, model catalog, terminal liveness) in the
+    // background once the transcript is already on screen.
+    //
+    // The runner round-trip triggered by refresh_state=true is the tall-pole
+    // leg on cold loads — the server has to re-poll the runner process before
+    // answering, and a slow/offline runner stalls the whole paint. Runner state
+    // isn't needed to render the transcript, so removing it from the critical
+    // path shortens time-to-first-paint without any visible regression: the
+    // cheap snapshot carries harness, agent binding, effort, pending inputs,
+    // pending elicitations, and history — everything the transcript needs.
+    // Runner-backed fields (skills, codexModelOptions, sandboxStatus, etc.)
+    // are initially empty/stale and filled in by the background refresh, which
+    // calls refetchRunnerBackedSessionState(applyBindingPatch: true) — the
+    // same reconcile path used by session.agent_changed and refreshSessionState.
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
+        queryFn: () => getSessionSlim(id),
         staleTime: 0,
         retry: false,
       }),
@@ -3390,6 +3403,35 @@ async function bindStream(
       rootSetState({ selectedEffort: effectiveEffort, selectedModel: resolvedStickyModel });
     }
     racedNativeModelOptions.delete(id);
+    // Runner-backed state is off the paint path: fire the refresh_state=true
+    // read in the background now that the transcript is on screen. This is a
+    // direct fetch (not through the shared ["session", id] fetchQuery) so it
+    // can't dedupe onto or be deduped by a concurrent refreshSessionBinding
+    // (triggered by session.agent_changed) — those would race for the same
+    // query key and one would swallow the other's queryFn. runnerStateOnly
+    // limits the store write to fields refresh_state actually re-derives
+    // (skills, model catalog, terminal/sandbox liveness) so optimistic
+    // mutations (costControlMode, subagentRouting) are never overwritten.
+    void (async () => {
+      if (isConversationDisposed(id)) return;
+      try {
+        const refreshed = await getSessionSlim(id, { refreshState: true });
+        if (isConversationDisposed(id)) return;
+        // Write back to the query cache so Infinity-staleTime consumers
+        // (useSession, Agents rail, header pickers) see the fresh snapshot.
+        queryClient.setQueryData(["session", id], refreshed);
+        setterFor(id)({
+          skills: refreshed.skills ?? [],
+          codexModelOptions: refreshed.codexModelOptions ?? [],
+          terminalPending: refreshed.terminalPending ?? false,
+          sandboxStatus: refreshed.sandboxStatus ?? null,
+          mcpStartup: refreshed.mcpStartup ?? null,
+        });
+      } catch {
+        // Best-effort: a slow/offline runner is the common failure here.
+        // Leave the bind-time snapshot values in place.
+      }
+    })();
   } catch (err) {
     if (isConversationDisposed(id)) return;
     set({
