@@ -373,6 +373,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
@@ -1777,6 +1778,28 @@ describe("Workspace rail maximize", () => {
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("reflects the docked sidebar's open state on the app shell for CSS to key off", () => {
+    // The maximized rail's traffic-light clearance (index.css) must drop when
+    // the sidebar is reopened over it — the sidebar then covers the window
+    // corner, so there are no lights to clear. That CSS keys off
+    // `data-sidebar-open` on the app shell, so the attribute has to track the
+    // docked open state (absent when closed, "true" when open).
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    const shell = document.querySelector(".app-shell");
+    expect(shell).not.toBeNull();
+    // Collapsed going in (jsdom default): the attribute is absent, so
+    // `:not([data-sidebar-open])` matches and the clearance still applies.
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    expect(shell?.hasAttribute("data-sidebar-open")).toBe(false);
+
+    // Reopen the sidebar: the attribute appears, dropping the clearance.
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
   it("pins the sidebar open on /settings so the Back row is reachable", () => {

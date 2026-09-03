@@ -32,6 +32,7 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   useHostModelOptions,
+  fetchHosts,
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
@@ -44,8 +45,11 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
+  connectArcaHost,
   controlHost,
+  getDesktopFeatures,
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
@@ -69,10 +73,13 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   getHostIdentity: vi.fn(async () => null),
   onHostStatusChanged: vi.fn(() => () => {}),
   controlHost: vi.fn(async () => ({ ok: false })),
+  getDesktopFeatures: vi.fn(async () => null),
+  connectArcaHost: vi.fn(async () => ({ ok: false })),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
+  fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
@@ -775,6 +782,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     databricks_features: false,
     managed_sandboxes_enabled: false,
     sandbox_provider: null,
+    enabled_connections: [],
     sharing_mode: "on",
     public_sharing_enabled: true,
     server_version: null,
@@ -800,6 +808,12 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
         </TooltipProvider>
       </CapabilitiesProvider>
     </QueryClientProvider>,
+  );
+}
+
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
   );
 }
 
@@ -957,6 +971,148 @@ describe("Run on this machine (desktop host enrollment)", () => {
     vi.mocked(controlHost).mockClear();
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-error-retry"));
     await waitFor(() => expect(vi.mocked(controlHost)).toHaveBeenCalledWith("start"));
+  });
+});
+
+describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    mockHosts([]);
+    vi.mocked(isElectronShell).mockReturnValue(true);
+    vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: false, hostId: null });
+    vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
+    vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+    vi.mocked(connectArcaHost).mockClear();
+    vi.mocked(fetchHosts).mockClear();
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    // Restore the browser defaults so these overrides don't leak into the
+    // other describe blocks (which assume no desktop shell / no MDM flag).
+    vi.mocked(isElectronShell).mockReturnValue(false);
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+  });
+
+  async function openHostMenu() {
+    const chip = await screen.findByTestId("new-chat-landing-host-chip");
+    fireEvent.pointerDown(chip, { button: 0 });
+    fireEvent.click(chip);
+  }
+
+  it("offers the Arca option only when the desktop shell reports the MDM flag", async () => {
+    renderLanding();
+    await openHostMenu();
+    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();
+  });
+
+  it("hides the Arca option when the flag is off or unknown (old shell)", async () => {
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+    renderLanding();
+    await openHostMenu();
+    // The menu is open (the escape hatch renders), but no Arca entry.
+    await screen.findByTestId("new-chat-landing-connect-host");
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
+  });
+
+  it("state 3: hides the Arca option entirely and tags the connected row", async () => {
+    // The row is recognized by the host id remembered at connect time — a
+    // host's name (machine hostname) is deliberately not matched against
+    // anything from `arca status`.
+    localStorage.setItem("omnigent:arca-host-id", "arca-1");
+    mockHosts([{ host_id: "arca-1", name: "ip-10-0-0-7", owner: "me", status: "online" }]);
+    renderLanding();
+    await openHostMenu();
+
+    const row = await screen.findByTestId("new-chat-landing-host-arca-1");
+    expect(row.textContent).toContain("Arca instance");
+    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
+  });
+
+  it("shows a plain Run on Arca item (no status line) while not connected", async () => {
+    renderLanding();
+    await openHostMenu();
+
+    const item = await screen.findByTestId("new-chat-landing-run-on-arca");
+    expect(item.textContent).toContain("Run on Arca");
+    expect(screen.queryByTestId("new-chat-landing-arca-subtitle")).toBeNull();
+  });
+
+  // Silent-outcome cases: a deliberate dismissal, and a failure the connect
+  // console already displayed — neither may echo into the composer strip.
+  async function expectNoArcaError(result: Awaited<ReturnType<typeof connectArcaHost>>) {
+    vi.mocked(connectArcaHost).mockResolvedValue(result);
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+    await waitFor(() => expect(vi.mocked(connectArcaHost)).toHaveBeenCalled());
+    expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
+  }
+
+  it("stays silent when the user dismissed the console", async () => {
+    await expectNoArcaError({
+      ok: false,
+      canceled: true,
+      error: "Connecting Arca wasn't approved.",
+    });
+  });
+
+  it("stays silent for a failure the console already displayed", async () => {
+    await expectNoArcaError({
+      ok: false,
+      shownInConsole: true,
+      error: "Couldn't reach the Arca instance.",
+    });
+  });
+
+  it("surfaces a gate failure (no console shown) with a retry", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({
+      ok: false,
+      error: "Couldn't reach the Arca instance.",
+    });
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    const err = await screen.findByTestId("new-chat-landing-arca-error");
+    expect(err.textContent).toContain("Couldn't reach the Arca instance.");
+    expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
+
+    // Retry re-invokes the connect.
+    vi.mocked(connectArcaHost).mockClear();
+    fireEvent.click(screen.getByTestId("new-chat-landing-arca-error-retry"));
+    await waitFor(() => expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1));
+  });
+
+  it("skips the new-host wait when the daemon was already connected", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true, alreadyRunning: true });
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    // No 30s poll, no error — an explanatory toast instead.
+    await waitFor(() =>
+      expect(showToastMock).toHaveBeenCalledWith(
+        "Arca is already connected to this server — pick its host from the list.",
+      ),
+    );
+    expect(vi.mocked(fetchHosts)).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
+  });
+
+  it("selects the host that newly came online after a successful connect", async () => {
+    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
+    // First post-connect poll already sees the freshly-registered Arca host.
+    vi.mocked(fetchHosts).mockResolvedValue([
+      { host_id: "arca-1", name: "arca-box", owner: "me", status: "online" },
+    ]);
+    renderLanding();
+    await openHostMenu();
+    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
+
+    // selectHost persists the pick — the observable effect of auto-selection.
+    await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
+    expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1189,15 +1345,15 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("workspace-picker-cancel")).toBeTruthy();
   });
 
-  it("separates zero-session quick import from an empty notice slot", () => {
+  it("separates the zero-session import action from an empty notice slot", () => {
     useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
     renderLanding();
 
     const notices = screen.getByTestId("new-chat-landing-notices");
-    const quickImportActions = screen.getByTestId("landing-quick-import").parentElement;
+    const importActions = screen.getByTestId("landing-import-sessions").parentElement;
     expect(notices).toHaveClass("mt-1");
-    expect(quickImportActions).toHaveClass("mt-5");
-    expect(notices.nextElementSibling).toBe(quickImportActions);
+    expect(importActions).toHaveClass("mt-5");
+    expect(notices.nextElementSibling).toBe(importActions);
   });
 
   it("keeps the footer anchored to the composer when a harness notice appears", () => {
@@ -1215,9 +1371,9 @@ describe("NewChatLandingScreen", () => {
     expect(composerSurface).toContainElement(footer);
     expect(composerSurface).not.toContainElement(warning);
     expect(notices).toContainElement(warning);
-    const quickImportActions = screen.getByTestId("landing-quick-import").parentElement;
-    expect(quickImportActions).toHaveClass("mt-5");
-    expect(notices.nextElementSibling).toBe(quickImportActions);
+    const importActions = screen.getByTestId("landing-import-sessions").parentElement;
+    expect(importActions).toHaveClass("mt-5");
+    expect(notices.nextElementSibling).toBe(importActions);
   });
 
   it("keeps the footer anchored to the composer when a create error appears", async () => {
@@ -1404,6 +1560,35 @@ describe("NewChatLandingScreen", () => {
     // (e.g. dropped the workspace gate), the blank cases above would have
     // enabled too.
     expect(submit.disabled).toBe(false);
+  });
+
+  it("keeps the disabled reason tooltip on the new-chat submit button", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const submit = screen.getByTestId("new-chat-landing-submit");
+
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
+  });
+
+  it("shows the default shortcut in the new-chat submit tooltip", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "inspect the repo" },
+    });
+    const submit = screen.getByTestId("new-chat-landing-submit");
+
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByRole("tooltip");
+
+    expect(within(tooltip).getByText("Start session")).toBeInTheDocument();
+    expect(tooltipKeys(tooltip)).toEqual(["↵"]);
   });
 
   it("keeps submit disabled when no agents exist", () => {
@@ -1871,7 +2056,7 @@ describe("NewChatLandingScreen", () => {
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
   });
 
-  it("reports start-session telemetry when a create is triggered with the Enter key", async () => {
+  it("keeps legacy Mod+Enter as a default-mode send alias", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -1882,15 +2067,33 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
     });
-    // Enter creates the session without going through the Start button, so the
-    // telemetry has to fire from handleCreate — not the Button's componentId.
-    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+      key: "Enter",
+      ctrlKey: true,
+    });
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
     expect(analytics).toHaveBeenCalledWith({
       type: "click",
       componentId: "new_chat.start_session",
       componentKind: "button",
     });
+  });
+
+  it("uses Mod+Enter to start a session when the alternate composer behavior is enabled", async () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "run the build" } });
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
   });
 
   it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
@@ -3036,6 +3239,24 @@ describe("NewChatLandingScreen skills menu", () => {
     );
   });
 
+  it("does not accept a highlighted skill when Enter is pressed on mobile", () => {
+    const restoreViewport = forceMobileViewport();
+    try {
+      mockAgents([skilledAgent()]);
+      renderLanding();
+      typeMessage("/rev");
+
+      fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+
+      expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+        "/rev",
+      );
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    } finally {
+      restoreViewport();
+    }
+  });
+
   it("Tab completes a match found only mid-name (exercises slashMenuMatches, not just the render filter)", () => {
     mockAgents([skilledAgent()]);
     renderLanding();
@@ -3363,6 +3584,27 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // Host absolute paths are shown as workspace-relative rows (folders first).
     expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
     expect(screen.getByTitle("Attach README.md")).toBeInTheDocument();
+  });
+
+  it("does not accept the highlighted mention when Enter is pressed on mobile", async () => {
+    const restoreViewport = forceMobileViewport();
+    try {
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+      );
+      fireEvent.change(input(), {
+        target: { value: "@README", selectionStart: 7 },
+      });
+
+      fireEvent.keyDown(input(), { key: "Enter" });
+
+      expect((input() as HTMLTextAreaElement).value).toBe("@README");
+      expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    } finally {
+      restoreViewport();
+    }
   });
 
   it("does NOT open the menu for a non-native (SDK) agent", () => {

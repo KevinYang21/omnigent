@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 from sqlalchemy import event, text
 
@@ -543,6 +547,53 @@ def test_append_leaves_created_by_none_for_agent_items(
     assert persisted.created_by is None
     [read_back] = conversation_store.list_items(conv.id).data
     assert read_back.created_by is None
+
+
+def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
+    """append() routes every item's payload through _encode_item_data_batch
+    exactly once, passing all payloads in item order — so a subclass whose
+    encode is a per-call RPC can collapse the page into a single call.
+
+    Guards the managed store's per-import CMK cost: one encrypt call per append,
+    not one per item.
+    """
+
+    class RecordingStore(SqlAlchemyConversationStore):
+        def __init__(self, uri: str) -> None:
+            super().__init__(uri)
+            self.batch_calls: list[list[str]] = []
+
+        def _encode_item_data_batch(self, data_jsons: list[str]) -> list[str]:
+            # Record the page, then defer to the identity default so the data
+            # still round-trips through the plaintext column.
+            self.batch_calls.append(list(data_jsons))
+            return super()._encode_item_data_batch(data_jsons)
+
+    store = RecordingStore(db_uri)
+    conv = store.create_conversation()
+    texts = [f"item-{i}" for i in range(5)]
+    persisted = store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_batch",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+            for text in texts
+        ],
+    )
+
+    # Exactly one batched encode call carrying all five payloads, in order.
+    assert len(store.batch_calls) == 1
+    encoded_page = store.batch_calls[0]
+    assert len(encoded_page) == 5
+    assert [json.loads(payload)["content"][0]["text"] for payload in encoded_page] == texts
+
+    # Data round-trips: persisted order and read-back both match the input.
+    assert [item.data.content[0]["text"] for item in persisted] == texts
+    read_back = store.list_items(conv.id).data
+    assert [item.data.content[0]["text"] for item in read_back] == texts
 
 
 def test_append_function_call_items(
@@ -2085,6 +2136,52 @@ def test_update_title_bumps_updated_at(
     )
 
 
+@pytest.mark.parametrize(
+    "rebind",
+    ["replace_runner_id", "clear_runner_id", "clear_host_binding", "set_host_id"],
+)
+def test_runner_host_rebind_does_not_bump_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    rebind: str,
+) -> None:
+    """
+    Runner/host binding is live state, so it must leave updated_at alone.
+
+    The sidebar lights its unread dot when ``updated_at`` exceeds the viewer's
+    last-seen baseline, so a rebind that stamped ``now`` would flag a
+    long-quiet conversation as unread with nothing new to read.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    host_id = "292dfcdf8a31f1319b469f4fa179ac6b"
+    _register_host(db_uri, host_id)
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation(
+        workspace="/Users/corey/projects/myapp",
+    )
+    assert conv.updated_at == 1000
+
+    # Three days later, with no new conversation content at all.
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000 + 3 * 86_400)
+    if rebind == "replace_runner_id":
+        conversation_store.replace_runner_id(conv.id, "runner_abc123")
+    elif rebind == "clear_runner_id":
+        conversation_store.clear_runner_id(conv.id)
+    elif rebind == "clear_host_binding":
+        conversation_store.clear_host_binding(conv.id)
+    else:
+        conversation_store.set_host_id(conv.id, host_id)
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000, (
+        f"{rebind} bumped updated_at to {fetched.updated_at} with no new "
+        "content; that lights the sidebar unread dot on a quiet conversation."
+    )
+
+
 # ── sort_by=updated_at ────────────────────────────────
 
 
@@ -3610,6 +3707,72 @@ def test_fork_copies_terminal_launch_args_by_default(
     assert fetched.terminal_launch_args == ["--permission-mode", "auto"]
 
 
+def test_fork_override_terminal_launch_args_supersedes_copy(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """An explicit launch-args override replaces the copied source args.
+
+    The fork dialog's permission-mode picker sends its own
+    ``terminal_launch_args``; the override must win over the same-agent copy,
+    and an empty list must clear the source's flags entirely.
+    """
+    source = conversation_store.create_conversation(
+        terminal_launch_args=["--permission-mode", "auto"],
+    )
+    picked = conversation_store.fork_conversation(
+        source.id,
+        override_terminal_launch_args=["--permission-mode", "plan"],
+        override_terminal_launch_args_set=True,
+    )
+    fetched = conversation_store.get_conversation(picked.id)
+    assert fetched is not None
+    assert fetched.terminal_launch_args == ["--permission-mode", "plan"]
+
+    cleared = conversation_store.fork_conversation(
+        source.id,
+        override_terminal_launch_args=[],
+        override_terminal_launch_args_set=True,
+    )
+    fetched_cleared = conversation_store.get_conversation(cleared.id)
+    assert fetched_cleared is not None
+    assert fetched_cleared.terminal_launch_args == []
+
+
+def test_fork_override_model_and_effort_supersede_inherit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """An explicit model/effort override wins over the source's copied values,
+    and a cleared override (set-flag on, value None) resets to the agent
+    default even on a same-agent fork that would otherwise copy them."""
+    source = conversation_store.create_conversation()
+    conversation_store.update_conversation(
+        source.id, model_override="sonnet", reasoning_effort="low"
+    )
+
+    overridden = conversation_store.fork_conversation(
+        source.id,
+        override_model_override="opus",
+        override_model_override_set=True,
+        override_reasoning_effort="high",
+        override_reasoning_effort_set=True,
+    )
+    fetched = conversation_store.get_conversation(overridden.id)
+    assert fetched is not None
+    assert fetched.model_override == "opus"
+    assert fetched.reasoning_effort == "high"
+
+    cleared = conversation_store.fork_conversation(
+        source.id,
+        override_model_override=None,
+        override_model_override_set=True,
+    )
+    fetched_cleared = conversation_store.get_conversation(cleared.id)
+    assert fetched_cleared is not None
+    assert fetched_cleared.model_override is None
+    # Effort NOT overridden ⇒ same-agent fork still copies the source's value.
+    assert fetched_cleared.reasoning_effort == "low"
+
+
 def test_fork_drops_terminal_launch_args_when_switching_agent(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3791,6 +3954,40 @@ def test_fork_conversation_drops_instance_scoped_labels(
     # usage.
     assert fork.labels == {"omnigent.wrapper": "claude-code-native-ui"}, (
         f"Fork must drop instance-scoped labels, kept {fork.labels!r}"
+    )
+
+
+def test_fork_extra_labels_rearm_bypass_over_the_always_drop(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """``extra_labels`` stamps AFTER the drop, so a deliberate opt-in wins.
+
+    The source's own bypass label is always dropped (instance-scoped), so a
+    bypass-armed source can't silently re-arm its clone. But when the fork
+    dialog explicitly re-arms bypass, the route passes it via ``extra_labels``,
+    which the store applies last — the fork ends up armed even though the
+    source's identical label was dropped on the same fork.
+    """
+    agent_store.create(
+        agent_id="c1a2b3c4d5e6f7081920314253647586",
+        name="fork-bypass",
+        bundle_location="c1a2b3c4d5e6f7081920314253647586/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="c1a2b3c4d5e6f7081920314253647586")
+    conversation_store.set_labels(source.id, {"omnigent.codex_native.bypass_sandbox": "1"})
+
+    # Same-agent fork WITHOUT the opt-in: the source's label is dropped.
+    plain = conversation_store.fork_conversation(source.id)
+    assert "omnigent.codex_native.bypass_sandbox" not in plain.labels
+
+    # WITH the opt-in via extra_labels: armed on the fork despite the drop.
+    armed = conversation_store.fork_conversation(
+        source.id,
+        extra_labels={"omnigent.codex_native.bypass_sandbox": "1"},
+    )
+    assert armed.labels.get("omnigent.codex_native.bypass_sandbox") == "1", (
+        f"extra_labels must re-arm bypass over the always-drop, got {armed.labels!r}"
     )
 
 
@@ -5654,3 +5851,106 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+# ── Connection-checkout budget ─────────────────────────
+
+
+def _count_checkouts(*engines: Any) -> tuple[list[int], Callable[[], None]]:
+    """Count pool checkouts across ``engines`` (deduplicated).
+
+    Attach *after* any setup writes so only the read under test is counted.
+
+    :returns: ``(count, detach)`` — a one-element list incremented per
+        checkout, plus a zero-arg callable that removes the listeners.
+    """
+    count = [0]
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        count[0] += 1
+
+    unique = list(dict.fromkeys(engines))
+    for engine in unique:
+        event.listen(engine, "checkout", _on_checkout)
+
+    def _detach() -> None:
+        for engine in unique:
+            event.remove(engine, "checkout", _on_checkout)
+
+    return count, _detach
+
+
+def test_get_conversation_costs_one_checkout(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """One logical read = one pool checkout, and it still returns every field.
+
+    ``get_conversation`` reads the AP ``conversations`` row plus the Omnigent
+    ``omnigent_conversation_metadata`` row. In single-DB mode both live on one
+    engine, so the whole read must share a single checkout — every extra
+    checkout is a ``pool_pre_ping`` round trip on Lakebase, on the hottest read
+    in the product. Counting checkouts (not milliseconds) keeps this immune to
+    load noise.
+    """
+    created = conversation_store.create_conversation(
+        title="budget",
+        runner_id="runner_budget",
+        host_id="4f64b6ee625f4e8259185c35c6e63f3d",
+        workspace="/tmp/ws",
+        git_branch="feature/x",
+    )
+    conversation_store.set_labels(created.id, {"tag": "value"})
+
+    count, detach = _count_checkouts(conversation_store._conv_engine, conversation_store._engine)
+    try:
+        conv = conversation_store.get_conversation(created.id)
+    finally:
+        detach()
+
+    assert count[0] == 1, f"get_conversation must take one checkout, got {count[0]}"
+    assert conv is not None
+    # AP-table fields.
+    assert conv.title == "budget"
+    # Omnigent-metadata fields — all None if the metadata read were dropped.
+    assert (conv.runner_id, conv.host_id) == (
+        "runner_budget",
+        "4f64b6ee625f4e8259185c35c6e63f3d",
+    )
+    assert (conv.workspace, conv.git_branch) == ("/tmp/ws", "feature/x")
+    assert conv.labels == {"tag": "value"}
+
+
+def test_get_conversation_keeps_distinct_query_names(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Sharing one checkout must not collapse the three reads' semantic names."""
+    from omnigent.db import current_query_name
+
+    created = conversation_store.create_conversation(title="named")
+    conversation_store.set_labels(created.id, {"tag": "value"})
+
+    names: list[str | None] = []
+
+    def _capture(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _params: object,
+        _ctx: object,
+        _many: bool,
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            names.append(current_query_name())
+
+    engine = conversation_store._conv_engine
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        assert conversation_store.get_conversation(created.id) is not None
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert names == [
+        "omnigent.conversation_store.select_conversation_by_id",
+        "omnigent.conversation_store.select_conversation_metadata_by_id",
+        "omnigent.conversation_store.select_conversation_labels",
+    ], names

@@ -65,6 +65,7 @@ from omnigent.db.utils import (
     insert_fts_bulk,
     make_named_managed_session_maker,
     now_epoch,
+    shared_read_scope,
     strip_nul_bytes,
 )
 from omnigent.entities import (
@@ -74,6 +75,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.session_import.models import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -81,6 +83,7 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    ARCHIVED_AT_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -303,6 +306,7 @@ def _new_session_metadata_row(
     runner_id: str | None = None,
     workspace: str | None = None,
     terminal_launch_args: list[str] | None = None,
+    project_id: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -322,6 +326,7 @@ def _new_session_metadata_row(
         id=conversation_id,
         kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         runner_id=runner_id,
+        project_id=project_id,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -795,11 +800,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         ensure_fts_table(self._conv_engine)
 
-    def _get_meta(
-        self, _unused_session: Session, conversation_id: str
-    ) -> SqlConversationMetadata | None:
+    def _get_meta(self, conversation_id: str) -> SqlConversationMetadata | None:
         """
         Fetch the metadata row for a conversation from the Omnigent DB.
+
+        Always goes through the Omnigent-DB session maker: in split-DB mode
+        ``omnigent_conversation_metadata`` lives on a different engine than the
+        caller's AP session, so the caller's session cannot serve it. A caller
+        inside :func:`shared_read_scope` pays no second pool checkout for it
+        when both logical databases share one engine.
         """
         with self._session("select_conversation_metadata_by_id") as meta_sess:
             return meta_sess.get(
@@ -877,6 +886,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
+        project_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1008,6 +1018,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 terminal_launch_args=(
                     json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
                 ),
+                project_id=project_id,
             )
             with self._session("insert_conversation_metadata") as meta_sess:
                 meta_sess.add(meta)
@@ -1044,20 +1055,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
-        Issues two queries inside one session: the conversation row
-        (which carries the agent binding + per-session override blob) and
-        a label fetch on ``conversation_labels``.
+        Issues three queries: the conversation row (which carries the agent
+        binding + per-session override blob), the Omnigent-DB metadata row, and
+        a label fetch on ``conversation_labels``. They run inside a
+        :func:`shared_read_scope` so the whole read costs one pool checkout per
+        engine — one in single-DB mode, where the metadata table would otherwise
+        force a second checkout (and, with ``pool_pre_ping``, a second network
+        round trip) for every session read in the product.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
         """
-        with self._conv_session("select_conversation_by_id") as session:
+        with shared_read_scope(), self._conv_session("select_conversation_by_id") as session:
             row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 return None
-            meta = self._get_meta(session, conversation_id)
+            meta = self._get_meta(conversation_id)
             return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
 
     def find_imported_conversation(
@@ -1965,6 +1980,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         return data_json
 
+    def _encode_item_data_batch(self, data_jsons: list[str]) -> list[str]:
+        """
+        Encode a whole page of item ``data`` JSONs on write, the write-side
+        mirror of :meth:`_decode_item_data_batch`. Returns one encoded value per
+        input, in order.
+
+        The default fans out to per-item :meth:`_encode_item_data`, so a store
+        that overrides only the per-item hook is unaffected. A subclass whose
+        encode carries a per-call cost (e.g. one encrypt RPC) should override
+        *this* method to transform every item in a single call instead of one
+        per item — :meth:`append` invokes it once for the whole batch.
+        """
+        return [self._encode_item_data(data_json) for data_json in data_jsons]
+
     def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
         """
         Inverse of :meth:`_encode_item_data` for a whole page of rows, applied
@@ -2011,6 +2040,18 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
         persisted: list[ConversationItem] = []
 
+        # Encode every item payload up front, in one batch, BEFORE opening the
+        # write transaction. The transform depends only on item data, not on any
+        # row we lock, so a subclass whose encode is a per-call RPC (encrypt)
+        # issues one call for the page and never holds the conversation's
+        # FOR UPDATE lock while it round-trips. strip_nul_bytes runs here so a
+        # Postgres text column never sees a NUL (tool output can embed one, e.g.
+        # reading a binary file), which would abort the whole INSERT.
+        raw_jsons = [
+            strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True))) for item in items
+        ]
+        encoded_data = self._encode_item_data_batch(raw_jsons)
+
         with self._conv_session("append_conversation_items") as session:
             # Lock the conversation row to serialize position writes.
             # On PostgreSQL this is a row-level FOR UPDATE lock; on
@@ -2052,15 +2093,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             completed_status = encode_item_status("completed")  # items are final on append
             fts_rows: list[tuple[str, str, str]] = []
             row_values: list[dict[str, object]] = []
-            for item in items:
+            for item, data in zip(items, encoded_data, strict=True):
                 position = next_pos
                 next_pos += 1
-                data_dict = item.data.model_dump(exclude_none=True)
-                # Strip NUL bytes before they reach a Postgres text
-                # column, which rejects them outright. Tool output can
-                # embed NUL (e.g. reading a binary file); without this
-                # the whole INSERT aborts and the item never persists.
-                data = self._encode_item_data(strip_nul_bytes(json.dumps(data_dict)))
                 search = self._item_search_text(item)
                 item_id = generate_item_id(item.type)
                 values: dict[str, object] = {
@@ -2816,6 +2851,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True
             if archived is not None:
                 # archived lives on the AP conversations row; a visible state change.
+                # Record the archive time as a label on the false->true transition
+                # only, so a redundant re-archive PATCH can't reset the retention
+                # clock; unarchiving clears it. Same transaction as the flag, and
+                # ahead of the _fetch_labels below, so the response carries it.
+                if archived and not row.archived:
+                    _upsert_labels(
+                        ap_sess, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now
+                    )
+                elif not archived:
+                    ap_sess.execute(
+                        delete(SqlConversationLabel).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.conversation_id == conversation_id,
+                            SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
+                        )
+                    )
                 row.archived = archived
                 ap_changed = True
             if ap_changed:
@@ -2843,7 +2894,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     meta_sess.add(meta)
                 meta.terminal_launch_args = json.dumps(terminal_launch_args)
         else:
-            meta = self._get_meta(ap_sess, conversation_id)
+            meta = self._get_meta(conversation_id)
         return _to_conversation(row, meta, labels)
 
     def rename_conversation_if_title_matches(
@@ -3047,7 +3098,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3074,7 +3124,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3109,7 +3158,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3219,7 +3267,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            ap_row.updated_at = now_epoch()
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
@@ -3287,6 +3334,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -3353,6 +3401,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
+            project_id=project_id,
         )
 
     def _create_session_with_agent_with_id(
@@ -3370,6 +3419,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
+        project_id: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -3417,6 +3467,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation_id,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
+            project_id=project_id,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
         )
@@ -3438,6 +3489,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -3461,7 +3520,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         (:data:`_INSTANCE_SCOPED_LABEL_KEYS` — native bridge ids,
         context metrics), which belong to the source's running instance
         and would mis-route or mis-display on the clone.
-        When the source had a ``workspace``, the fork is additionally
+        When the source had a ``workspace`` — or is a runner-bound native
+        session whose workspace metadata was lost — the fork is additionally
         stamped with ``FORK_SOURCE_LABEL_KEY`` (value = source id) so the
         unbound clone reports offline until it rebinds a directory (see
         :class:`SessionConnectivity`).
@@ -3494,6 +3554,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             the bound agent's defaults — used when the fork switches to
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
+        :param override_model_override: Explicit ``model_override`` for the
+            fork, applied only when ``override_model_override_set`` is
+            ``True`` — then it supersedes the ``copy_model_settings`` copy
+            (a value pins that model; ``None`` clears to the agent default).
+        :param override_model_override_set: Whether the caller chose an
+            explicit ``model_override`` (the fork dialog's model picker).
+            ``False`` (default) inherits per ``copy_model_settings``.
+        :param override_reasoning_effort: Explicit ``reasoning_effort`` for
+            the fork, applied only when ``override_reasoning_effort_set`` is
+            ``True``.
+        :param override_reasoning_effort_set: Whether the caller chose an
+            explicit ``reasoning_effort``. ``False`` (default) inherits per
+            ``copy_model_settings``.
+        :param override_terminal_launch_args: Explicit
+            ``terminal_launch_args`` for the fork (e.g. the permission-mode
+            selector's ``["--permission-mode", "auto"]``), applied only when
+            ``override_terminal_launch_args_set`` is ``True`` — then it
+            supersedes the ``copy_terminal_launch_args`` copy (``[]`` clears
+            them, ``None`` also clears).
+        :param override_terminal_launch_args_set: Whether the caller chose
+            explicit launch args. ``False`` (default) inherits per
+            ``copy_terminal_launch_args``.
+        :param dropped_label_keys: Source labels to NOT copy onto the fork,
+            beyond the always-dropped instance-scoped set. The fork route
+            passes the permission-mode / codex-bypass label keys here when
+            the dialog picks explicit launch args, so the stale copied label
+            can't shadow the freshly chosen mode.
+        :param extra_labels: Labels to stamp on the fork AFTER the copy /
+            drop / presentation-label logic, so a deliberate opt-in wins over
+            the always-drop rule. The fork route passes the DANGEROUS
+            ``codex_native.bypass_sandbox`` label here when the dialog's
+            approval selector explicitly re-arms bypass — the only path that
+            sets it, since the source's own bypass label is always dropped.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` on the fork so a native
             target harness rebuilds its transcript instead of starting
@@ -3545,6 +3638,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             cloned_agent_description=cloned_agent_description,
             copy_model_settings=copy_model_settings,
             copy_terminal_launch_args=copy_terminal_launch_args,
+            override_model_override=override_model_override,
+            override_model_override_set=override_model_override_set,
+            override_reasoning_effort=override_reasoning_effort,
+            override_reasoning_effort_set=override_reasoning_effort_set,
+            override_terminal_launch_args=override_terminal_launch_args,
+            override_terminal_launch_args_set=override_terminal_launch_args_set,
+            dropped_label_keys=dropped_label_keys,
+            extra_labels=extra_labels,
             carry_history_into_native=carry_history_into_native,
             resume_source_native_session=resume_source_native_session,
             presentation_labels=presentation_labels,
@@ -3564,6 +3665,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         cloned_agent_description: str | None = None,
         copy_model_settings: bool = True,
         copy_terminal_launch_args: bool = True,
+        override_model_override: str | None = None,
+        override_model_override_set: bool = False,
+        override_reasoning_effort: str | None = None,
+        override_reasoning_effort_set: bool = False,
+        override_terminal_launch_args: list[str] | None = None,
+        override_terminal_launch_args_set: bool = False,
+        dropped_label_keys: frozenset[str] = frozenset(),
+        extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
@@ -3604,14 +3713,23 @@ class SqlAlchemyConversationStore(ConversationStore):
             # — same gate — harness_override) copy only when copy_model_settings.
             # The routing switches (cost_control_mode_override,
             # subagent_routing_override) are intentionally never carried onto a fork.
+            # An explicit dialog pick (override_*_set) supersedes the inherited
+            # value — the fork dialog seeds the picker from the source, so an
+            # untouched picker sends nothing and inheritance stands.
+            fork_effort = (
+                override_reasoning_effort
+                if override_reasoning_effort_set
+                else (source_overrides["reasoning_effort"] if copy_model_settings else None)
+            )
+            fork_model = (
+                override_model_override
+                if override_model_override_set
+                else (source_overrides["model_override"] if copy_model_settings else None)
+            )
             fork_overrides = _encode_session_overrides(
                 {
-                    "reasoning_effort": (
-                        source_overrides["reasoning_effort"] if copy_model_settings else None
-                    ),
-                    "model_override": (
-                        source_overrides["model_override"] if copy_model_settings else None
-                    ),
+                    "reasoning_effort": fork_effort,
+                    "model_override": fork_model,
                     "harness_override": (
                         source_overrides["harness_override"] if copy_model_settings else None
                     ),
@@ -3744,18 +3862,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             # clone is unbound (workspace/host not copied) and must rebind
             # a directory before it can run, so the online-dot reports it
             # offline and the UI opens the directory picker on the first
-            # message instead of dropping it. Forks of chat-only sources
-            # (no workspace) get no such label and resume in-process like
+            # message instead of dropping it. A runner-bound native source
+            # with no workspace gets the same recovery treatment because
+            # that combination reflects lost metadata, not a chat-only
+            # session. Other workspace-less sources resume in-process like
             # a brand-new chat session.
             # Per-user pin keys (``omnigent.pinned.<user>``) are dynamic-suffix,
             # so they're never in the exact-match drop sets — drop them by prefix
             # instead. A fork is a NEW conversation; inheriting the source's pins
             # would show the clone as pinned for the forker AND carry every other
             # user's pin key along as dead data.
+            source_labels = _fetch_labels(session, source_conversation_id)
             fork_labels = {
                 key: value
-                for key, value in _fetch_labels(session, source_conversation_id).items()
-                if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
+                for key, value in source_labels.items()
+                if key
+                not in (
+                    _INSTANCE_SCOPED_LABEL_KEYS
+                    | _FORK_ONLY_DROPPED_LABEL_KEYS
+                    | dropped_label_keys
+                )
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
@@ -3766,12 +3892,32 @@ class SqlAlchemyConversationStore(ConversationStore):
             # CLI — Claude Code's ``--permission-mode auto`` makes ``pi`` exit 1
             # at launch (unknown option), which surfaces as
             # ``required_terminal_exited``. Drop them on a switching fork.
+            # An explicit dialog pick (the permission-/approval-mode selector)
+            # supersedes the inherited launch args; an untouched picker sends
+            # nothing, so the same-agent copy / switch-drop rule stands. The
+            # metadata column stores the JSON-encoded string, so the copy path
+            # reuses the source's already-encoded value while an override list
+            # is encoded here (matching create_conversation).
             source_terminal_args = (
-                source_meta_ref.terminal_launch_args
-                if source_meta_ref and copy_terminal_launch_args
-                else None
+                (
+                    json.dumps(override_terminal_launch_args)
+                    if override_terminal_launch_args is not None
+                    else None
+                )
+                if override_terminal_launch_args_set
+                else (
+                    source_meta_ref.terminal_launch_args
+                    if source_meta_ref and copy_terminal_launch_args
+                    else None
+                )
             )
-            if source_workspace is not None:
+            source_has_bound_native_runner = bool(
+                source_meta_ref
+                and source_meta_ref.runner_id
+                and native_coding_agent_for_wrapper_label(source_labels.get(WRAPPER_LABEL_KEY))
+                is not None
+            )
+            if source_workspace is not None or source_has_bound_native_runner:
                 fork_labels[FORK_SOURCE_LABEL_KEY] = source_conversation_id
             # Carry the source's native session id as a one-shot fork
             # directive so a native harness can resume + branch the source's
@@ -3803,6 +3949,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for _pkey in (UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY):
                     fork_labels.pop(_pkey, None)
                 fork_labels.update(presentation_labels)
+            # Caller-supplied labels stamped LAST so a deliberate opt-in beats
+            # both the copy and the always-drop rules — e.g. the fork dialog
+            # re-arming the DANGEROUS codex bypass. The source's own bypass
+            # label was already dropped (it's instance-scoped), so this is the
+            # only path that sets it, and only from an explicit request field.
+            if extra_labels:
+                fork_labels.update(extra_labels)
             if fork_labels:
                 _upsert_labels(session, new_conv.id, fork_labels, now)
 
