@@ -39,16 +39,23 @@ type SidebarDropHandler = (drag: SessionDragState, target: SidebarDropTarget) =>
 
 interface SessionDragDropContextValue {
   activeDrag: SessionDragState | null;
+  provided: boolean;
   registerSidebarDropHandler: (handler: SidebarDropHandler) => () => void;
 }
 
 const SessionDragDropContext = createContext<SessionDragDropContextValue>({
   activeDrag: null,
+  provided: false,
   registerSidebarDropHandler: () => () => {},
 });
 
 export function useSessionDragDrop(): SessionDragDropContextValue {
   return useContext(SessionDragDropContext);
+}
+
+export function SessionDragDropBoundary({ children }: { children: ReactNode }) {
+  const { provided } = useSessionDragDrop();
+  return provided ? children : <SessionDragDropProvider>{children}</SessionDragDropProvider>;
 }
 
 function dragStateFromEvent(event: DragStartEvent): SessionDragState {
@@ -121,7 +128,7 @@ export function SessionDragDropProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ activeDrag, registerSidebarDropHandler }),
+    () => ({ activeDrag, provided: true, registerSidebarDropHandler }),
     [activeDrag, registerSidebarDropHandler],
   );
 

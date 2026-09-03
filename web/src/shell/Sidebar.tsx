@@ -56,7 +56,11 @@ import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
-import { useSessionDragDrop, type SessionDragState } from "./SessionDragDropProvider";
+import {
+  SessionDragDropBoundary,
+  useSessionDragDrop,
+  type SessionDragState,
+} from "./SessionDragDropProvider";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
@@ -1889,7 +1893,7 @@ function ConversationList({
   // rules between groups.
   return (
     <SidebarRowDataProvider projectNamesById={projectNamesById} hostsById={hostsById}>
-      <div className="contents">
+      <SessionDragDropBoundary>
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
             className="flex flex-col gap-4"
@@ -2110,7 +2114,7 @@ function ConversationList({
             )}
           </div>
         </RowEditHoldContext.Provider>
-      </div>
+      </SessionDragDropBoundary>
     </SidebarRowDataProvider>
   );
 }
