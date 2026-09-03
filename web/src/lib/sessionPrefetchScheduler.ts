@@ -15,8 +15,11 @@ import { getSessionSlim } from "@/lib/sessionsApi";
 export class SessionPrefetchScheduler {
   private inFlight = false;
   private next: string | null = null;
+  private readonly queryClient: QueryClient;
 
-  constructor(private readonly queryClient: QueryClient) {}
+  constructor(queryClient: QueryClient) {
+    this.queryClient = queryClient;
+  }
 
   /** Warm `["session", id]`. No-op if already fresh; queued if one is running. */
   prefetch(conversationId: string): void {
