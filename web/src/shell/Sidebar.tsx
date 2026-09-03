@@ -1104,12 +1104,17 @@ function InfiniteScrollSentinel({
   fetchMore,
   scrollRoot,
   indent,
+  silent,
 }: {
   hasMore: boolean;
   isFetching: boolean;
   fetchMore: () => void;
   scrollRoot: RefObject<HTMLElement | null>;
   indent?: boolean;
+  // When true, background pagination runs without any visible indicator —
+  // no spinner, no "Load more" label. Use when the list already has content
+  // so the sentinel does not look like a stalled initial load.
+  silent?: boolean;
 }) {
   const ref = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -1126,6 +1131,21 @@ function InfiniteScrollSentinel({
   }, [hasMore, isFetching, fetchMore, scrollRoot]);
 
   if (!hasMore) return null;
+  // Silent mode: a 1px-tall, non-interactive button keeps the
+  // IntersectionObserver anchor in the DOM so auto-fetch continues, but
+  // nothing is rendered that would look like an incomplete initial load.
+  if (silent) {
+    return (
+      <button
+        ref={ref}
+        type="button"
+        disabled
+        aria-hidden="true"
+        tabIndex={-1}
+        className="pointer-events-none h-px w-full"
+      />
+    );
+  }
   return (
     <button
       ref={ref}
@@ -2169,13 +2189,17 @@ function ConversationList({
               Settings page ("Archived chats"), reachable from the footer. */}
                 {/* Infinite-scroll sentinel for the global list. Pagination extends
               the Chats list, so it hides with a collapsed Chats group — a loader
-              under a collapsed group reads orphaned. */}
+              under a collapsed group reads orphaned. Silent while the list has
+              visible items: background pagination shouldn't look like a stalled
+              initial load when the current tab shows only a few sessions but many
+              more exist for other tabs (e.g. few "mine", many "shared"). */}
                 {!effectiveCollapsedSections.includes("Chats") && (
                   <InfiniteScrollSentinel
                     hasMore={hasMorePages}
                     isFetching={isFetchingNextPage}
                     fetchMore={fetchNextPage}
                     scrollRoot={scrollContainerRef}
+                    silent={totalVisible > 0}
                   />
                 )}
               </>

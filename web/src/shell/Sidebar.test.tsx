@@ -1332,12 +1332,12 @@ describe("Sidebar collapsible sections", () => {
 // "Load more" button with it, or the button floats under nothing.
 describe("Sidebar load-more vs collapsed Sessions", () => {
   it("hides Load more while Sessions is collapsed and restores it on expand", () => {
-    const rows = [conv("conv_mine", "Claude Code")];
+    // Use an empty page so totalVisible=0 → silent=false → "Load more" is visible.
     useConvMock.mockImplementation(
       () =>
         ({
           data: {
-            pages: [{ data: rows, first_id: rows[0]!.id, last_id: rows[0]!.id, has_more: true }],
+            pages: [{ data: [], first_id: null, last_id: null, has_more: true }],
             pageParams: [undefined],
           },
           isLoading: false,
@@ -1352,11 +1352,61 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
 
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
-    // Collapsed Sessions hides its rows AND the pagination affordance.
-    expect(screen.queryByText("conv_mine")).toBeNull();
+    // Collapsed Sessions hides the pagination affordance.
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+  });
+
+  it("loads subsequent pages silently when the current tab already has sessions", () => {
+    // When there are visible sessions, background pagination must not show a
+    // spinner or "Load more" — a persistent indicator makes the list look
+    // like it is still on its initial load (OMNI-6002: few mine sessions,
+    // many shared sessions across subsequent pages).
+    let observerCallback: IntersectionObserverCallback | undefined;
+    class TestObserver {
+      constructor(cb: IntersectionObserverCallback) {
+        observerCallback = cb;
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+      takeRecords = () => [];
+      root = null;
+      rootMargin = "";
+      thresholds = [];
+    }
+    vi.stubGlobal("IntersectionObserver", TestObserver);
+
+    const fetchNextPage = vi.fn();
+    const rows = [conv("conv_mine", "Claude Code")];
+    useConvMock.mockImplementation(
+      () =>
+        ({
+          data: {
+            pages: [{ data: rows, first_id: rows[0]!.id, last_id: rows[0]!.id, has_more: true }],
+            pageParams: [undefined],
+          },
+          isLoading: false,
+          isError: false,
+          error: null,
+          fetchNextPage,
+          hasNextPage: true,
+          isFetchingNextPage: false,
+        }) as unknown as ReturnType<typeof useConversations>,
+    );
+    renderSidebar();
+
+    // One mine session is visible — no "Load more" button and no "Loading…"
+    // spinner must be shown so it does not look like the list is stuck loading.
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+    expect(screen.queryByText("Loading…")).toBeNull();
+
+    // The sentinel is still observed so auto-fetch fires on intersection.
+    observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
+    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+
+    vi.unstubAllGlobals();
   });
 
   it("auto-fetches the next page when the sentinel scrolls into view (infinite scroll)", () => {
