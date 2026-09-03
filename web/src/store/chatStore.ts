@@ -43,6 +43,14 @@
 //     deduping by item id.
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
+import {
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { create } from "zustand";
 import type {
   AnyBlock,
@@ -1284,7 +1292,7 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   return prompt;
 }
 
-export const useChatStore = create<ChatState>((_rootSet, get) => ({
+const baseChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
   blocks: [],
@@ -2384,6 +2392,63 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 }));
+
+const ChatStoreScopeContext = createContext<string | null>(null);
+
+export function ChatStoreScopeProvider({
+  conversationId,
+  children,
+}: {
+  conversationId: string;
+  children: ReactNode;
+}) {
+  return createElement(ChatStoreScopeContext.Provider, { value: conversationId }, children);
+}
+
+function scopedChatState(conversationId: string): ChatState {
+  const root = baseChatStore.getState();
+  const entry = conversationRegistry.peek(conversationId);
+  return entry ? { ...root, ...entry.getState() } : root;
+}
+
+function useScopedChatStoreValue<T>(
+  conversationId: string | null,
+  selector: (state: ChatState) => T,
+  rootSelected: T,
+): T {
+  const subscribe = useCallback(
+    (onStoreChange: () => void) => {
+      if (conversationId === null) return () => {};
+      const unsubscribeRoot = baseChatStore.subscribe(onStoreChange);
+      const unsubscribeConversation = conversationRegistry.subscribe((changedId) => {
+        if (changedId === conversationId) onStoreChange();
+      });
+      return () => {
+        unsubscribeRoot();
+        unsubscribeConversation();
+      };
+    },
+    [conversationId],
+  );
+  const getSnapshot = useCallback(
+    () => (conversationId === null ? rootSelected : selector(scopedChatState(conversationId))),
+    [conversationId, rootSelected, selector],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+function identityChatState(state: ChatState): ChatState {
+  return state;
+}
+
+export const useChatStore = Object.assign(function useChatStore<T = ChatState>(
+  selector: (state: ChatState) => T = identityChatState as (state: ChatState) => T,
+): T {
+  const conversationId = useContext(ChatStoreScopeContext);
+  const rootSelected = baseChatStore(selector);
+  const scopedSelected = useScopedChatStoreValue(conversationId, selector, rootSelected);
+  return conversationId === null ? rootSelected : scopedSelected;
+}, baseChatStore) as typeof baseChatStore;
 
 // ── Store-action setter ──────────────────────────────────
 //
