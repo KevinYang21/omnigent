@@ -2184,10 +2184,8 @@ export function NewChatLandingScreen() {
     setAttachmentError(null);
   };
 
-  // Drag-and-drop — same behavior as the in-session composer: a file dropped
-  // anywhere on the landing surface attaches here (an inset ring on the box
-  // plus an overlay naming the target), while the shell around it is left
-  // alone. Declared after ``landingSurface``, which is the drop target.
+  // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
+  // the landing surface attaches here. Declared after ``landingSurface``.
   const isDragActive = useFileDropTarget(landingSurface, addFiles);
 
   // Gates the sandbox host option: only servers whose sandbox
@@ -4505,8 +4503,7 @@ export function NewChatLandingScreen() {
             </h1>
           ) : null}
         </div>
-        {/* Drop cue spanning the landing surface — files landing anywhere in
-            it attach to this composer. */}
+        {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <div className="relative flex w-full flex-col gap-1">
           <form

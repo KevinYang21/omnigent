@@ -25,14 +25,10 @@ The assertion pins to the chip's per-file remove control
 disappearing after the remove click.
 
 Drag-drop covers the whole chat column (``hooks/useFileDropTarget.ts``, bound to
-the ``[data-chat-surface]`` element): a file dropped on the transcript attaches
-to the composer, because dropping a screenshot into a chat has no other meaning
-and an unhandled drop makes the browser navigate away from the session to render
-the file. The shell around the chat — sidebar, workspace rail — is deliberately
-excluded. That needs a real browser: the drag is claimed only when
-``dataTransfer.types`` carries ``"Files"``, and ``preventDefault`` on
-``dragover`` is what makes a ``drop`` event fire at all — both of which jsdom
-approximates rather than implements.
+``[data-chat-surface]``), not just the composer box, and nothing outside it. It
+needs a real browser: the drag is claimed only when ``dataTransfer.types`` carries
+``"Files"``, and ``preventDefault`` on ``dragover`` is what makes a ``drop`` fire
+at all — both of which jsdom approximates rather than implements.
 """
 
 from __future__ import annotations
@@ -262,9 +258,8 @@ def test_failed_upload_restores_the_message(
     expect(composer).to_have_value("look at this file", timeout=10_000)
 
 
-# Synthesises an OS file drag in the page. Playwright can't drive a real
-# desktop-to-browser drag, but a page-built ``DataTransfer`` carrying a ``File``
-# produces the same events with the same ``types`` the handler reads.
+# Synthesises an OS file drag: Playwright can't drive a real desktop-to-browser
+# drag, but a page-built ``DataTransfer`` fires the same events.
 _DISPATCH_FILE_DRAG = """
 ([selector, types, name, body]) => {
   const target = document.querySelector(selector);
@@ -287,33 +282,29 @@ def test_file_dropped_on_the_transcript_attaches(
 ) -> None:
     """A file dropped on the transcript attaches to the composer.
 
-    The drop target used to be the composer box alone, so a screenshot dropped
-    on the transcript fell through to the browser, which navigated away from
-    the session to render the file — losing the page. Now the whole chat column
-    claims a file drag: the cue spans it and the file lands in composer state
-    wherever in it the drag was released.
+    The target used to be the composer box alone, so a screenshot dropped on the
+    transcript fell through to the browser, which navigated away from the session
+    to render the file — losing the page.
     """
     base_url, session_id = seeded_session
 
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
 
-    # The transcript is outside the composer box — the case that used to fail.
+    # Guards the premise: the drop lands outside the composer box.
     assert page.evaluate(
         "() => !document.querySelector('[role=log]').closest('[data-composer-card]')"
     ), "the transcript resolved inside the composer box — the test proves nothing"
 
-    # Dragging a file over the transcript lifts the chat-wide drop cue.
     page.evaluate(_DISPATCH_FILE_DRAG, ["[role=log]", ["dragenter"], "hover.txt", "x"])
     expect(page.get_by_test_id("file-drop-overlay")).to_be_visible(timeout=10_000)
 
-    # Releasing there attaches the file and clears the cue.
     handled = page.evaluate(
         _DISPATCH_FILE_DRAG,
         ["[role=log]", ["dragover", "drop"], _ATTACH_NAME, _ATTACH_BODY],
     )
-    # ``dispatchEvent`` returns False when the handler called preventDefault —
-    # i.e. the app claimed the drop instead of letting the browser open the file.
+    # False = preventDefault, i.e. the app claimed the drop instead of letting
+    # the browser open the file.
     assert handled is False, "the chat column did not claim the file drop"
 
     expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_be_visible(timeout=10_000)
@@ -325,9 +316,8 @@ def test_file_dropped_outside_the_chat_column_is_ignored(
 ) -> None:
     """A file dropped on the sidebar is not a composer attachment.
 
-    The drop target is the chat column, not the window: the shell around it
-    keeps whatever drag behavior it has, so nothing is claimed and no chip
-    appears.
+    The target is the chat column, not the window, so the shell around it keeps
+    whatever drag behavior it has.
     """
     base_url, session_id = seeded_session
 
@@ -347,8 +337,6 @@ def test_file_dropped_outside_the_chat_column_is_ignored(
         _DISPATCH_FILE_DRAG,
         [sidebar, ["dragenter", "dragover", "drop"], _ATTACH_NAME, _ATTACH_BODY],
     )
-    # Nothing claimed it (the browser's own default is left in place), and no
-    # cue or chip appeared.
     assert handled is True, "a drop outside the chat column was claimed"
     expect(page.get_by_test_id("file-drop-overlay")).to_have_count(0)
     expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_have_count(0)

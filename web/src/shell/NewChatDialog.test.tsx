@@ -3168,9 +3168,8 @@ describe("NewChatLandingScreen skill pills", () => {
   });
 });
 
-// A dataTransfer for an OS file drag. ``types`` is what the page-wide handler
-// reads during the drag (files are only exposed on drop), so it has to be set
-// for the drop cue to appear.
+// A dataTransfer for an OS file drag. ``types`` is what the handler reads
+// mid-drag — files are only exposed on drop.
 function fileDrag(files: File[] = []) {
   return { types: ["Files"], files };
 }
@@ -3212,9 +3211,7 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  // The whole landing surface is the drop target: a screenshot dragged onto the
-  // heading or the empty space beside the composer has no other meaning here,
-  // and unhandled it would make the browser navigate away to render the file.
+  // The whole landing surface is the drop target, not just the composer box.
   it("attaches files dropped anywhere on the landing surface, not just on the composer", () => {
     renderLanding();
     const surface = screen.getByTestId("new-chat-landing");
@@ -3226,8 +3223,7 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  // Outside that surface — the sidebar and the rest of the shell — a file drag
-  // is not an attachment and is left to whatever owns that region.
+  // Outside it — the sidebar and the rest of the shell — nothing is claimed.
   it("ignores files dropped outside the landing surface", () => {
     renderLanding();
     fireEvent.dragEnter(document.body, { dataTransfer: fileDrag() });

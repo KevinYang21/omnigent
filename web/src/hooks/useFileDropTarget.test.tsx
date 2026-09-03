@@ -3,15 +3,12 @@ import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useFileDropTarget } from "./useFileDropTarget";
 
-/** A dataTransfer for an OS file drag; `types` is the mid-drag file signal. */
+/** A dataTransfer for an OS file drag. */
 function fileDrag(files: File[] = []) {
   return { types: ["Files"], files };
 }
 
-/**
- * A drop target ("the chat column") with a child inside it and a sibling
- * outside it — the shell around the chat, which must keep its own behavior.
- */
+/** A drop target with a child inside it and a sibling outside it. */
 function Harness({ onFiles }: { onFiles: (files: File[]) => void }) {
   const [target, setTarget] = useState<HTMLElement | null>(null);
   const active = useFileDropTarget(target, onFiles);
@@ -43,8 +40,7 @@ describe("useFileDropTarget", () => {
     expect(onFiles).toHaveBeenCalledWith([file]);
   });
 
-  // The point of scoping: the shell around the chat (sidebar, workspace rail)
-  // is not an attachment surface, so a drop there is left to whatever owns it.
+  // The shell around the chat is not an attachment surface.
   it("ignores a drop outside the target", () => {
     const onFiles = vi.fn();
     render(<Harness onFiles={onFiles} />);
@@ -56,7 +52,7 @@ describe("useFileDropTarget", () => {
       dataTransfer: fileDrag([file]),
     });
 
-    // Not default-prevented either: nothing claimed the drop.
+    // Not default-prevented: nothing claimed the drop.
     expect(dropped).toBe(true);
     expect(onFiles).not.toHaveBeenCalled();
   });
@@ -72,9 +68,7 @@ describe("useFileDropTarget", () => {
     expect(state()).toBe("idle");
   });
 
-  // Enter/leave fire in pairs as the pointer crosses child elements. Without
-  // the depth count the affordance would flicker off the moment the drag
-  // moved from the column onto the transcript inside it.
+  // Without the depth count the cue flickers off on every child crossing.
   it("keeps the drag active while the pointer crosses child elements", () => {
     render(<Harness onFiles={vi.fn()} />);
     const target = screen.getByTestId("target");
@@ -97,8 +91,7 @@ describe("useFileDropTarget", () => {
     expect(state()).toBe("idle");
   });
 
-  // A text or link drag keeps its native meaning — dragging selected text
-  // into the composer textarea has to keep working.
+  // Dragging selected text into the composer textarea has to keep working.
   it("ignores a drag that carries no files", () => {
     const onFiles = vi.fn();
     render(<Harness onFiles={onFiles} />);
@@ -107,13 +100,13 @@ describe("useFileDropTarget", () => {
     fireEvent.dragEnter(screen.getByTestId("inside"), { dataTransfer: transfer });
     expect(state()).toBe("idle");
     const dropped = fireEvent.drop(screen.getByTestId("inside"), { dataTransfer: transfer });
-    // Not default-prevented: the browser still handles the text drop itself.
+    // The browser still handles the text drop itself.
     expect(dropped).toBe(true);
     expect(onFiles).not.toHaveBeenCalled();
   });
 
-  // Without preventDefault on dragover the drop event never fires, and the
-  // browser navigates away from the app to render the dropped file.
+  // No preventDefault on dragover → no drop event, and the browser opens the
+  // file over the app.
   it("claims a file drag so the browser does not open the file", () => {
     render(<Harness onFiles={vi.fn()} />);
     const target = screen.getByTestId("target");

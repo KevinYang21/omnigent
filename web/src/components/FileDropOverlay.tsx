@@ -1,10 +1,5 @@
-// Drop affordance for a file drag, covering the chat column it is portalled
-// into (see useFileDropTarget) rather than the whole viewport — the shell
-// around the chat is not a drop target.
-//
-// Portalled into the drop target itself so it spans the transcript and the
-// composer together, and pointer-events-none so it never sits between the drag
-// and the page.
+// Drop cue for a file drag, portalled into the drop target so it covers exactly
+// the region that accepts the drop. pointer-events-none keeps it out of the way.
 
 import { createPortal } from "react-dom";
 
