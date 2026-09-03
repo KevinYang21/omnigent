@@ -32,6 +32,8 @@ import httpx
 from omnigent import model_catalog
 
 if TYPE_CHECKING:
+    import configparser
+
     from openai import OpenAI, Stream
     from openai.types.chat import ChatCompletionChunk
 
@@ -750,13 +752,15 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
         f"Databricks authentication failed for workspace {host}. "
         f"Run: databricks auth login --host {host}"
     )
-    sp_sections = _databrickscfg_service_principal_sections()
+    # One parse of ~/.databrickscfg yields both the host-matching profiles and
+    # which of them are service principals; ordering then works off those sets.
+    matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(host)
     # User profiles that matched the host but failed to authenticate (e.g. an
     # expired OAuth grant). Tracked so we can warn if a lower-priority service
     # principal is then selected — otherwise the host would silently register
     # under the SP again, the exact wrong-identity symptom the ordering fixes.
     failed_user_profiles: list[str] = []
-    for profile_name in _host_profile_selection_order(host):
+    for profile_name in _order_profiles_by_identity_preference(matches, sp_sections):
         try:
             cfg = _sdk_config(profile=profile_name)
             cfg.authenticate()
@@ -800,8 +804,104 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
 
 
-def _host_profile_selection_order(host: str) -> list[str]:
-    """Order the host-matching profiles by identity preference.
+# Sentinel default_section: keeps [DEFAULT] a plain section carrying only its
+# own keys (no inheritance in either direction), so a [DEFAULT] user profile's
+# ``auth_type = databricks-cli`` cannot smear onto named SP sections and
+# misclassify them as user profiles.
+_NO_DEFAULT_INHERITANCE = "@omnigent-no-default-inheritance@"
+
+
+def _read_databrickscfg_no_inheritance() -> configparser.ConfigParser | None:
+    """Parse ``~/.databrickscfg`` with default-section inheritance disabled.
+
+    :returns: A ``ConfigParser`` whose ``[DEFAULT]`` is a plain section, or
+        ``None`` when the config file is missing or unparseable.
+    """
+    import configparser
+    from pathlib import Path
+
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
+    if not cfg_path.exists():
+        return None
+    config = configparser.ConfigParser(default_section=_NO_DEFAULT_INHERITANCE)
+    try:
+        config.read(cfg_path)
+    except configparser.Error:
+        return None
+    return config
+
+
+def _section_is_service_principal(options: configparser.SectionProxy) -> bool:
+    """Whether a ``~/.databrickscfg`` section holds M2M service-principal creds.
+
+    A section is a service principal when it carries ``client_id`` +
+    ``client_secret`` (or an explicit machine ``auth_type`` such as
+    ``oauth-m2m``) and no user-interactive ``auth_type`` overrides that.
+
+    :param options: The section mapping (a ``ConfigParser`` section).
+    :returns: ``True`` when the section is an M2M service principal.
+    """
+    # auth_type literals mirror the databricks-sdk's known types. A future SDK
+    # auth type not listed here falls through to the client_id + client_secret
+    # heuristic below, which still catches M2M SP sections.
+    user_auth_types = {"databricks-cli", "external-browser", "pat", "runtime"}
+    auth_type = options.get("auth_type", "").strip().lower()
+    if auth_type in user_auth_types:
+        return False
+    return auth_type in {"oauth-m2m", "azure-client-secret", "github-oidc-azure"} or (
+        "client_id" in options and "client_secret" in options
+    )
+
+
+def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], set[str]]:
+    """Host-matching profiles and which of them are service principals.
+
+    Parses ``~/.databrickscfg`` once and derives both, so the resolver
+    doesn't read the file twice per credential resolution. Host matching
+    still honours ``[DEFAULT]`` inheritance (a named section with no ``host``
+    of its own inherits the default's), replicated here on the
+    no-inheritance parse so SP classification is not polluted.
+
+    :param host: Workspace host to match, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: ``(matches, sp_sections)`` — matching section names in file
+        order (``"DEFAULT"`` included when it carries a matching host) and
+        the subset of *all* section names that are service principals.
+        ``([], set())`` when the file is missing or unparseable.
+    """
+
+    def _norm(value: str) -> str:
+        value = value.strip().rstrip("/")
+        return value.split("://", 1)[-1].lower()
+
+    config = _read_databrickscfg_no_inheritance()
+    if config is None:
+        return [], set()
+    wanted = _norm(host)
+    # With the sentinel default_section, the file's [DEFAULT] is a plain
+    # section named "DEFAULT"; its host is what named sections inherit.
+    default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
+    matches: list[str] = []
+    sp_sections: set[str] = set()
+    for section in config.sections():
+        options = config[section]
+        if _section_is_service_principal(options):
+            sp_sections.add(section)
+        if section == "DEFAULT":
+            # Ordered last, below, to mirror the file-order walk that keeps
+            # [DEFAULT] a fallback behind named sections.
+            continue
+        # A named section with no host of its own inherits [DEFAULT]'s host.
+        section_host = options.get("host", "") or default_host
+        if _norm(section_host) == wanted:
+            matches.append(section)
+    if default_host and _norm(default_host) == wanted:
+        matches.append("DEFAULT")
+    return matches, sp_sections
+
+
+def _order_profiles_by_identity_preference(matches: list[str], sp_sections: set[str]) -> list[str]:
+    """Order host-matching profiles by identity preference.
 
     File order is identity-blind: an M2M service-principal section listed
     before the user's ``[DEFAULT]`` (U2M) section always wins a
@@ -811,71 +911,57 @@ def _host_profile_selection_order(host: str) -> list[str]:
     different account from the signed-in app user, so the user sees no
     live host. Order by intent instead:
 
-    1. The ``DATABRICKS_CONFIG_PROFILE`` profile, when it matches *host*
-       — an explicit selection always wins (even naming an SP profile).
+    1. The ``DATABRICKS_CONFIG_PROFILE`` profile, when it matches — an
+       explicit selection always wins (even naming an SP profile).
     2. User (U2M / PAT) profiles, in file order.
     3. M2M service-principal profiles, in file order — still reachable
        when they are the only credential for the host.
 
-    :param host: Workspace host to match, e.g.
-        ``"https://example.databricks.com"``.
-    :returns: Matching profile names, most-preferred first.
+    :param matches: Host-matching profile names, in file order.
+    :param sp_sections: Section names classified as service principals.
+    :returns: The matching profile names, most-preferred first.
     """
-    matches = _databrickscfg_profiles_for_host(host)
     if len(matches) < 2:
         return matches
     env_profile = (os.environ.get("DATABRICKS_CONFIG_PROFILE") or "").strip()
-    sp_sections = _databrickscfg_service_principal_sections()
     explicit = [name for name in matches if name == env_profile]
     users = [name for name in matches if name != env_profile and name not in sp_sections]
     sps = [name for name in matches if name != env_profile and name in sp_sections]
     return explicit + users + sps
 
 
+def _host_profile_selection_order(host: str) -> list[str]:
+    """Order the host-matching profiles for *host* by identity preference.
+
+    Thin wrapper over :func:`_databrickscfg_host_matches_and_sp_sections`
+    and :func:`_order_profiles_by_identity_preference` for callers/tests
+    that only need the ordered list from a host.
+
+    :param host: Workspace host to match, e.g.
+        ``"https://example.databricks.com"``.
+    :returns: Matching profile names, most-preferred first.
+    """
+    matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(host)
+    return _order_profiles_by_identity_preference(matches, sp_sections)
+
+
 def _databrickscfg_service_principal_sections() -> set[str]:
     """Section names in ``~/.databrickscfg`` holding M2M service-principal creds.
 
-    A section is a service principal when it carries ``client_id`` +
-    ``client_secret`` (or an explicit machine ``auth_type`` such as
-    ``oauth-m2m``) and no user-interactive ``auth_type`` overrides that.
-
-    Parsed with the ``DEFAULT`` section demoted to a regular section:
-    ConfigParser's default-section inheritance would otherwise smear a
-    ``[DEFAULT]`` user profile's ``auth_type = databricks-cli`` onto every
-    named SP section and misclassify it as a user profile.
+    See :func:`_section_is_service_principal` for the classification rule.
 
     :returns: The SP section names (``"DEFAULT"`` included when the
         default section itself is an SP), or ``set()`` when the config
         file is missing or unparseable.
     """
-    import configparser
-    from pathlib import Path
-
-    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE") or (Path.home() / ".databrickscfg"))
-    if not cfg_path.exists():
+    config = _read_databrickscfg_no_inheritance()
+    if config is None:
         return set()
-    # A sentinel default_section keeps [DEFAULT] a plain section with only
-    # its own keys (no inheritance in either direction).
-    config = configparser.ConfigParser(default_section="@omnigent-no-default-inheritance@")
-    try:
-        config.read(cfg_path)
-    except configparser.Error:
-        return set()
-    # auth_type literals mirror the databricks-sdk's known types. A future
-    # SDK auth type not listed here falls through to the client_id +
-    # client_secret heuristic below, which still catches M2M SP sections.
-    user_auth_types = {"databricks-cli", "external-browser", "pat", "runtime"}
-    sections: set[str] = set()
-    for section in config.sections():
-        options = config[section]
-        auth_type = options.get("auth_type", "").strip().lower()
-        if auth_type in user_auth_types:
-            continue
-        if auth_type in {"oauth-m2m", "azure-client-secret", "github-oidc-azure"} or (
-            "client_id" in options and "client_secret" in options
-        ):
-            sections.add(section)
-    return sections
+    # The sentinel default_section makes the file's [DEFAULT] a regular
+    # "DEFAULT" section, so it appears in sections() and is classified here.
+    return {
+        section for section in config.sections() if _section_is_service_principal(config[section])
+    }
 
 
 def _databrickscfg_profiles_for_host(host: str) -> list[str]:
