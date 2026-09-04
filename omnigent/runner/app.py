@@ -180,6 +180,9 @@ from omnigent.tools.builtins.load_skill import (
 
 _logger = logging.getLogger(__name__)
 
+# Bound on how long DELETE waits for a cancelled session init to unwind.
+_SESSION_INIT_CANCEL_TIMEOUT_S = 10.0
+
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay
 # pending before the configured rows are served instead. Module-level so
@@ -4291,9 +4294,28 @@ def create_runner_app(
         ]
         for init_task in init_tasks:
             init_task.cancel()
-        for init_task in init_tasks:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await init_task
+        if init_tasks:
+            # asyncio.wait absorbs the CancelledErrors and bounds the wait on a
+            # hung cancellation, mirroring _cancel_auto_forwarder_task. A real
+            # init failure is logged rather than raised: the teardown below has
+            # to run either way, or the servers this cancel exists to reap leak
+            # anyway.
+            _finished, pending = await asyncio.wait(
+                set(init_tasks), timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+            )
+            if pending:
+                _logger.warning(
+                    "Cancelled session init for %s did not finish within %.0fs",
+                    session_id,
+                    _SESSION_INIT_CANCEL_TIMEOUT_S,
+                )
+            for done_task in _finished:
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    _logger.warning(
+                        "Session init for %s failed while being cancelled: %r",
+                        session_id,
+                        done_task.exception(),
+                    )
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
             turn_task.cancel()
