@@ -1331,6 +1331,10 @@ describe("Sidebar collapsible sections", () => {
 // Pagination belongs to the Sessions list: collapsing it must take the
 // "Load more" button with it, or the button floats under nothing.
 describe("Sidebar load-more vs collapsed Sessions", () => {
+  // Restore any globally-stubbed APIs after every test so stubs don't leak
+  // into later tests when an assertion throws before the in-test cleanup.
+  afterEach(() => vi.unstubAllGlobals());
+
   it("hides Load more while Sessions is collapsed and restores it on expand", () => {
     // Use an empty page so totalVisible=0 → silent=false → "Load more" is visible.
     useConvMock.mockImplementation(

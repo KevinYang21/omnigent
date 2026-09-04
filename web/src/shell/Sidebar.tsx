@@ -1094,9 +1094,12 @@ export function Sidebar({
 /**
  * Auto-loading pagination control. An IntersectionObserver fetches the next
  * page when this nears view (rooted on the scroll container, pre-fetching 200px
- * early for smoothness); the button stays clickable as an a11y /
- * no-IntersectionObserver fallback. Renders nothing once there's no more to
- * load. Shared by the global list and each project folder.
+ * early for smoothness). In the default (non-silent) mode the button is also
+ * directly clickable as an a11y / no-IntersectionObserver fallback. In silent
+ * mode (`silent=true`) a non-interactive 1px element anchors the observer
+ * without any visible UI — no click/focus fallback is available there. Renders
+ * nothing once there's no more to load. Shared by the global list and each
+ * project folder.
  */
 function InfiniteScrollSentinel({
   hasMore,
