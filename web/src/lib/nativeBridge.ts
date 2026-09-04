@@ -457,6 +457,19 @@ export function supportsBrowser(): boolean {
 }
 
 /**
+ * Navigate the conversation's embedded browser view to a URL as a user action
+ * (not agent-issued, so it skips the agent navigation allowlist). Returns false
+ * and no-ops outside a browser-capable shell, so callers can fall back to the
+ * system browser.
+ */
+export function browserNavigate(conversationId: string, url: string): boolean {
+  const api = electronApi();
+  if (typeof api?.browserOpenOrNavigate !== "function") return false;
+  void api.browserOpenOrNavigate(conversationId, url, undefined, { force: true });
+  return true;
+}
+
+/**
  * True when running inside the Electron desktop shell on macOS — the one
  * platform where the shell hides the native title bar (titleBarStyle
  * "hiddenInset") and the web layer must reserve space for the traffic

@@ -539,7 +539,14 @@ function SidebarNode({
   );
 }
 
-export function GithubPanel({ conversationId }: { conversationId: string }) {
+export function GithubPanel({
+  conversationId,
+  onOpenUrlInBrowser,
+}: {
+  conversationId: string;
+  /** Open a link in the embedded browser; absent off browser-capable shells. */
+  onOpenUrlInBrowser?: (url: string) => void;
+}) {
   // Poll for live CI status only while this panel is mounted (the status-line
   // indicator keeps the non-polling default). Self-limits to unsettled checks.
   const info = useGithubInfo(conversationId, { poll: true });
@@ -788,6 +795,16 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const pr = data.pr!;
   const checks = pr.checks;
 
+  // Left-click opens the PR in the embedded browser when available; modified
+  // clicks (new-tab/window intent) and non-browser shells fall through to the
+  // anchor's default target="_blank" → system browser.
+  const openPrInEmbeddedBrowser = (e: React.MouseEvent) => {
+    if (!onOpenUrlInBrowser) return;
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    e.preventDefault();
+    onOpenUrlInBrowser(pr.url);
+  };
+
   return (
     <TooltipProvider delayDuration={0}>
       <div className="flex h-full min-h-0 flex-col">
@@ -810,12 +827,23 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               href={pr.url}
               target="_blank"
               rel="noreferrer"
+              onClick={openPrInEmbeddedBrowser}
               className="group inline-flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
             >
               <span className="truncate">{pr.title}</span>
               <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
-              <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
+              {!onOpenUrlInBrowser && (
+                <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
+              )}
             </a>
+            {onOpenUrlInBrowser && (
+              <IconButton
+                label="Open in system browser"
+                onClick={() => window.open(pr.url, "_blank", "noreferrer")}
+              >
+                <ExternalLinkIcon className="size-3.5" />
+              </IconButton>
+            )}
           </div>
           {/* CI status checks (from the PR's statusCheckRollup), on their own
             line as pills; hover a pill to see the job names in that bucket. */}

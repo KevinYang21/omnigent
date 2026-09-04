@@ -577,6 +577,9 @@ interface WorkspacePanelProps {
   /** Whether the Browser tab is available — Electron shell only (hidden in a
    *  plain web build, which has no embedded WebContentsView). */
   showBrowserTab: boolean;
+  /** Open a URL in the embedded browser and surface the Browser tab. Provided
+   *  only on browser-capable shells; when absent, links open externally. */
+  onOpenUrlInBrowser?: (url: string) => void;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -674,6 +677,7 @@ export function WorkspacePanel({
   showFilesPanel,
   showGithubTab,
   showBrowserTab,
+  onOpenUrlInBrowser,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -982,7 +986,7 @@ export function WorkspacePanel({
           // measures this rail slot to position the native view over it.
           <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "github" && showGithubTab ? (
-          <GithubPanel conversationId={conversationId} />
+          <GithubPanel conversationId={conversationId} onOpenUrlInBrowser={onOpenUrlInBrowser} />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
         ) : (

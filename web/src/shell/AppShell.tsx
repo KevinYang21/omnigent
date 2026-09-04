@@ -22,6 +22,7 @@ import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
+  browserNavigate,
   isAndroidShell,
   isIOSShell,
   isMacElectronShell,
@@ -814,6 +815,19 @@ export function AppShell() {
       setRightPanelOpen(true);
     });
   }, []);
+
+  // Open a URL in the conversation's embedded browser and surface it: navigate
+  // the view, then switch to the Browser tab and open the rail. Used for links
+  // (e.g. the GitHub tab's PR link) that should open in-app rather than the
+  // system browser. No-op off a browser-capable shell, so callers fall back.
+  const openUrlInEmbeddedBrowser = useCallback(
+    (url: string) => {
+      if (!conversationId || !browserNavigate(conversationId, url)) return;
+      setRightRailTab("browser");
+      setRightPanelOpen(true);
+    },
+    [conversationId],
+  );
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
@@ -2035,6 +2049,9 @@ export function AppShell() {
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
                     showBrowserTab={railTabsAvailable.browser}
+                    onOpenUrlInBrowser={
+                      railTabsAvailable.browser ? openUrlInEmbeddedBrowser : undefined
+                    }
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}

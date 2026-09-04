@@ -75,11 +75,11 @@ function file(
   };
 }
 
-function renderPanel() {
+function renderPanel(props: { onOpenUrlInBrowser?: (url: string) => void } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <GithubPanel conversationId="conv_1" />
+      <GithubPanel conversationId="conv_1" {...props} />
     </QueryClientProvider>,
   );
 }
@@ -174,6 +174,24 @@ describe("GithubPanel", () => {
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
+  });
+
+  it("opens the PR in the embedded browser and offers a system-browser fallback", async () => {
+    const onOpenUrlInBrowser = vi.fn();
+    renderPanel({ onOpenUrlInBrowser });
+    const link = await screen.findByRole("link", { name: /chore: dummy PR/ });
+    fireEvent.click(link);
+    expect(onOpenUrlInBrowser).toHaveBeenCalledWith("https://example.com/pr/6000");
+    // The explicit escape hatch to the system browser is present.
+    expect(screen.getByRole("button", { name: "Open in system browser" })).toBeInTheDocument();
+  });
+
+  it("links the PR out to the system browser when no embedded browser is available", async () => {
+    renderPanel();
+    const link = await screen.findByRole("link", { name: /chore: dummy PR/ });
+    expect(link).toHaveAttribute("href", "https://example.com/pr/6000");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(screen.queryByRole("button", { name: "Open in system browser" })).toBeNull();
   });
 
   it("stacks a diff section per changed file", async () => {
