@@ -62,8 +62,8 @@ def test_writes_host_only_profile_and_sets_env(
 ) -> None:
     seen = _connected(monkeypatch)
     assert dc.configure_host_databricks("https://omni.example/", "host-1") is True
-    # Broker hit with the host token header, correct URL.
-    assert seen["url"] == "https://omni.example/v1/hosts/host-1/databricks-credential"
+    # Broker hit with the host token header, generic provider-keyed URL.
+    assert seen["url"] == "https://omni.example/v1/hosts/host-1/credentials/databricks"
     assert seen["headers"]["X-Omnigent-Host-Token"] == "host-tok"
     # Profile written with only the host (trailing slash stripped) — no token.
     cfg = configparser.ConfigParser()

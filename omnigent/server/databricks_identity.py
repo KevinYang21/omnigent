@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import logging
 
+from omnigent.connections.databricks import DatabricksConnectionStore
 from omnigent.db.utils import now_epoch
 from omnigent.server.databricks_app import DatabricksAppError
 from omnigent.server.databricks_app_client import DatabricksAppClient
-from omnigent.connections.databricks import DatabricksConnectionStore
 
 _logger = logging.getLogger(__name__)
 

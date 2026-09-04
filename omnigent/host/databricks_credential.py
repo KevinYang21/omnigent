@@ -10,10 +10,11 @@ sidecar recording the broker coordinates (server URL, host id, launch token).
 The Databricks **bearer is never persisted in the sandbox**. Instead, the
 command-based harnesses (codex / claude / pi) mint it on demand: their gateway
 auth command falls back to :func:`main` here, which fetches the owner's
-server-refreshed token from the credential broker
-(:mod:`omnigent.server.routes.host_databricks`) each time it runs — the same
-per-op broker fetch the GitHub credential helper uses. The harness re-runs that
-command as tokens near expiry, so a long session refreshes without relaunch.
+server-refreshed token from the generic credential broker
+(:mod:`omnigent.server.routes.host_credentials`, ``provider=databricks``) each
+time it runs — the same per-op broker fetch the GitHub credential helper uses.
+The harness re-runs that command as tokens near expiry, so a long session
+refreshes without relaunch.
 
 The launch token in the sidecar is a lesser, expiring credential already present
 in this disposable sandbox (git's credential helper bakes the same token into
@@ -59,7 +60,9 @@ _SIDECAR_NAME = ".omnigent-databricks-broker.json"
 
 
 def _credential_url(server: str, host_id: str) -> str:
-    return f"{server.rstrip('/')}/v1/hosts/{host_id}/databricks-credential"
+    # Generic, provider-keyed host-credential broker (host_credentials.py); the
+    # dedicated per-provider route was removed in favor of this one.
+    return f"{server.rstrip('/')}/v1/hosts/{host_id}/credentials/databricks"
 
 
 def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
