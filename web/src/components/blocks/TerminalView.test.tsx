@@ -825,6 +825,11 @@ describe("mobile terminal key bar", () => {
     ]) {
       expect(within(bar).getByRole("button", { name: label })).toBeInTheDocument();
     }
+    // Shift+Tab shows its label as stacked words (no glyph); the accessible
+    // name stays "Shift + Tab" via aria-label.
+    const shiftTab = within(bar).getByRole("button", { name: "Shift + Tab" });
+    expect(shiftTab).toHaveTextContent("SHIFT");
+    expect(shiftTab).toHaveTextContent("TAB");
   });
 
   it("does not render the key bar on a desktop viewport", async () => {

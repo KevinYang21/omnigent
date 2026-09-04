@@ -787,22 +787,24 @@ export function TerminalView({
 }
 
 /**
- * The on-screen keys, left→right. Arrows render as icons; Esc and Shift+Tab
- * as glyphs (lucide has no icon for either), grouped so the arrow cluster
- * reads as a unit between them.
+ * The on-screen keys, left→right. Arrows render as icons; Esc renders as a
+ * glyph and Shift+Tab as stacked words (lucide has no icon for either),
+ * grouped so the arrow cluster reads as a unit between them.
  */
 const MOBILE_KEYS: readonly {
   key: TerminalMobileKey;
   label: string;
   icon?: LucideIcon;
   glyph?: string;
+  /** Stacked text lines, for keys with no single glyph (e.g. Shift+Tab). */
+  lines?: readonly string[];
 }[] = [
   { key: "escape", label: "Escape", glyph: "esc" },
   { key: "left", label: "Left arrow", icon: ArrowLeftIcon },
   { key: "up", label: "Up arrow", icon: ArrowUpIcon },
   { key: "down", label: "Down arrow", icon: ArrowDownIcon },
   { key: "right", label: "Right arrow", icon: ArrowRightIcon },
-  { key: "shift-tab", label: "Shift + Tab", glyph: "⇧⇥" },
+  { key: "shift-tab", label: "Shift + Tab", lines: ["SHIFT", "TAB"] },
 ];
 
 /**
@@ -818,7 +820,7 @@ function MobileKeyBar({ onKey }: { onKey: (key: TerminalMobileKey) => void }) {
       data-testid="terminal-mobile-keys"
       className="flex shrink-0 items-stretch gap-1 border-border border-t px-1 pt-1"
     >
-      {MOBILE_KEYS.map(({ key, label, icon: Icon, glyph }) => (
+      {MOBILE_KEYS.map(({ key, label, icon: Icon, glyph, lines }) => (
         <Button
           key={key}
           type="button"
@@ -836,6 +838,15 @@ function MobileKeyBar({ onKey }: { onKey: (key: TerminalMobileKey) => void }) {
         >
           {Icon ? (
             <Icon className="size-4" aria-hidden />
+          ) : lines ? (
+            <span
+              aria-hidden
+              className="flex flex-col items-center font-semibold text-[9px] leading-tight tracking-tight"
+            >
+              {lines.map((line) => (
+                <span key={line}>{line}</span>
+              ))}
+            </span>
           ) : (
             <span aria-hidden className="text-sm">
               {glyph}
