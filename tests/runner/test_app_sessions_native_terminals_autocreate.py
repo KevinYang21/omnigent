@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1542,10 +1543,12 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         session_id: str,
         external_session_id: str,
         workspace: Path,
-    ) -> Path:
+    ) -> Path | None:
         """Record the resume id and return a transcript path."""
         del client, session_id, workspace
         synth_calls.append(external_session_id)
+        if snapshot_external_id is None:
+            return None
         return tmp_path / f"{external_session_id}.jsonl"
 
     monkeypatch.setattr(
@@ -1576,6 +1579,16 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
                         return {"labels": {}}
 
                 return _LabelsResponse()
+
+            if url.endswith("/items"):
+
+                class _ItemsResponse(NullServerClient._Response):
+                    """No committed history keeps a truly fresh launch blank."""
+
+                    def json(self) -> dict[str, Any]:
+                        return {"data": [], "has_more": False}
+
+                return _ItemsResponse()
 
             assert url == "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2"
 
@@ -1639,11 +1652,12 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         f"transcript is re-posted."
     )
 
-    # ``start_at_end`` must be correct *because* the resume branch ran, not
-    # by coincidence: synthesis happens exactly when (and only when) the
-    # snapshot carried an external session id.
+    # ``start_at_end`` must be correct because the resume branch ran, not by
+    # coincidence. A missing id now also attempts mint+synthesis; this fixture
+    # returns no history so that case remains a genuinely fresh launch.
     if snapshot_external_id is None:
-        assert synth_calls == []
+        assert len(synth_calls) == 1
+        uuid.UUID(synth_calls[0])
     else:
         assert synth_calls == [snapshot_external_id]
 
