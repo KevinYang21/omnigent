@@ -1464,9 +1464,13 @@ async def _auto_create_opencode_terminal(
     except BaseException:
         # Includes CancelledError: session teardown can cancel this create
         # while it is still materializing the OpenCode session, and nothing
-        # else owns the just-spawned server yet.
-        await server.close()
+        # else owns the just-spawned server yet. Drop the registry entry
+        # before closing, and suppress the close, the way the forwarder
+        # supervisor's finally does: a close that raises must not strand a
+        # stale registry entry, nor replace the exception being propagated.
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        with contextlib.suppress(Exception):
+            await server.close()
         raise
 
     # Start the SSE forwarder in the background so session creation never
@@ -1535,10 +1539,12 @@ async def _auto_create_opencode_terminal(
         )
     except BaseException:
         # Includes CancelledError: a teardown that lands before the terminal
-        # registers must still reap the forwarder and its server.
+        # registers must still reap the forwarder and its server. Pop before
+        # closing, and suppress the close, for the same reason as above.
         await _cancel_auto_forwarder_task(session_id)
-        await server.close()
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        with contextlib.suppress(Exception):
+            await server.close()
         raise
 
     _logger.info(
