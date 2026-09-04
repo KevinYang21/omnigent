@@ -332,6 +332,7 @@ from omnigent.session_lifecycle import (
     title_without_closed_marker,
 )
 from omnigent.spec.types import (
+    DEFAULT_ASK_TIMEOUT,
     AgentSpec,
     Phase,
     PolicyAction,
@@ -2057,7 +2058,11 @@ async def _hold_native_ask_gate_impl(
         content_preview=json.dumps(data)[:1024],
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
-    timeout_s = float(resolve_ask_timeout(engine, result))
+    # When engine is None (broken-policy ask synthesized without a live engine)
+    # fall back to the spec-wide default so the gate still parks correctly.
+    timeout_s = float(
+        resolve_ask_timeout(engine, result) if engine is not None else DEFAULT_ASK_TIMEOUT
+    )
     # Use the caller-supplied id when present (hook retries re-attach to
     # the same elicitation); otherwise mint a fresh one so we can surface
     # this ASK in the native terminal before parking on the web verdict.
