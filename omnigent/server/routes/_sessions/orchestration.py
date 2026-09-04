@@ -6846,9 +6846,35 @@ async def _evaluate_tool_call_policy(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return None
-    engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
-    )
+    try:
+        engine = await asyncio.to_thread(
+            _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
+        )
+    except Exception as _build_exc:  # noqa: BLE001 — e.g. CEL compile error in policy factory
+        _logger.warning(
+            "TOOL_CALL policy engine build failed for session=%s; asking for manual approval: %s",
+            session_id,
+            _build_exc,
+            extra={"session_id": session_id},
+        )
+        elicitation_id = await _register_policy_elicitation(
+            session_id=session_id,
+            result=PolicyResult(
+                action=PolicyAction.ASK,
+                reason=f"Policy engine error — please approve or deny manually: {_build_exc}",
+            ),
+            arguments_preview=arguments_str,
+            conversation_store=conversation_store,
+        )
+        _pending_policy_ask_writes[elicitation_id] = _PendingPolicyAskWrites(
+            state_updates=None,
+            set_labels=None,
+        )
+        return {
+            "verdict": "pending",
+            "elicitation_id": elicitation_id,
+            "ask_timeout": None,
+        }
 
     try:
         args_payload = json.loads(arguments_str)

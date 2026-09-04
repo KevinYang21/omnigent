@@ -635,11 +635,11 @@ def register_events_routes(
                     artifact_store=artifact_store,
                 )
             except Exception as _policy_exc:
-                # Policy evaluation crashed (e.g. factory misconfigured).
-                # Log and treat as DENY so the session doesn't hang on
-                # "working" forever. The full cause is logged for admins;
-                # the denial reason returned to (and streamed at) the client
-                # stays generic so the raw exception text isn't exposed.
+                # Policy evaluation crashed (e.g. factory misconfigured / CEL
+                # compile error). Ask for manual approval rather than silently
+                # blocking — a broken policy should not invisibly veto every
+                # turn. Full cause logged for admins; the reason shown to the
+                # user stays generic so the raw exception text isn't exposed.
                 _logger.warning(
                     "Input policy evaluation failed for %s: %s",
                     session_id,
@@ -647,8 +647,8 @@ def register_events_routes(
                     exc_info=True,
                 )
                 _input_verdict = {
-                    "verdict": "deny",
-                    "reason": "Denied by policy (policy evaluation error).",
+                    "verdict": "ask",
+                    "reason": "Policy evaluation error — please approve or deny manually.",
                 }
             if _input_verdict is not None:
                 # DENY or ASK — don't forward to runner. Publish a
