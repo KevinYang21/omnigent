@@ -541,6 +541,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,
