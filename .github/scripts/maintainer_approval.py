@@ -43,6 +43,7 @@ def approval_decision(
     head_sha: str,
     maintainers: set[str],
     trusted_authors: set[str],
+    trusted_approvers: set[str],
     trusted_successors: set[str],
     reviews: list[dict[str, Any]],
     commits: list[dict[str, Any]],
@@ -50,7 +51,7 @@ def approval_decision(
     timeline: list[dict[str, Any]] | None = None,
 ) -> ApprovalDecision:
     """
-    Accept trusted authors, current approval, or trusted successor pushes.
+    Accept trusted authors, current approval, or a trusted bot successor approval.
 
     ``pushers`` maps a commit SHA to the logins GitHub authenticated as pushing
     it. Commit author/committer logins are derived from the commit email, which
@@ -58,6 +59,7 @@ def approval_decision(
     """
     maintainers = {login.casefold() for login in maintainers}
     trusted_authors = {login.casefold() for login in trusted_authors}
+    trusted_approvers = {login.casefold() for login in trusted_approvers}
     trusted_successors = {login.casefold() for login in trusted_successors}
     if author.casefold() in maintainers:
         return ApprovalDecision(True, f"Author @{author} is a maintainer.")
@@ -66,6 +68,14 @@ def approval_decision(
 
     commit_positions = {
         str(commit.get("sha") or ""): index for index, commit in enumerate(commits)
+    }
+    current_bot_approvers = {
+        login
+        for login, review in latest_decisive_reviews(reviews).items()
+        if login.casefold() in trusted_approvers
+        and (review.get("user") or {}).get("type") == "Bot"
+        and str(review.get("state") or "").upper() == "APPROVED"
+        and str(review.get("commit_id") or "") == head_sha
     }
     failures: list[str] = []
     for login, review in latest_decisive_reviews(reviews).items():
@@ -124,10 +134,17 @@ def approval_decision(
         ):
             failures.append(f"@{login}'s approval was not auto-dismissed by trusted automation")
             continue
+        if not current_bot_approvers:
+            failures.append(
+                f"@{login} approved {approved_sha[:9]} before trusted automation updated "
+                f"the PR; awaiting Otto approval of {head_sha[:9]}"
+            )
+            continue
+        bot_names = ", ".join(f"@{name}" for name in sorted(current_bot_approvers))
         return ApprovalDecision(
             True,
-            f"Maintainer @{login} approved {approved_sha[:9]}; only trusted "
-            f"automation pushed and committed through {head_sha[:9]}.",
+            f"Maintainer @{login} approved {approved_sha[:9]}; {bot_names} approved "
+            f"the trusted automation changes at {head_sha[:9]}.",
         )
 
     reason = "; ".join(failures) if failures else "awaiting approval from a maintainer"
@@ -227,6 +244,7 @@ def main() -> int:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
     parser.add_argument("--trusted-author", action="append", default=[])
+    parser.add_argument("--trusted-approver", action="append", default=[])
     parser.add_argument("--trusted-successor", action="append", default=[])
     args = parser.parse_args()
 
@@ -241,6 +259,7 @@ def main() -> int:
         head_sha=str((pull.get("head") or {}).get("sha") or ""),
         maintainers=maintainers(args.repository),
         trusted_authors=set(args.trusted_author),
+        trusted_approvers=set(args.trusted_approver),
         trusted_successors=set(args.trusted_successor),
         reviews=reviews,
         commits=commits,

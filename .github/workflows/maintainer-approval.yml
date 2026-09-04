@@ -60,4 +60,5 @@ jobs:
             --repository "$REPO" \
             --pr-number "$PR" \
             --trusted-author 'omni-resolve-agent[bot]' \
+            --trusted-approver 'omni-resolve-agent[bot]' \
             --trusted-successor 'omni-resolve-agent[bot]'

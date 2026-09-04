@@ -9,14 +9,25 @@ MAINTAINERS = {"maintainer"}
 TRUSTED = {"omni-resolve-agent[bot]"}
 
 
-def review(state: str, commit_id: str, *, submitted: str = "2026-09-01T00:00:00Z"):
+def review(
+    state: str,
+    commit_id: str,
+    *,
+    submitted: str = "2026-09-01T00:00:00Z",
+    login: str = "maintainer",
+    user_type: str = "User",
+):
     return {
         "id": 1,
         "state": state,
         "commit_id": commit_id,
         "submitted_at": submitted,
-        "user": {"login": "maintainer"},
+        "user": {"login": login, "type": user_type},
     }
+
+
+def bot_review(commit_id: str = "new", *, login: str = "omni-resolve-agent[bot]"):
+    return review("APPROVED", commit_id, login=login, user_type="Bot")
 
 
 def commit(sha: str, login: str = "omni-resolve-agent[bot]"):
@@ -63,6 +74,7 @@ def decide(
         head_sha=head,
         maintainers=MAINTAINERS,
         trusted_authors=TRUSTED,
+        trusted_approvers=TRUSTED,
         trusted_successors=TRUSTED,
         reviews=reviews,
         commits=commits,
@@ -89,21 +101,46 @@ def test_trusted_automation_author_passes_without_review():
 
 def test_approval_survives_trusted_same_repo_successor_commits():
     decision = decide(
-        reviews=[review("APPROVED", "old")],
+        reviews=[review("APPROVED", "old"), bot_review()],
         commits=[commit("old"), commit("new")],
     )
     assert decision.approved
-    assert "only trusted automation pushed and committed" in decision.reason
+    assert "omni-resolve-agent[bot]" in decision.reason
+
+
+def test_trusted_successors_require_a_current_otto_approval():
+    missing = decide(
+        reviews=[review("APPROVED", "old")],
+        commits=[commit("old"), commit("new")],
+    )
+    stale = decide(
+        reviews=[review("APPROVED", "old"), bot_review("old")],
+        commits=[commit("old"), commit("new")],
+    )
+    untrusted = decide(
+        reviews=[review("APPROVED", "old"), bot_review(login="other[bot]")],
+        commits=[commit("old"), commit("new")],
+    )
+    assert not missing.approved
+    assert not stale.approved
+    assert not untrusted.approved
+    assert "awaiting Otto approval" in missing.reason
+
+
+def test_otto_approval_without_a_human_predecessor_does_not_pass():
+    decision = decide(reviews=[bot_review()], commits=[commit("new")])
+    assert not decision.approved
+    assert "awaiting approval from a maintainer" in decision.reason
 
 
 def test_auto_dismissed_approval_survives_the_trusted_push_that_dismissed_it():
     decision = decide(
-        reviews=[review("DISMISSED", "old")],
+        reviews=[review("DISMISSED", "old"), bot_review()],
         commits=[commit("old"), commit("new")],
         timeline=[dismissal_event()],
     )
     assert decision.approved
-    assert "only trusted automation pushed and committed" in decision.reason
+    assert "omni-resolve-agent[bot]" in decision.reason
 
 
 def test_fork_head_requires_a_fresh_approval():
@@ -234,6 +271,7 @@ def test_maintainer_authored_pr_still_passes():
         head_sha="new",
         maintainers=MAINTAINERS,
         trusted_authors=TRUSTED,
+        trusted_approvers=TRUSTED,
         trusted_successors=TRUSTED,
         reviews=[],
         commits=[commit("new", "maintainer")],
