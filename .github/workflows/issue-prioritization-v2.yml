@@ -84,10 +84,10 @@ jobs:
           DATABRICKS_AUTH_TYPE: oauth-m2m
           GITHUB_TOKEN: ${{ github.token }}
           MODEL_ENDPOINT: ${{ vars.ISSUE_PRIORITIZATION_V2_MODEL_ENDPOINT }}
-          INTAKE: ${{ inputs.intake }}
-          APPLY: ${{ inputs.apply }}
-          MANUAL_DISPATCH: ${{ inputs.manual_dispatch }}
-          POST_DUPLICATE_COMMENTS: ${{ inputs.post_duplicate_comments }}
+          INTAKE: ${{ format('{0}', inputs.intake) }}
+          APPLY: ${{ format('{0}', inputs.apply) }}
+          MANUAL_DISPATCH: ${{ format('{0}', inputs.manual_dispatch) }}
+          POST_DUPLICATE_COMMENTS: ${{ format('{0}', inputs.post_duplicate_comments) }}
           REPO_POST_DUPLICATE_COMMENTS: ${{ vars.ISSUE_TRIAGE_POST_DUPLICATE_COMMENTS || 'false' }}
           CLOSE_DUPLICATES: ${{ vars.ISSUE_TRIAGE_CLOSE_DUPLICATES || 'false' }}
         run: |
