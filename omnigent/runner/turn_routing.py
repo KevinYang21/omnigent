@@ -736,6 +736,7 @@ class TurnRouter:
     token: str
     httpd: ThreadingHTTPServer
     _closed: bool = False
+    _advertisement_removed: bool = False
 
     def close(self) -> None:
         """Stop the server and remove its own advertisement.
@@ -749,6 +750,13 @@ class TurnRouter:
         self._closed = True
         self.httpd.shutdown()
         self.httpd.server_close()
+        self._remove_owned_advertisement()
+
+    def _remove_owned_advertisement(self) -> None:
+        """Remove the advertisement if it still names this router."""
+        if self._advertisement_removed:
+            return
+        self._advertisement_removed = True
         path = self.bridge_dir / ADVERTISEMENT_FILE
         try:
             advertised = json.loads(path.read_text(encoding="utf-8"))
@@ -1549,6 +1557,7 @@ async def _wait_for_cleared(
 # ── Per-session lifecycle (runner side) ────────────────────────────────────
 
 _session_routers: dict[str, TurnRouter] = {}
+_session_router_generations: dict[str, str] = {}
 _lifecycle_lock = threading.Lock()
 
 # Harnesses whose ``UserPromptSubmit`` hook reads a turn-router
@@ -1578,6 +1587,7 @@ def ensure_session_turn_router(
     harness: str | None = None,
     routing_enabled: bool = True,
     loop: asyncio.AbstractEventLoop | None = None,
+    owner_generation: str | None = None,
 ) -> TurnRouter | None:
     """Start (once) the loopback turn router serving *session_id*.
 
@@ -1596,6 +1606,8 @@ def ensure_session_turn_router(
         the absent advertisement as "do not register the route-turn hook" —
         so a session that will never route pays no per-prompt round trip.
     :param loop: Event loop owning the relay. ``None`` uses the running one.
+    :param owner_generation: Optional managed-startup generation adopting the
+        router. A later generation atomically supersedes the earlier owner.
     :returns: The running router handle, or ``None``.
     """
     if server_client is None or harness not in _TURN_HOOK_HARNESSES or not routing_enabled:
@@ -1612,6 +1624,10 @@ def ensure_session_turn_router(
                     session_id=session_id,
                     filename=ADVERTISEMENT_FILE,
                 )
+                if owner_generation is None:
+                    _session_router_generations.pop(session_id, None)
+                else:
+                    _session_router_generations[session_id] = owner_generation
                 return existing
             router = start_turn_router(
                 bridge_dir=bridge_dir,
@@ -1622,6 +1638,8 @@ def ensure_session_turn_router(
                 loop=resolver_loop,
             )
             _session_routers[session_id] = router
+            if owner_generation is not None:
+                _session_router_generations[session_id] = owner_generation
     except (OSError, RuntimeError):
         _logger.warning(
             "turn router could not start for session=%s harness=%s",
@@ -1637,7 +1655,12 @@ def ensure_session_turn_router(
     return router
 
 
-def shutdown_session_turn_router(session_id: str, router: TurnRouter | None = None) -> None:
+def shutdown_session_turn_router(
+    session_id: str,
+    router: TurnRouter | None = None,
+    *,
+    expected_owner_generation: str | None = None,
+) -> None:
     """Stop the turn router serving *session_id* and forget it.
 
     Cheap and safe for a session that never had one, and safe to call
@@ -1647,12 +1670,25 @@ def shutdown_session_turn_router(session_id: str, router: TurnRouter | None = No
     :param router: The handle the caller started. When given, the teardown
         is identity-scoped so a delayed teardown from a previous launch
         cannot close the router a re-create has since installed.
+    :param expected_owner_generation: When given, close only if this startup
+        generation still owns the router. Adoption and cleanup compare under
+        the same lifecycle lock.
     """
     with _lifecycle_lock:
         current = _session_routers.get(session_id)
+        if (
+            expected_owner_generation is not None
+            and _session_router_generations.get(session_id) != expected_owner_generation
+        ):
+            return
         if router is not None and current is not router:
             return
+        if current is not None:
+            # Keep the identity check and unlink atomic with successor
+            # installation. ``close`` will only stop the detached server.
+            current._remove_owned_advertisement()
         _session_routers.pop(session_id, None)
+        _session_router_generations.pop(session_id, None)
     if current is None:
         return
     with contextlib.suppress(Exception):

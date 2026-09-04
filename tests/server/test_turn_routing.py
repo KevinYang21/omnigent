@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -556,6 +557,149 @@ async def test_ensure_session_turn_router_is_idempotent(tmp_path: Path) -> None:
         shutdown_session_turn_router("conv_y", first)
     # Safe to tear down twice.
     shutdown_session_turn_router("conv_y", first)
+
+
+async def test_turn_router_generation_transfer_blocks_predecessor_shutdown(
+    tmp_path: Path,
+) -> None:
+    """A predecessor cannot close the router after a successor adopts it."""
+    first = ensure_session_turn_router(
+        "conv_generation",
+        bridge_dir=tmp_path / "first",
+        server_client=_FakeServerClient(),
+        harness="codex-native",
+        owner_generation="generation-a",
+    )
+    assert first is not None
+    try:
+        successor = ensure_session_turn_router(
+            "conv_generation",
+            bridge_dir=tmp_path / "successor",
+            server_client=_FakeServerClient(),
+            harness="codex-native",
+            owner_generation="generation-b",
+        )
+        assert successor is first
+
+        shutdown_session_turn_router(
+            "conv_generation",
+            first,
+            expected_owner_generation="generation-a",
+        )
+        still_owned = ensure_session_turn_router(
+            "conv_generation",
+            bridge_dir=tmp_path / "check",
+            server_client=_FakeServerClient(),
+            harness="codex-native",
+            owner_generation="generation-b",
+        )
+        assert still_owned is successor
+
+        shutdown_session_turn_router(
+            "conv_generation",
+            successor,
+            expected_owner_generation="generation-b",
+        )
+    finally:
+        shutdown_session_turn_router("conv_generation")
+
+
+def test_turn_router_shutdown_removes_advertisement_before_successor_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Advertisement removal stays atomic with registry detachment."""
+    session_id = "conv_turn_shutdown_successor"
+    bridge_dir = tmp_path / "shared"
+    advertisement = bridge_dir / ADVERTISEMENT_FILE
+    loop = asyncio.new_event_loop()
+    first = ensure_session_turn_router(
+        session_id,
+        bridge_dir=bridge_dir,
+        server_client=_FakeServerClient(),
+        harness="codex-native",
+        loop=loop,
+        owner_generation="generation-a",
+    )
+    assert first is not None
+    advertisement_read = threading.Event()
+    release_read = threading.Event()
+    successor_attempted = threading.Event()
+    successor_holder: list[Any] = []
+    thread_errors: list[BaseException] = []
+    original_read_text = Path.read_text
+
+    def _pause_after_predecessor_read(path: Path, *args: Any, **kwargs: Any) -> str:
+        value = original_read_text(path, *args, **kwargs)
+        if path == advertisement and threading.current_thread().name == "turn-predecessor":
+            advertisement_read.set()
+            if not release_read.wait(timeout=5):
+                raise TimeoutError("test did not release predecessor advertisement read")
+        return value
+
+    def _shutdown_predecessor() -> None:
+        try:
+            shutdown_session_turn_router(
+                session_id,
+                first,
+                expected_owner_generation="generation-a",
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            thread_errors.append(exc)
+
+    def _install_successor() -> None:
+        successor_attempted.set()
+        try:
+            successor_holder.append(
+                ensure_session_turn_router(
+                    session_id,
+                    bridge_dir=bridge_dir,
+                    server_client=_FakeServerClient(),
+                    harness="codex-native",
+                    loop=loop,
+                    owner_generation="generation-b",
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            thread_errors.append(exc)
+
+    monkeypatch.setattr(Path, "read_text", _pause_after_predecessor_read)
+    predecessor_thread = threading.Thread(
+        target=_shutdown_predecessor,
+        name="turn-predecessor",
+    )
+    successor_thread = threading.Thread(
+        target=_install_successor,
+        name="turn-successor",
+    )
+    predecessor_thread.start()
+    try:
+        assert advertisement_read.wait(timeout=5)
+        acquired_during_read = turn_routing._lifecycle_lock.acquire(blocking=False)
+        if acquired_during_read:
+            turn_routing._lifecycle_lock.release()
+        successor_thread.start()
+        assert successor_attempted.wait(timeout=5)
+    finally:
+        release_read.set()
+        predecessor_thread.join(timeout=5)
+        if successor_thread.ident is not None:
+            successor_thread.join(timeout=5)
+
+    try:
+        assert not predecessor_thread.is_alive()
+        assert not successor_thread.is_alive()
+        assert not acquired_during_read
+        assert thread_errors == []
+        assert len(successor_holder) == 1
+        successor = successor_holder[0]
+        assert successor is not None
+        assert successor is not first
+        advertised = json.loads(advertisement.read_text(encoding="utf-8"))
+        assert advertised["url"] == successor.url
+    finally:
+        shutdown_session_turn_router(session_id)
+        loop.close()
 
 
 # ── Server relay + replay ───────────────────────────────────────────

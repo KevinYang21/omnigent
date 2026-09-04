@@ -844,6 +844,38 @@ def _test_app_server(
     )
 
 
+async def test_app_server_readiness_keeps_component_watchdog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed callers cannot replace the app-server's fail-fast watchdog."""
+    from omnigent import codex_native_app_server
+
+    class _NeverReadyClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def connect(self) -> None:
+            raise OSError("not listening yet")
+
+        async def close(self) -> None:
+            return None
+
+    assert codex_native_app_server._CONNECT_TIMEOUT_SECONDS == 10.0
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _NeverReadyClient)
+    monkeypatch.setattr(codex_native_app_server, "_CONNECT_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(codex_native_app_server, "_CONNECT_RETRY_DELAY_SECONDS", 0.0)
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        tmp_path,
+    )
+
+    with pytest.raises(RuntimeError, match="Timed out waiting for Codex app-server socket"):
+        await server._wait_until_ready()
+
+
 async def test_start_upserts_mcp_server_config_across_relaunches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

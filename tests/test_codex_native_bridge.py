@@ -11,14 +11,18 @@ import pytest
 from omnigent import codex_native_bridge
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
+    CodexNativeStartupClaim,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
+    clear_bridge_runtime_state,
     clear_bridge_state,
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
+    ensure_bridge_startup_error_if_generation,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
+    read_bridge_startup_claim,
     read_bridge_startup_error,
     read_bridge_state,
     read_codex_config_model,
@@ -27,9 +31,13 @@ from omnigent.codex_native_bridge import (
     read_policy_hook_config,
     settle_pending_mcp_startup,
     update_active_turn_id,
+    update_bridge_startup_stage,
     update_mcp_server_startup,
+    write_bridge_startup_claim,
     write_bridge_startup_error,
+    write_bridge_startup_error_if_generation,
     write_bridge_state,
+    write_bridge_state_if_generation,
     write_codex_config_model,
     write_policy_hook_config,
 )
@@ -355,12 +363,154 @@ def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> No
     drops it before each launch so stale failures don't linger (issue #59).
     """
     assert read_bridge_startup_error(bridge_dir) is None
-
     write_bridge_startup_error(bridge_dir, "thread never started (TimeoutError)")
     assert read_bridge_startup_error(bridge_dir) == "thread never started (TimeoutError)"
 
     clear_bridge_state(bridge_dir)
     assert read_bridge_startup_error(bridge_dir) is None
+
+
+def test_clear_bridge_runtime_state_preserves_startup_error(bridge_dir: Path) -> None:
+    """Rollback removes stale live pointers without erasing its diagnosis."""
+    _seed_active_turn(bridge_dir, None)
+    update_mcp_server_startup(bridge_dir, "slow-mcp", status="starting")
+    write_bridge_startup_error(bridge_dir, "thread startup exceeded its managed deadline")
+    write_bridge_startup_claim(
+        bridge_dir,
+        CodexNativeStartupClaim(
+            generation="current-generation",
+            started_at_unix=100.0,
+            deadline_unix=280.0,
+            stage="waiting for thread/started",
+            updated_at_unix=120.0,
+        ),
+    )
+
+    cleared = clear_bridge_runtime_state(
+        bridge_dir,
+        expected_generation="current-generation",
+    )
+
+    assert cleared is True
+    assert read_bridge_state(bridge_dir) is None
+    assert read_mcp_startup(bridge_dir) == {}
+    assert read_bridge_startup_claim(bridge_dir) is None
+    assert read_bridge_startup_error(bridge_dir) == "thread startup exceeded its managed deadline"
+
+
+def test_bridge_startup_claim_round_trips_and_updates_stage(bridge_dir: Path) -> None:
+    """The executor can observe the runner's generation, expiry, and stage."""
+    claim = CodexNativeStartupClaim(
+        generation="claim-generation",
+        started_at_unix=100.0,
+        deadline_unix=280.0,
+        stage="starting app-server",
+        updated_at_unix=100.0,
+    )
+    write_bridge_startup_claim(bridge_dir, claim)
+
+    assert read_bridge_startup_claim(bridge_dir) == claim
+    assert update_bridge_startup_stage(
+        bridge_dir,
+        expected_generation=claim.generation,
+        stage="waiting for thread/started",
+    )
+    updated = read_bridge_startup_claim(bridge_dir)
+    assert updated is not None
+    assert updated.generation == claim.generation
+    assert updated.deadline_unix == claim.deadline_unix
+    assert updated.stage == "waiting for thread/started"
+
+
+@pytest.mark.parametrize(
+    "invalid_claim",
+    [
+        {
+            "generation": "not-finite",
+            "started_at_unix": 100.0,
+            "deadline_unix": float("nan"),
+            "stage": "waiting",
+            "updated_at_unix": 100.0,
+        },
+        {
+            "generation": "backwards",
+            "started_at_unix": 100.0,
+            "deadline_unix": 99.0,
+            "stage": "waiting",
+            "updated_at_unix": 100.0,
+        },
+    ],
+)
+def test_bridge_startup_claim_rejects_invalid_deadlines(
+    bridge_dir: Path,
+    invalid_claim: dict[str, object],
+) -> None:
+    """Corrupt claims cannot create an unbounded executor wait."""
+    (bridge_dir / "startup.json").write_text(json.dumps(invalid_claim), encoding="utf-8")
+
+    assert read_bridge_startup_claim(bridge_dir) is None
+
+
+def test_generation_guarded_writers_preserve_successor(bridge_dir: Path) -> None:
+    """A delayed predecessor cannot overwrite a successor's state or error."""
+    successor_claim = CodexNativeStartupClaim(
+        generation="successor",
+        started_at_unix=200.0,
+        deadline_unix=380.0,
+        stage="launching terminal",
+        updated_at_unix=200.0,
+    )
+    successor_state = CodexNativeBridgeState(
+        session_id="conv_successor",
+        socket_path="ws://127.0.0.1:2",
+        thread_id="thread_successor",
+        codex_home=str(bridge_dir / "successor-home"),
+    )
+    write_bridge_startup_claim(bridge_dir, successor_claim)
+    write_bridge_state(bridge_dir, successor_state)
+    write_bridge_startup_error(bridge_dir, "successor error")
+
+    assert not write_bridge_state_if_generation(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_old",
+            socket_path="ws://127.0.0.1:1",
+            thread_id="thread_old",
+            codex_home=str(bridge_dir / "old-home"),
+        ),
+        expected_generation="predecessor",
+    )
+    assert not write_bridge_startup_error_if_generation(
+        bridge_dir,
+        "predecessor error",
+        expected_generation="predecessor",
+    )
+    assert read_bridge_state(bridge_dir) == successor_state
+    assert read_bridge_startup_error(bridge_dir) == "successor error"
+
+
+def test_fallback_startup_error_preserves_specific_diagnosis(bridge_dir: Path) -> None:
+    """Rollback diagnostics never replace the phase's more useful error."""
+    claim = CodexNativeStartupClaim(
+        generation="current",
+        started_at_unix=100.0,
+        deadline_unix=280.0,
+        stage="waiting for thread/started",
+        updated_at_unix=120.0,
+    )
+    write_bridge_startup_claim(bridge_dir, claim)
+    write_bridge_startup_error_if_generation(
+        bridge_dir,
+        "specific thread-start timeout",
+        expected_generation=claim.generation,
+    )
+
+    assert ensure_bridge_startup_error_if_generation(
+        bridge_dir,
+        "generic rollback failure",
+        expected_generation=claim.generation,
+    )
+    assert read_bridge_startup_error(bridge_dir) == "specific thread-start timeout"
 
 
 def test_mcp_startup_updates_round_trip(bridge_dir: Path) -> None:
