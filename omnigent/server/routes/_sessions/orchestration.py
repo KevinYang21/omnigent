@@ -1987,7 +1987,7 @@ async def _hold_native_ask_gate_impl(
     session_id: str,
     phase: Phase,
     data: dict[str, Any],
-    engine: PolicyEngine,
+    engine: PolicyEngine | None,
     result: PolicyResult,
     conversation_store: ConversationStore,
     elicitation_id: str | None = None,
@@ -2087,9 +2087,9 @@ async def _hold_native_ask_gate_impl(
     if approved:
         # POLICIES.md §7.2: writes accumulated by the ASKing policy
         # land only on approve.
-        if result.set_labels:
+        if result.set_labels and engine is not None:
             engine.apply_label_writes(result.set_labels)
-        if result.state_updates:
+        if result.state_updates and engine is not None:
             with contextlib.suppress(ConversationNotFoundError):
                 engine.apply_state_updates(result.state_updates)
     return approved
@@ -7029,9 +7029,37 @@ async def _evaluate_input_policy(
     # can reason about attachments per-file instead of a merged string.
     request_content = {"user_content": user_text, "attachments": attachments}
 
-    engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
-    )
+    try:
+        engine = await asyncio.to_thread(
+            _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
+        )
+    except Exception as _build_exc:  # noqa: BLE001 — e.g. CEL compile error in policy factory
+        _logger.warning(
+            "REQUEST policy engine build failed for session=%s; asking for manual approval: %s",
+            session_id,
+            _build_exc,
+            extra={"session_id": session_id},
+        )
+        # Synthesize an ASK result and route it through the same server-side
+        # gate as normal ASK verdicts, so the user gets an approval card.
+        _ask_result = PolicyResult(
+            action=PolicyAction.ASK,
+            reason=f"Policy engine error — please approve or deny manually: {_build_exc}",
+        )
+        try:
+            approved = await _hold_native_ask_gate(
+                request,
+                session_id=session_id,
+                phase=Phase.REQUEST,
+                data=body.data,
+                engine=None,
+                result=_ask_result,
+                conversation_store=conversation_store,
+            )
+        except ElicitationDeclinedError as exc:
+            return {"verdict": "deny", "reason": exc.args[0] or "Denied by policy"}
+        return None if approved else {"verdict": "deny", "reason": _ask_result.reason}
+
     ctx = EvaluationContext(
         phase=Phase.REQUEST,
         content=request_content,

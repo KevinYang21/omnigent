@@ -635,11 +635,13 @@ def register_events_routes(
                     artifact_store=artifact_store,
                 )
             except Exception as _policy_exc:
-                # Policy evaluation crashed (e.g. factory misconfigured / CEL
-                # compile error). Ask for manual approval rather than silently
-                # blocking — a broken policy should not invisibly veto every
-                # turn. Full cause logged for admins; the reason shown to the
-                # user stays generic so the raw exception text isn't exposed.
+                # Unexpected crash outside the policy engine's own error
+                # handling (e.g. DB failure during spec load). Log and
+                # fail-closed so the session doesn't hang on "working"
+                # forever. CEL compile errors and broken callables are
+                # handled inside _evaluate_input_policy itself (via the
+                # engine build try/except) and reach here only on truly
+                # unexpected failures.
                 _logger.warning(
                     "Input policy evaluation failed for %s: %s",
                     session_id,
@@ -647,8 +649,8 @@ def register_events_routes(
                     exc_info=True,
                 )
                 _input_verdict = {
-                    "verdict": "ask",
-                    "reason": "Policy evaluation error — please approve or deny manually.",
+                    "verdict": "deny",
+                    "reason": "Denied by policy (policy evaluation error).",
                 }
             if _input_verdict is not None:
                 # DENY or ASK — don't forward to runner. Publish a

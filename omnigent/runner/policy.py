@@ -317,7 +317,10 @@ class RunnerToolPolicyGate:
                     pending_ask = PolicyVerdict(
                         action="ask",
                         policy_name=gated.name,
-                        reason=f"policy error — please approve or deny manually: {type(exc).__name__}: {exc}",
+                        reason=(
+                        f"policy error — please approve or deny manually:"
+                        f" {type(exc).__name__}: {exc}"
+                    ),
                     )
                 continue
             if result.action == PolicyAction.DENY:
