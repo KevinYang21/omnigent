@@ -6366,9 +6366,11 @@ async def _relay_runner_stream_once(
                         # full stream, so it can sanitize only this final
                         # buffered segment; text persisted at earlier tool-call
                         # boundaries is already durable (the turn still fails
-                        # with a persisted deny error item). Segment-complete
-                        # durable gating is the RESPONSE phase's job — the
-                        # boundary flush above evaluates it for every segment.
+                        # with a persisted deny error item). A policy bound
+                        # only to llm_response therefore does NOT gate those
+                        # earlier segments; segment-complete durable gating
+                        # requires a RESPONSE-phase binding, which the boundary
+                        # flush above evaluates for every segment.
                         _deny_reason = _llm_response_denied_turns.pop(session_id, None)
                         await _flush_relay_text(
                             conversation_store,
