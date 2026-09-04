@@ -1022,10 +1022,8 @@ async def forward_claude_transcript_to_session(
                             )
                         except Exception:  # noqa: BLE001
                             _logger.warning(
-                                "Failed to persist bounded compaction hook fallback; "
-                                "session=%s bridge_dir=%s",
+                                "Failed to persist bounded compaction hook fallback; session=%s",
                                 current_session_id,
-                                bridge_dir,
                                 exc_info=True,
                                 extra={"session_id": current_session_id},
                             )
