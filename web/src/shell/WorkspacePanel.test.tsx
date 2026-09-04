@@ -157,8 +157,9 @@ describe("WorkspacePanel surface presentation", () => {
     renderWorkspace({ variant: "session-column" });
 
     const panel = screen.getByRole("complementary", { name: "Workspace" });
-    expect(panel.className).toContain("md:h-[45%]");
-    expect(panel.className).toContain("@min-[720px]/session-column:md:w-[45%]");
+    expect(panel.className).toContain("md:basis-[var(--session-workspace-basis,45%)]");
+    expect(panel.className).toContain("md:w-full");
+    expect(panel.className).toContain("@min-[720px]/session-column:md:w-auto");
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {

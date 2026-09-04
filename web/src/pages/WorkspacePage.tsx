@@ -225,6 +225,7 @@ function WorkspaceLeafView({
   const closePane = useWorkspaceLayoutStore((state) => state.closePane);
   const sessionId = node.sessionId;
   const title = useWorkspacePaneTitle(sessionId ?? "");
+  const sessionDockRef = useRef<HTMLDivElement>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(() =>
     sessionId
       ? (readSessionWorkspaceState(sessionId).open ?? readDefaultWorkspacePanelOpen())
@@ -274,6 +275,12 @@ function WorkspaceLeafView({
     writeSessionWorkspaceState(sessionId, { open: next });
   };
 
+  const collapseWorkspace = () => {
+    if (!sessionId) return;
+    setWorkspaceOpen(false);
+    writeSessionWorkspaceState(sessionId, { open: false });
+  };
+
   const chat = sessionId ? (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <ChatStoreScopeProvider conversationId={sessionId}>
@@ -306,12 +313,19 @@ function WorkspaceLeafView({
             className="@container/session-column flex min-h-0 min-w-0 flex-1"
           >
             <div
+              ref={sessionDockRef}
               data-testid={`session-dock-${sessionId}`}
               className="flex min-h-0 min-w-0 flex-1 flex-col @min-[720px]/session-column:flex-row"
             >
               {chat}
               {workspaceOpen ? (
-                <SessionWorkspaceDock key={sessionId} conversationId={sessionId} label={title} />
+                <SessionWorkspaceDock
+                  key={sessionId}
+                  conversationId={sessionId}
+                  dockRef={sessionDockRef}
+                  label={title}
+                  onCollapse={collapseWorkspace}
+                />
               ) : null}
             </div>
           </div>

@@ -726,7 +726,7 @@ export function WorkspacePanel({
         maximized
           ? cn("md:absolute md:inset-0", variant === "global" && "md:border-l")
           : variant === "session-column"
-            ? "md:h-[45%] md:w-full md:shrink-0 md:border-t @min-[720px]/session-column:md:h-auto @min-[720px]/session-column:md:w-[45%] @min-[720px]/session-column:md:border-t-0 @min-[720px]/session-column:md:border-l"
+            ? "md:h-auto md:w-full md:basis-[var(--session-workspace-basis,45%)] md:shrink-0 md:border-t @min-[720px]/session-column:md:h-full @min-[720px]/session-column:md:w-auto @min-[720px]/session-column:md:border-t-0 @min-[720px]/session-column:md:border-l"
             : "md:shrink-0 md:border-l",
       )}
       style={maximized || variant === "session-column" ? undefined : { width }}

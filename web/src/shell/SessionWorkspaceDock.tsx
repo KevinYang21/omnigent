@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState, type RefObject } from "react";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversations } from "@/hooks/useConversations";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
@@ -15,14 +15,22 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 import { CloseShellDialog } from "./CloseShellDialog";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
+import { SessionDockSplitter, SESSION_WORKSPACE_BASIS_VAR } from "./SessionDockSplitter";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 interface SessionWorkspaceDockProps {
   conversationId: string;
+  dockRef: RefObject<HTMLDivElement | null>;
   label: string;
+  onCollapse: () => void;
 }
 
-export function SessionWorkspaceDock({ conversationId, label }: SessionWorkspaceDockProps) {
+export function SessionWorkspaceDock({
+  conversationId,
+  dockRef,
+  label,
+  onCollapse,
+}: SessionWorkspaceDockProps) {
   const persisted = useMemo(() => readSessionWorkspaceState(conversationId), [conversationId]);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(
     () => persisted.rightRailTab ?? "files",
@@ -41,6 +49,7 @@ export function SessionWorkspaceDock({ conversationId, label }: SessionWorkspace
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [maximized, setMaximized] = useState(false);
   const [terminalPendingClose, setTerminalPendingClose] = useState<string | null>(null);
+  const [paneSizePct, setPaneSizePct] = useState(() => persisted.paneSizePct ?? 45);
 
   const { data: conversationsData } = useConversations("", true);
   const listedConversation = useMemo(
@@ -95,6 +104,10 @@ export function SessionWorkspaceDock({ conversationId, label }: SessionWorkspace
       selectedTerminalKey,
     });
   }, [conversationId, openFiles, rightRailTab, selectedFilePath, selectedTerminalKey]);
+
+  useLayoutEffect(() => {
+    dockRef.current?.style.setProperty(SESSION_WORKSPACE_BASIS_VAR, `${paneSizePct}%`);
+  }, [dockRef, paneSizePct]);
 
   useEffect(() => {
     if (showFilesPanel || (rightRailTab !== "files" && rightRailTab !== "changes")) return;
@@ -158,8 +171,23 @@ export function SessionWorkspaceDock({ conversationId, label }: SessionWorkspace
       : pendingTerminal.name
     : null;
 
+  const resizePane = useCallback(
+    (nextSizePct: number) => {
+      setPaneSizePct(nextSizePct);
+      writeSessionWorkspaceState(conversationId, { paneSizePct: nextSizePct });
+    },
+    [conversationId],
+  );
+
   return (
     <>
+      <SessionDockSplitter
+        dockRef={dockRef}
+        label={label}
+        sizePct={paneSizePct}
+        onResize={resizePane}
+        onCollapse={onCollapse}
+      />
       <WorkspacePanel
         conversationId={conversationId}
         ariaLabel={`Workspace for ${label}`}
