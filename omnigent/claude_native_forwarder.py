@@ -2607,6 +2607,54 @@ def reset_transcript_forward_state(bridge_dir: Path, *, reset_hooks: bool = True
             (bridge_dir / filename).unlink()
 
 
+def prepare_transcript_forward_state_for_resume(
+    bridge_dir: Path,
+    transcript_path: Path,
+    *,
+    session_id: str,
+) -> bool:
+    """
+    Preserve a valid resume cursor or seed an invalid one at transcript EOF.
+
+    Local Claude transcripts are authoritative on cold resume.  Their durable
+    forwarding cursor is equally important: a valid cursor catches up any
+    locally-written tail, while an invalid cursor must not replay ambiguous
+    history.  In the latter case this function retains the transcript for
+    Claude, replaces only the cursor with an EOF cursor, and returns ``False``
+    so the caller can surface degraded synchronization to the user.
+
+    :returns: ``True`` only when the existing path, offset, and fingerprint
+        were all valid and the state was preserved unchanged.
+    """
+    state = _read_forward_state(bridge_dir)
+    if (
+        state is not None
+        and state.transcript_path == transcript_path
+        and state.byte_offset is not None
+        and state.cursor_fingerprint is not None
+    ):
+        validated = _validated_transcript_state(
+            state,
+            bridge_dir=bridge_dir,
+            session_id=session_id,
+        )
+        if validated == state:
+            return True
+
+    reset_transcript_forward_state(bridge_dir)
+    byte_offset = _transcript_end_offset(transcript_path)
+    _write_forward_state(
+        bridge_dir,
+        TranscriptForwardState(
+            transcript_path=transcript_path,
+            line_cursor=0,
+            byte_offset=byte_offset,
+            cursor_fingerprint=_jsonl_cursor_fingerprint(transcript_path, byte_offset),
+        ),
+    )
+    return False
+
+
 async def _ensure_hook_state(
     bridge_dir: Path,
     *,

@@ -97,6 +97,7 @@ from omnigent.claude_native_bridge import (
     url_component,
 )
 from omnigent.claude_native_forwarder import (
+    prepare_transcript_forward_state_for_resume,
     reset_transcript_forward_state,
     supervise_forwarder,
 )
@@ -281,6 +282,7 @@ def _managed_settings_paths() -> tuple[Path, ...]:
 
 
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SYNTHESIZED_RESUME_TRANSCRIPTS: set[Path] = set()
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
 _RESUME_ACTION_LEAVE = "leave"
@@ -4638,10 +4640,23 @@ async def _prepare_claude_terminal(
             "bridge dir prepared",
             startup_progress=startup_progress,
         )
-        reset_transcript_forward_state(bridge_dir)
+        resume_transcript: Path | None = None
+        if len(cold_resume_args) >= 2 and cold_resume_args[0] == "--resume":
+            resume_transcript = _find_claude_resume_transcript(
+                cold_resume_args[1],
+                workspace=Path.cwd().resolve(),
+            )
+        if resume_transcript is None:
+            reset_transcript_forward_state(bridge_dir)
+        else:
+            _prepare_cold_resume_forward_state(
+                bridge_dir=bridge_dir,
+                transcript=resume_transcript,
+                session_id=session_id,
+            )
         _mark_startup_step(
             startup_profiler,
-            "transcript forward state reset",
+            "transcript forward state prepared",
             startup_progress=startup_progress,
         )
         # Cold-resume args first so user-supplied tail args keep their relative position.
@@ -4683,6 +4698,36 @@ async def _prepare_claude_terminal(
         tmux_socket=launch_tmux.socket,
         tmux_target=launch_tmux.target,
     )
+
+
+def _prepare_cold_resume_forward_state(
+    *,
+    bridge_dir: Path,
+    transcript: Path,
+    session_id: str,
+) -> None:
+    """Preserve a valid local cursor or seed safely after the resume prefix."""
+    if transcript in _SYNTHESIZED_RESUME_TRANSCRIPTS:
+        _SYNTHESIZED_RESUME_TRANSCRIPTS.discard(transcript)
+        reset_transcript_forward_state(bridge_dir)
+        prepare_transcript_forward_state_for_resume(
+            bridge_dir,
+            transcript,
+            session_id=session_id,
+        )
+        return
+    if prepare_transcript_forward_state_for_resume(
+        bridge_dir,
+        transcript,
+        session_id=session_id,
+    ):
+        return
+    message = (
+        "Claude transcript forwarding cursor was invalid; resuming local "
+        "context but synchronization will continue from the transcript end."
+    )
+    click.echo(f"warning: {message}", err=True)
+    _logger.warning(message, extra={"session_id": session_id})
 
 
 async def _fetch_claude_session_labels(
@@ -4730,16 +4775,14 @@ async def _resolve_cold_resume_args(
 
     Looks up the claude session id captured into
     ``conversations.external_session_id`` and injects it so the new
-    terminal reattaches to the prior claude transcript. Fails loud if
-    the conversation isn't claude-native; warns and returns empty if
-    no external session id was ever captured, or if synthesizing the
-    local transcript yields no resumable records (an empty transcript
-    would make ``claude --resume`` exit instead of start).
+    terminal reattaches to the prior Claude transcript. If no id was
+    captured, mint one, reconstruct server history under it, and persist
+    it. A truly empty server history starts fresh with a warning.
 
     :param client: HTTP client for the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :returns: ``("--resume", "<claude_sid>")`` or ``()`` when no id is
-        mapped or there is no resumable history.
+    :returns: ``("--resume", "<claude_sid>")`` or ``()`` when server
+        history is empty and no local transcript can be resumed.
     :raises click.ClickException: Conversation missing or not claude-native.
     """
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
@@ -4768,17 +4811,13 @@ async def _resolve_cold_resume_args(
             f"{session_id}` to resume it through the right runtime.",
         )
     external_session_id = payload.get("external_session_id")
-    if not isinstance(external_session_id, str) or not external_session_id:
-        # Omnigent conv survives; claude side starts fresh. Warn on
-        # both channels: ``click.echo`` for the foreground user,
-        # ``_logger.warning`` for log aggregation (Sentry).
-        message = (
-            f"claude session id was never captured for {session_id!r}; "
-            f"resuming with no prior claude context."
-        )
-        click.echo(f"warning: {message}", err=True)
-        _logger.warning(message)
-        return ()
+    minted = (
+        not isinstance(external_session_id, str)
+        or not external_session_id
+        or _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id) is None
+    )
+    if minted:
+        external_session_id = str(uuid.uuid4())
     transcript = await _ensure_local_claude_resume_transcript(
         client,
         session_id=session_id,
@@ -4786,16 +4825,20 @@ async def _resolve_cold_resume_args(
         workspace=Path.cwd().resolve(),
     )
     if transcript is None:
-        # No resumable records: ``claude --resume`` against an empty (or
-        # absent) transcript exits with "No conversation found" instead of
-        # starting. Launch fresh — the Omnigent conv survives.
-        message = (
-            f"no resumable claude history for {session_id!r}; "
-            f"resuming with no prior claude context."
-        )
+        message = f"no Claude history exists for {session_id!r}; starting a fresh Claude session."
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
         return ()
+    if minted:
+        patch_resp = await client.patch(
+            f"/v1/sessions/{url_component(session_id)}",
+            json={"external_session_id": external_session_id},
+        )
+        if patch_resp.status_code >= 400:
+            raise click.ClickException(
+                f"Failed to persist Claude session id for {session_id!r} "
+                f"({patch_resp.status_code}): {error_text(patch_resp)}"
+            )
     return ("--resume", external_session_id)
 
 
@@ -4807,15 +4850,15 @@ async def _ensure_local_claude_resume_transcript(
     workspace: Path,
 ) -> Path | None:
     """
-    Refresh Claude Code's local JSONL transcript for cold resume.
+    Resolve Claude Code's local JSONL transcript for cold resume.
 
     Cross-machine resume has the Omnigent conversation and Claude external
     session id on the server, but not Claude Code's local
     ``~/.claude/projects/<cwd>/<sid>.jsonl`` file. Claude's
     ``--resume <sid>`` consults that local project transcript. The
-    wrapper always rewrites it from committed Omnigent items before launch so
-    Omnigent remains the source of truth when a previous local Claude JSONL
-    has diverged.
+    A valid local transcript is authoritative and is returned byte-for-byte
+    unchanged. Server reconstruction is used only when no valid local artifact
+    exists.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g.
@@ -4829,11 +4872,8 @@ async def _ensure_local_claude_resume_transcript(
         ``OMNIGENT_RUNNER_WORKSPACE``. Pass an already-resolved
         path (symlinks collapsed) so the project-dir encoding matches
         what Claude computes.
-    :returns: Path to the local transcript that was written; ``None`` if
-        *external_session_id* is not a safe transcript stem, or if the AP
-        history yields no resumable records (an empty transcript would make
-        ``claude --resume`` exit instead of start, so the caller must launch
-        fresh).
+    :returns: Path to a validated local or synthesized transcript; ``None``
+        if *external_session_id* is unsafe or server history is empty.
     :raises click.ClickException: If Omnigent history cannot be fetched or
         the transcript cannot be written.
     """
@@ -4845,25 +4885,18 @@ async def _ensure_local_claude_resume_transcript(
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
 
-    try:
-        items = await _fetch_all_session_items_for_claude_resume(client, session_id)
-    except _ResumeHistoryUnavailableError:
-        # Server history is unreachable (5xx / dropped connections at every
-        # page size), but an intact local transcript from a previous run on
-        # this machine can still resume the conversation — far better than
-        # silently starting blank. It may be somewhat stale relative to the
-        # server, which the resumed session tolerates. 4xx contract errors
-        # (plain ClickException) still propagate: the server explicitly
-        # rejected the conversation, so reviving local history is unsafe.
-        if _is_resumable_claude_transcript(target):
-            _logger.warning(
-                "Could not fetch server history for %r; resuming from the "
-                "existing local transcript %s",
-                session_id,
-                target,
-            )
-            return target
-        raise
+    for candidate in _claude_resume_transcript_candidates(
+        external_session_id,
+        workspace=current,
+    ):
+        if _is_resumable_claude_transcript(
+            candidate,
+            external_session_id=external_session_id,
+        ):
+            return candidate
+        _backup_unparseable_claude_transcript(candidate)
+
+    items = await _fetch_all_session_items_for_claude_resume(client, session_id)
     # Items are persisted with unresolved file_id attachment blocks;
     # fetch the bytes back so the rebuilt transcript can reference a
     # live local file instead of silently dropping the attachment.
@@ -4875,11 +4908,13 @@ async def _ensure_local_claude_resume_transcript(
         cwd=current,
         bridge_dir=bridge_dir_for_conversation_id(session_id),
     )
-    # Empty transcript → ``claude --resume`` exits fatally ("No conversation
-    # found"), killing the terminal-as-agent. Return None so the caller
-    # launches fresh instead of resuming nothing.
-    if not records:
+    if not items:
         return None
+    if not records:
+        raise click.ClickException(
+            f"Claude history for {session_id!r} is non-empty but contains no "
+            "resumable records; refusing to launch a blank session."
+        )
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
     try:
@@ -4894,22 +4929,85 @@ async def _ensure_local_claude_resume_transcript(
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
+    _SYNTHESIZED_RESUME_TRANSCRIPTS.add(target)
     return target
 
 
-def _is_resumable_claude_transcript(path: Path) -> bool:
+def _claude_resume_transcript_candidates(
+    external_session_id: str,
+    *,
+    workspace: Path,
+) -> list[Path]:
+    """Return current-workspace then prior-workspace transcript candidates."""
+    if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
+        return []
+    current = _claude_project_dir_for_cwd(workspace) / f"{external_session_id}.jsonl"
+    candidates = [current] if current.is_file() else []
+    if not _CLAUDE_PROJECTS_DIR.is_dir():
+        return candidates
+    prior = [
+        project_dir / f"{external_session_id}.jsonl"
+        for project_dir in _CLAUDE_PROJECTS_DIR.iterdir()
+        if project_dir.is_dir()
+        and (project_dir / f"{external_session_id}.jsonl").is_file()
+        and (project_dir / f"{external_session_id}.jsonl") != current
+    ]
+    prior.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return [*candidates, *prior]
+
+
+def _find_claude_resume_transcript(
+    external_session_id: str,
+    *,
+    workspace: Path,
+) -> Path | None:
+    """Find the first structurally resumable transcript in workspace order."""
+    for candidate in _claude_resume_transcript_candidates(
+        external_session_id,
+        workspace=workspace,
+    ):
+        if _is_resumable_claude_transcript(
+            candidate,
+            external_session_id=external_session_id,
+        ):
+            return candidate
+    return None
+
+
+def _backup_unparseable_claude_transcript(path: Path) -> Path:
+    """Copy an invalid local artifact aside before server reconstruction."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = path.with_name(f"{path.name}.omnigent-backup-{stamp}")
+    try:
+        shutil.copy2(path, backup)
+    except OSError as exc:
+        raise click.ClickException(
+            f"Failed to back up unparseable Claude transcript {path}: {exc}"
+        ) from exc
+    return backup
+
+
+def _is_resumable_claude_transcript(
+    path: Path,
+    *,
+    external_session_id: str | None = None,
+) -> bool:
     """
     Whether *path* holds a transcript ``claude --resume`` can start from.
 
     ``--resume`` against an empty or non-JSONL file exits fatally instead of
     starting, which for claude-native (terminal == agent) kills the session.
-    A transcript qualifies when at least one line parses as a JSON object —
-    the minimum Claude Code accepts as a conversation record.
+    Every non-empty line must be a JSON object, native session ids must match,
+    and ``cwd`` metadata must agree with the containing Claude project
+    directory. At least one structurally complete user or assistant message is
+    required.
 
     :param path: Candidate ``<sid>.jsonl`` transcript path.
     :returns: ``True`` when the file exists and holds a JSON-object line.
     """
     try:
+        resumable = False
+        seen_uuids: set[str] = set()
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -4919,7 +5017,35 @@ def _is_resumable_claude_transcript(path: Path) -> bool:
                     record = json.loads(line)
                 except ValueError:
                     return False
-                return isinstance(record, dict)
+                if not isinstance(record, dict):
+                    return False
+                record_session_id = record.get("sessionId")
+                if (
+                    external_session_id is not None
+                    and record_session_id is not None
+                    and record_session_id != external_session_id
+                ):
+                    return False
+                cwd = record.get("cwd")
+                if isinstance(cwd, str) and (
+                    _sanitize_claude_project_name(str(Path(cwd).resolve())) != path.parent.name
+                ):
+                    return False
+                record_uuid = record.get("uuid")
+                parent_uuid = record.get("parentUuid")
+                if isinstance(parent_uuid, str) and parent_uuid not in seen_uuids:
+                    return False
+                if isinstance(record_uuid, str):
+                    if record_uuid in seen_uuids:
+                        return False
+                    seen_uuids.add(record_uuid)
+                if (
+                    record.get("type") in {"user", "assistant"}
+                    and isinstance(record_uuid, str)
+                    and isinstance(record.get("message"), dict)
+                ):
+                    resumable = True
+        return resumable
     except (OSError, UnicodeDecodeError):
         # A binary/non-UTF-8 file raises mid-iteration, outside the per-line
         # JSON guard — it is just as unresumable as non-JSONL content.

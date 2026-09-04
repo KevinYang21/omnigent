@@ -2922,7 +2922,21 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
     target_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
     target_dir.mkdir(parents=True)
     local = target_dir / "sid123.jsonl"
-    local.write_text('{"type":"user"}\n', encoding="utf-8")
+    local.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "local-message",
+                "parentUuid": None,
+                "sessionId": "sid123",
+                "cwd": str(workspace),
+                "message": {"role": "user", "content": "local"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    original = local.read_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
@@ -2940,7 +2954,7 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
     assert written == local
     # The untouched local transcript is used as-is, never overwritten with
     # partial server state.
-    assert local.read_text(encoding="utf-8") == '{"type":"user"}\n'
+    assert local.read_bytes() == original
 
 
 @pytest.mark.asyncio
@@ -5227,19 +5241,12 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
 
 
 @pytest.mark.asyncio
-async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcript(
+async def test_resolve_cold_resume_args_reuses_existing_local_claude_transcript(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    Cold resume treats Omnigent history as source of truth over local JSONL.
-
-    Claude can leave a local ``~/.claude/projects/<cwd>/<sid>.jsonl``
-    that diverges from the Omnigent transcript we have persisted. The resume
-    path must still fetch Omnigent items and overwrite that stale file before
-    returning ``--resume <sid>``. If the helper reintroduces an early
-    return when the local target exists, this test keeps the stale line
-    and fails.
+    A resumable local transcript wins byte-for-byte without an items fetch.
     """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -5254,13 +5261,17 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
         json.dumps(
             {
                 "type": "user",
+                "uuid": "local-uuid",
+                "parentUuid": None,
                 "sessionId": "claude-uuid-abc",
+                "cwd": str(workspace.resolve()),
                 "message": {"role": "user", "content": "stale local text"},
             }
         )
         + "\n",
         encoding="utf-8",
     )
+    original = transcript_path.read_bytes()
     item_from_ap = {
         "id": "msg_user_fresh",
         "response_id": "resp_1",
@@ -5299,13 +5310,214 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
         args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
 
     assert args == ("--resume", "claude-uuid-abc")
-    assert item_requests == 1, "cold resume must fetch Omnigent items even when local JSONL exists"
-    records = [
-        json.loads(line)
-        for line in transcript_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [record["message"]["content"] for record in records] == ["fresh Omnigent text"]
+    assert item_requests == 0
+    assert transcript_path.read_bytes() == original
+
+
+def _write_resumable_local_transcript(path: Path, *, sid: str, cwd: Path, text: str) -> bytes:
+    """Write one structurally resumable Claude-native message."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    raw = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": f"uuid-{text}",
+                "parentUuid": None,
+                "sessionId": sid,
+                "cwd": str(cwd),
+                "message": {"role": "user", "content": text},
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode()
+    path.write_bytes(raw)
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_resume_searches_current_workspace_before_prior_without_server_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Current workspace wins; a valid prior workspace is the fallback."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    current = tmp_path / "current"
+    prior = tmp_path / "prior"
+    current_path = (
+        projects / claude_native._sanitize_claude_project_name(str(current)) / "sid.jsonl"
+    )
+    prior_path = projects / claude_native._sanitize_claude_project_name(str(prior)) / "sid.jsonl"
+    current_raw = _write_resumable_local_transcript(
+        current_path, sid="sid", cwd=current, text="current"
+    )
+    _write_resumable_local_transcript(prior_path, sid="sid", cwd=prior, text="prior")
+
+    def no_fetch(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server context fetch was unexpected: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(no_fetch), base_url="http://test"
+    ) as client:
+        resolved = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv",
+            external_session_id="sid",
+            workspace=current,
+        )
+    assert resolved == current_path
+    assert current_path.read_bytes() == current_raw
+
+    current_path.unlink()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(no_fetch), base_url="http://test"
+    ) as client:
+        resolved = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv",
+            external_session_id="sid",
+            workspace=current,
+        )
+    assert resolved == prior_path
+
+
+@pytest.mark.asyncio
+async def test_wrong_workspace_artifact_is_backed_up_then_synthesized(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Mismatched cwd metadata cannot masquerade as the current artifact."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    current = tmp_path / "current"
+    target = projects / claude_native._sanitize_claude_project_name(str(current)) / "sid.jsonl"
+    corrupt_raw = _write_resumable_local_transcript(
+        target,
+        sid="sid",
+        cwd=tmp_path / "different-workspace",
+        text="wrong",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_items_response_body(
+                [
+                    {
+                        "id": "msg_server",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "server"}],
+                    }
+                ]
+            ),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        resolved = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv",
+            external_session_id="sid",
+            workspace=current,
+        )
+    assert resolved == target
+    backups = list(target.parent.glob("sid.jsonl.omnigent-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == corrupt_raw
+    assert b"server" in target.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_nonempty_unconvertible_history_refuses_blank_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Non-empty history that converts to nothing is a user-visible error."""
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_items_response_body(
+                [{"id": "opaque_1", "type": "unknown", "content": "opaque"}]
+            ),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        with pytest.raises(click.ClickException, match="contains no resumable records"):
+            await claude_native._ensure_local_claude_resume_transcript(
+                client,
+                session_id="conv",
+                external_session_id="sid",
+                workspace=tmp_path / "workspace",
+            )
+
+
+def test_resume_cursor_preserved_or_reseeded_at_eof(tmp_path: Path) -> None:
+    """Valid cursor survives; stale fingerprint is replaced with EOF."""
+    from omnigent import claude_native_forwarder
+
+    transcript = tmp_path / "sid.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    bridge = tmp_path / "bridge"
+    offset = transcript.stat().st_size
+    state = claude_native_forwarder.TranscriptForwardState(
+        transcript_path=transcript,
+        line_cursor=1,
+        byte_offset=offset,
+        cursor_fingerprint=claude_native_forwarder._jsonl_cursor_fingerprint(transcript, offset),
+    )
+    claude_native_forwarder._write_forward_state(bridge, state)
+    before = (bridge / "transcript_forwarder.json").read_bytes()
+    assert claude_native_forwarder.prepare_transcript_forward_state_for_resume(
+        bridge, transcript, session_id="conv"
+    )
+    assert (bridge / "transcript_forwarder.json").read_bytes() == before
+
+    claude_native_forwarder._write_forward_state(
+        bridge,
+        claude_native_forwarder.TranscriptForwardState(
+            transcript_path=transcript,
+            line_cursor=1,
+        ),
+    )
+    assert not claude_native_forwarder.prepare_transcript_forward_state_for_resume(
+        bridge, transcript, session_id="conv"
+    )
+
+    transcript.write_bytes(b'{"type":"assistant"}\n')
+    assert not claude_native_forwarder.prepare_transcript_forward_state_for_resume(
+        bridge, transcript, session_id="conv"
+    )
+    reseeded = claude_native_forwarder._read_forward_state(bridge)
+    assert reseeded is not None
+    assert reseeded.byte_offset == transcript.stat().st_size
+    assert reseeded.transcript_path == transcript
+
+
+def test_invalid_local_resume_cursor_emits_degraded_sync_notice(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Local context still resumes, but a missing cursor is visible to users."""
+    transcript = tmp_path / "sid.jsonl"
+    transcript.write_bytes(b'{"type":"user"}\n')
+    bridge = tmp_path / "bridge"
+
+    claude_native._prepare_cold_resume_forward_state(
+        bridge_dir=bridge,
+        transcript=transcript,
+        session_id="conv",
+    )
+
+    assert "synchronization will continue from the transcript end" in capsys.readouterr().err
+    state = json.loads((bridge / "transcript_forwarder.json").read_text())
+    assert state["byte_offset"] == transcript.stat().st_size
 
 
 @pytest.mark.asyncio
@@ -5386,29 +5598,52 @@ async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_im
 
 @pytest.mark.asyncio
 async def test_resolve_cold_resume_args_warns_when_external_session_id_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """
-    Claude-native conv with no captured external_session_id (crashed
-    before first hook, etc.) returns ``()`` and prints a warning.
-    The Omnigent conv id still survives — the new terminal binds
-    to the same row — but Claude starts fresh. Critical: this
-    branch MUST NOT raise so the user can recover the conv even
-    when the prior claude side is unrecoverable.
+    Missing external_session_id mints, synthesizes, persists, and resumes.
     """
-    client = await _httpx_client_with_canned_response(
-        _conversation_response_body(
-            labels={"omnigent.wrapper": "claude-code-native-ui"},
-            external_session_id=None,
-        ),
-        200,
-    )
-    async with client:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    patches: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        if request.url.path.endswith("/items"):
+            return httpx.Response(
+                200,
+                json=_items_response_body(
+                    [
+                        {
+                            "id": "msg_restore",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "restore me"}],
+                        }
+                    ]
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_conversation_response_body(
+                labels={"omnigent.wrapper": "claude-code-native-ui"},
+                external_session_id=None,
+            ),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
         args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
-    assert args == ()
-    captured = capsys.readouterr()
-    # Warning lands on stderr (click.echo(..., err=True) in production).
-    assert "claude session id was never captured" in captured.err
+    assert args[0] == "--resume"
+    assert re.fullmatch(r"[0-9a-f-]{36}", args[1])
+    assert patches == [{"external_session_id": args[1]}]
+    assert list((tmp_path / "projects").rglob(f"{args[1]}.jsonl"))
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.asyncio
@@ -5459,7 +5694,7 @@ async def test_resolve_cold_resume_args_warning_lands_in_logger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Missing ``external_session_id`` warns via ``_logger.warning``.
+    Missing id plus empty history warns and starts fresh.
 
     The ``click.echo`` channel covers the foreground user; the
     logger channel covers post-hoc debug (log aggregation /
@@ -5487,6 +5722,7 @@ async def test_resolve_cold_resume_args_warning_lands_in_logger(
             external_session_id=None,
         ),
         200,
+        items=[],
     )
     async with client:
         result = await claude_native._resolve_cold_resume_args(client, "conv_abc")
@@ -5494,7 +5730,7 @@ async def test_resolve_cold_resume_args_warning_lands_in_logger(
     # Warning was issued — if a regression replaced
     # ``_logger.warning(...)`` with ``pass`` or a print, this
     # assertion catches it.
-    assert any("conv_abc" in m for m in captured_warnings), (
+    assert any("conv_abc" in m and "no Claude history" in m for m in captured_warnings), (
         f"Expected a WARNING mentioning 'conv_abc'; got {captured_warnings!r}"
     )
 
