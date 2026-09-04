@@ -65,6 +65,7 @@ _ENV_VARS_TO_CLEAR = (
 _BUNDLE_RESOURCE_KEY = "omnigent"
 
 _WHEEL_PREFIXES = ("omnigent-", "omnigent_client-", "omnigent_ui_sdk-")
+_BUILTIN_EXTENSION_WHEEL_PREFIXES = ("omnigent_canvas-",)
 
 
 def _log(msg: str) -> None:
@@ -253,6 +254,32 @@ def _classify_wheels(wheels: Iterable[Path]) -> _ClassifiedWheels:
         else:
             oversize.append(wheel)
     return _ClassifiedWheels(main=main_wheel, small=small, oversize=oversize)
+
+
+def _partition_built_wheels(
+    wheels: Iterable[Path], explicit_extensions: Iterable[Path] = ()
+) -> tuple[list[Path], list[Path]]:
+    """Separate core release wheels from bundled first-party extensions."""
+    explicit_paths = {wheel.resolve() for wheel in explicit_extensions}
+    core: list[Path] = []
+    extensions: list[Path] = []
+    unexpected: list[Path] = []
+    for wheel in wheels:
+        if wheel.name.startswith(_WHEEL_PREFIXES):
+            core.append(wheel)
+        elif wheel.name.startswith(_BUILTIN_EXTENSION_WHEEL_PREFIXES):
+            extensions.append(wheel)
+        elif wheel.resolve() in explicit_paths:
+            continue
+        else:
+            unexpected.append(wheel)
+    if unexpected:
+        names = ", ".join(wheel.name for wheel in unexpected)
+        raise SystemExit(
+            f"unexpected wheel(s) in dist/: {names}; pass additional extensions "
+            "with --extension-wheel from a separate output directory"
+        )
+    return core, extensions
 
 
 def _wheel_version(wheel: Path, prefix: str) -> str:
@@ -1054,11 +1081,17 @@ def main() -> int:
         if backups and not args.keep_version_bump:
             _restore_versions(backups)
 
-    classified = _classify_wheels(wheels)
+    explicit_extension_wheels = [wheel.resolve() for wheel in args.extension_wheel]
+    core_wheels, builtin_extension_wheels = _partition_built_wheels(
+        wheels, explicit_extension_wheels
+    )
+    classified = _classify_wheels(core_wheels)
     for wheel in wheels:
         size_mb = wheel.stat().st_size / 1024 / 1024
         _log(f"  {wheel.name}  {size_mb:.2f} MB")
-    if classified.oversize:
+    if classified.oversize or any(
+        wheel.stat().st_size > _WORKSPACE_WHEEL_LIMIT_BYTES for wheel in builtin_extension_wheels
+    ):
         raise SystemExit(
             "uv-based Databricks Apps deploys require every Omnigent wheel to "
             "fit under the 10 MB Workspace file cap. Reduce the Python payload "
@@ -1074,7 +1107,10 @@ def main() -> int:
     # wheels locally, then copy the new small wheels in.
     src = _src_dir()
     src.mkdir(parents=True, exist_ok=True)
-    extension_wheels = [wheel.resolve() for wheel in args.extension_wheel]
+    extension_wheels = [
+        *([] if args.skip_web_ui else builtin_extension_wheels),
+        *explicit_extension_wheels,
+    ]
     for wheel in extension_wheels:
         if not wheel.is_file():
             raise SystemExit(f"--extension-wheel {wheel} does not exist")

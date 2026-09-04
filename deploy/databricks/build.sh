@@ -11,6 +11,7 @@
 #   dist/omnigent-<version>-py3-none-any.whl
 #   dist/omnigent_client-<version>-py3-none-any.whl
 #   dist/omnigent_ui_sdk-<version>-py3-none-any.whl
+#   dist/omnigent_canvas-<version>-py3-none-any.whl (full web UI only)
 #   dist/web-ui.tar.gz    SPA archive, when EXTERNALIZE_WEB_UI=1
 
 set -euo pipefail
@@ -60,6 +61,11 @@ uv build --wheel --out-dir dist/ sdks/ui/
 
 echo "==> Building omnigent wheel"
 uv build --wheel --out-dir dist/ .
+
+if [[ "${SKIP_WEB_UI:-}" != "1" ]]; then
+    echo "==> Building Canvas extension wheel"
+    uv build --wheel --out-dir dist/ extensions/canvas/
+fi
 
 echo ""
 echo "Built wheels:"

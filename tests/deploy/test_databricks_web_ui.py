@@ -249,7 +249,7 @@ def test_build_sh_archives_the_spa_and_opts_out_when_run_for_real(tmp_path: Path
 
     # And every wheel build saw the opt-out, so setup.py cannot rebuild it back in.
     uv_calls = [line for line in command_log.read_text().splitlines() if line.startswith("uv|")]
-    assert len(uv_calls) == 3
+    assert len(uv_calls) == 4
     assert all(call.split("|", 2)[1] == "true" for call in uv_calls), uv_calls
 
 
@@ -301,7 +301,7 @@ def test_build_sh_leaves_the_spa_in_the_wheel_without_externalize(tmp_path: Path
 
     assert (repo / "omnigent" / "server" / "static" / "web-ui" / "index.html").is_file()
     uv_calls = [line for line in command_log.read_text().splitlines() if line.startswith("uv|")]
-    assert uv_calls == ["uv|<unset>"] * 3, uv_calls
+    assert uv_calls == ["uv|<unset>"] * 4, uv_calls
 
 
 def _write_executable(path: Path, content: str) -> None:
