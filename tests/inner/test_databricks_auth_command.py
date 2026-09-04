@@ -300,3 +300,20 @@ def test_an_explicit_fallback_is_not_overridden_by_the_broker(
     )
     assert "omnigent.host.databricks_credential" not in command
     assert "ucode-token" in command
+
+
+def test_no_sidecar_leaves_the_command_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Non-regression: with NO broker sidecar (a normal user with their own
+    Databricks profile, not a managed connect sandbox), the broker fallback adds
+    nothing — the command has no broker reference and no eval-fallback clause,
+    i.e. it is identical to the pre-change behaviour."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    cmd = databricks_bearer_token_command("https://example.databricks.com", "myprofile")
+    assert "omnigent.host.databricks_credential" not in cmd
+    # The eval-fallback clause is emitted ONLY when a fallback command is set.
+    assert "eval" not in cmd

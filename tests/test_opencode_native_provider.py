@@ -742,3 +742,13 @@ def test_mcp_progress_heartbeat_lifecycle() -> None:
         assert len(written_messages) == count_at_exit
     finally:
         bridge_mod._write_jsonrpc = orig_write
+
+
+def test_resolve_databricks_gateway_inert_without_profile() -> None:
+    """Non-regression: opencode's Databricks gateway is inert for a non-databricks
+    user — no profile means no gateway (None), so provider config is untouched and
+    a non-databricks opencode session is unaffected."""
+    from omnigent.opencode_native_provider import resolve_databricks_gateway
+
+    assert resolve_databricks_gateway(None) is None
+    assert resolve_databricks_gateway("") is None
