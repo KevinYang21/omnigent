@@ -84,6 +84,20 @@ Relinking the same plugin id updates its source path without deleting plugin
 config or state. Python and manifest changes are picked up the next time the
 popup opens; Herdr does not need to restart.
 
+## Launch
+
+The Herdr session name is arbitrary; it is not an Omnigent plugin setting:
+
+```sh
+herdr --session work
+```
+
+Each name selects an independent Herdr server, sidebar, layout, and plugin
+cache. Continue using `omnigent-spike` to retain the Spaces created during the
+prototype. Running `herdr` without `--session`, or choosing another name,
+opens a separate workspace set with a cold Omnigent cache. The plugin install,
+configuration, and keybinding are available to every local Herdr session.
+
 ## Picker workflow
 
 The popup paints its last persisted catalog immediately, then refreshes it in
@@ -150,8 +164,9 @@ persisted in the catalog cache.
 | `catalog_cache_file` | Herdr plugin state | Optional session-cache override. |
 | `agent_cache_file` | Herdr plugin state | Optional agent-cache override. |
 
-For a second Herdr session or server, caches and bindings are automatically
-separated by the Herdr socket and configured Omnigent origin.
+For a second Herdr session or server, default caches and bindings are
+automatically separated by the Herdr socket and configured Omnigent origin.
+Explicit state or cache file overrides should therefore use distinct paths.
 
 ## Optional status rows
 

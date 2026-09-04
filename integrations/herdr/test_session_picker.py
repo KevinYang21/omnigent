@@ -187,11 +187,18 @@ class PickerStateTest(unittest.TestCase):
 
         self.assertEqual(state.selected.session_id, selected)
 
-    def test_loading_or_error_never_allows_a_stale_selection_to_open(self) -> None:
-        state = PickerState()
-        state.set_records([record("old")])
+    def test_current_cached_selection_can_open_during_or_after_refresh(self) -> None:
+        state = PickerState(query="target", displayed_query="target")
+        state.set_records([record("target")])
+        state.loading = True
+        self.assertTrue(state.can_open)
+        state.loading = False
+        state.error = "search failed"
         self.assertTrue(state.can_open)
 
+    def test_stale_selection_cannot_open_during_or_after_refresh(self) -> None:
+        state = PickerState(query="target", displayed_query="previous")
+        state.set_records([record("old")])
         state.loading = True
         self.assertFalse(state.can_open)
         state.loading = False
@@ -627,6 +634,86 @@ class SessionSpaceBridgeTest(unittest.TestCase):
 
 
 class PickerInteractionTest(unittest.TestCase):
+    def test_cached_selection_opens_before_background_refresh_finishes(self) -> None:
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        class Bridge:
+            def __init__(self) -> None:
+                self.refresh_started = threading.Event()
+                self.release_refresh = threading.Event()
+                self.refresh_finished = threading.Event()
+                self.opened = threading.Event()
+                self.opened_records: list[SessionRecord] = []
+
+            def catalog(self, _query: str) -> list[SessionRecord]:
+                self.refresh_started.set()
+                self.release_refresh.wait(5)
+                self.refresh_finished.set()
+                raise PickerError("released test refresh")
+
+            def open(self, selected: SessionRecord) -> None:
+                self.opened_records.append(selected)
+                self.opened.set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = PickerConfig(
+                server="https://omnigent.example",
+                omnigent_executable="/opt/omnigent",
+                max_sessions=200,
+                debounce_seconds=0,
+                state_file=root / "state.json",
+                catalog_cache_file=root / "catalog.json",
+                agent_cache_file=root / "agents.json",
+                catalog_cache_scope="test",
+                fallback_cwd=root,
+                herdr_executable="/opt/herdr",
+            )
+            PersistentCatalogCache(config.catalog_cache_file, scope="test").store(
+                [
+                    replace(record("target"), title="Cached deployment target"),
+                    replace(record("other"), title="Unrelated session"),
+                ]
+            )
+            bridge = Bridge()
+            results: list[str | None] = []
+
+            def run() -> None:
+                results.append(
+                    run_picker(
+                        bridge,  # type: ignore[arg-type]
+                        config,
+                        input_stream=pipe,
+                        output_stream=DummyOutput(),
+                    )
+                )
+
+            with create_pipe_input() as pipe:
+                thread = threading.Thread(target=run)
+                thread.start()
+                try:
+                    self.assertTrue(bridge.refresh_started.wait(2))
+                    pipe.send_text("deployment target\r")
+                    self.assertTrue(
+                        bridge.opened.wait(1),
+                        "cached selection waited for the catalog refresh",
+                    )
+                    thread.join(2)
+                finally:
+                    bridge.release_refresh.set()
+                    self.assertTrue(bridge.refresh_finished.wait(2))
+                    if thread.is_alive():
+                        pipe.send_text("\x03")
+                        thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, ["target"])
+        self.assertEqual(
+            [opened.session_id for opened in bridge.opened_records],
+            ["target"],
+        )
+
     def test_multiline_initial_message_is_sent_once_despite_repeated_enter(self) -> None:
         from prompt_toolkit.input import create_pipe_input
         from prompt_toolkit.output import DummyOutput

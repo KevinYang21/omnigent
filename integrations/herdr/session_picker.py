@@ -488,11 +488,11 @@ class PickerState:
 
     @property
     def can_open(self) -> bool:
+        displayed_results_are_current = self.displayed_query == _normalize_query(self.query)
         return (
             self.selected is not None
-            and not self.loading
             and not self.opening
-            and self.error is None
+            and (displayed_results_are_current or (not self.loading and self.error is None))
         )
 
     def set_records(
