@@ -520,6 +520,35 @@ def fail_closed_hook_output(
     return None
 
 
+def fail_ask_hook_output(hook_event: str, detail: str | None = None) -> dict[str, object] | None:
+    """
+    Build the fail-ask hook output for an unobtainable policy verdict.
+
+    Like :func:`fail_closed_hook_output` but for ``PreToolUse``: instead of
+    auto-denying the tool call, returns ``None`` so the harness falls back to
+    its own native approval dialog. This preserves human oversight when the
+    policy server is transiently unreachable — the user still decides — rather
+    than blocking all tool calls until the server recovers.
+
+    ``UserPromptSubmit`` still blocks (fail-closed) because it is the sole
+    pre-turn enforcement gate for native sessions; a server hiccup must not
+    let an over-budget or otherwise-blocked request proceed silently.
+
+    Use this for harnesses whose native TUI has an interactive approval UI
+    (claude-native, codex-native). For headless harnesses where no approval
+    UI is available, prefer :func:`fail_closed_hook_output`.
+
+    :param hook_event: Hook event name, e.g. ``"PreToolUse"``.
+    :param detail: Optional diagnostic string, forwarded to
+        :func:`fail_closed_hook_output` for non-PreToolUse events.
+    :returns: ``None`` for ``PreToolUse`` (fall through to native dialog);
+        delegates to :func:`fail_closed_hook_output` for all other events.
+    """
+    if hook_event == _PRE_TOOL_USE:
+        return None
+    return fail_closed_hook_output(hook_event, detail)
+
+
 def post_evaluate_with_retry(
     url: str,
     headers: dict[str, str],

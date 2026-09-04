@@ -9,6 +9,7 @@ from omnigent import native_policy_hook
 from omnigent.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
+    fail_ask_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
     post_evaluate_with_retry,
@@ -372,6 +373,45 @@ def test_fail_closed_unknown_event_fails_open() -> None:
     accidentally blocking — the conservative default for an unknown gate.
     """
     assert fail_closed_hook_output("SomeNewEvent") is None
+
+
+def test_fail_ask_pre_tool_use_returns_none() -> None:
+    """
+    ``fail_ask_hook_output`` returns ``None`` for ``PreToolUse``.
+
+    Returning ``None`` (no hook output) makes the harness fall back to its
+    own native approval dialog instead of auto-denying, preserving human
+    oversight when the policy server is transiently unreachable.
+    """
+    assert fail_ask_hook_output("PreToolUse") is None
+
+
+def test_fail_ask_pre_tool_use_with_detail_returns_none() -> None:
+    """Detail string does not change the fail-ask PreToolUse output."""
+    assert fail_ask_hook_output("PreToolUse", "server connection refused") is None
+
+
+def test_fail_ask_user_prompt_submit_still_fails_closed() -> None:
+    """
+    ``fail_ask_hook_output`` still blocks ``UserPromptSubmit``.
+
+    The request gate is the sole pre-turn enforcement point; a server
+    hiccup must not silently allow an over-budget or blocked request.
+    """
+    output = fail_ask_hook_output("UserPromptSubmit")
+    assert output is not None
+    assert output["decision"] == "block"
+    assert output["reason"]
+
+
+def test_fail_ask_post_tool_use_fails_open() -> None:
+    """``PostToolUse`` fails open under fail-ask, same as fail-closed."""
+    assert fail_ask_hook_output("PostToolUse") is None
+
+
+def test_fail_ask_unknown_event_fails_open() -> None:
+    """Unknown events fail open under fail-ask."""
+    assert fail_ask_hook_output("SomeNewEvent") is None
 
 
 def _resp(status: int, location: str | None = None) -> httpx.Response:
