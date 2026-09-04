@@ -13,6 +13,7 @@ from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
+    clear_bridge_runtime_state,
     clear_bridge_state,
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
@@ -29,6 +30,7 @@ from omnigent.codex_native_bridge import (
     update_active_turn_id,
     update_mcp_server_startup,
     write_bridge_startup_error,
+    write_bridge_startup_generation,
     write_bridge_state,
     write_codex_config_model,
     write_policy_hook_config,
@@ -355,12 +357,29 @@ def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> No
     drops it before each launch so stale failures don't linger (issue #59).
     """
     assert read_bridge_startup_error(bridge_dir) is None
-
     write_bridge_startup_error(bridge_dir, "thread never started (TimeoutError)")
     assert read_bridge_startup_error(bridge_dir) == "thread never started (TimeoutError)"
 
     clear_bridge_state(bridge_dir)
     assert read_bridge_startup_error(bridge_dir) is None
+
+
+def test_clear_bridge_runtime_state_preserves_startup_error(bridge_dir: Path) -> None:
+    """Rollback removes stale live pointers without erasing its diagnosis."""
+    _seed_active_turn(bridge_dir, None)
+    update_mcp_server_startup(bridge_dir, "slow-mcp", status="starting")
+    write_bridge_startup_error(bridge_dir, "thread startup exceeded its managed deadline")
+    write_bridge_startup_generation(bridge_dir, "current-generation")
+
+    cleared = clear_bridge_runtime_state(
+        bridge_dir,
+        expected_generation="current-generation",
+    )
+
+    assert cleared is True
+    assert read_bridge_state(bridge_dir) is None
+    assert read_mcp_startup(bridge_dir) == {}
+    assert read_bridge_startup_error(bridge_dir) == "thread startup exceeded its managed deadline"
 
 
 def test_mcp_startup_updates_round_trip(bridge_dir: Path) -> None:

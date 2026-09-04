@@ -1173,6 +1173,9 @@ class CodexNativeAppServer:
         trust keeps that interactive screen from stranding a resumed web
         session (see :func:`trust_all_codex_hooks`). Interactive CLI
         sessions leave it disabled so a human reviews their own hooks.
+    :param readiness_timeout_seconds: Maximum time for app-server readiness.
+        Managed callers may replace the local 10-second default with the
+        remaining portion of their shared startup deadline.
     :param policy_notice_pending: One-shot flag: ``True`` once a degrade
         reason is recorded, until the runner's terminal-ensure handler
         surfaces it to Omnigent (which posts a single durable banner). Prevents
@@ -1204,6 +1207,7 @@ class CodexNativeAppServer:
     trust_project: bool = False
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
+    readiness_timeout_seconds: float = _CONNECT_TIMEOUT_SECONDS
 
     async def start(self) -> None:
         """
@@ -1567,7 +1571,7 @@ class CodexNativeAppServer:
         :raises RuntimeError: If the app-server exits or never
             becomes ready before the timeout.
         """
-        deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
+        deadline = asyncio.get_running_loop().time() + self.readiness_timeout_seconds
         last_error: Exception | None = None
         while asyncio.get_running_loop().time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:

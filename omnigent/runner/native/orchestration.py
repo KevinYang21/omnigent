@@ -21,7 +21,7 @@ import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, Self
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.codex_native_app_server import CodexAppServerClient, CodexNativeAppServer
     from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.opencode_native_app_server import OpenCodeNativeServer
     from omnigent.opencode_native_client import OpenCodeClient, OpenCodeSession
     from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
@@ -43,6 +44,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.codex_native_bridge import CODEX_NATIVE_THREAD_START_TIMEOUT_SECONDS
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -88,6 +90,52 @@ _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
+
+
+@dataclasses.dataclass(frozen=True)
+class _CodexManagedStartupDeadline:
+    """One monotonic deadline shared by every managed Codex startup gate."""
+
+    expires_at: float
+    timeout_seconds: float
+
+    @classmethod
+    def start(
+        cls,
+        timeout_seconds: float = CODEX_NATIVE_THREAD_START_TIMEOUT_SECONDS,
+    ) -> Self:
+        """Start a deadline from the current event loop's monotonic clock."""
+        return cls(
+            expires_at=asyncio.get_running_loop().time() + timeout_seconds,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def remaining(self, stage: str) -> float:
+        """Return the remaining budget or raise an actionable stage error."""
+        remaining = self.expires_at - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Codex managed startup exceeded {self.timeout_seconds:g}s "
+                f"before {stage}. Retry the session; if this repeats, inspect "
+                "the runner log for the named startup stage."
+            )
+        return remaining
+
+    async def run(self, stage: str, operation: Callable[[], Awaitable[Any]]) -> Any:
+        """Run one startup operation within this deadline's remaining budget."""
+        timeout = self.remaining(stage)
+        timeout_context = asyncio.timeout(timeout)
+        try:
+            async with timeout_context:
+                return await operation()
+        except TimeoutError as exc:
+            if not timeout_context.expired():
+                raise
+            raise TimeoutError(
+                f"Codex managed startup exceeded {self.timeout_seconds:g}s "
+                f"while {stage}. Retry the session; if this repeats, inspect "
+                "the runner log for the named startup stage."
+            ) from exc
 
 
 class _EnsureCommentRelay(Protocol):
@@ -216,10 +264,11 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
     """
-    if session_id not in _AUTO_CODEX_APP_SERVERS:
+    expected_app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    if expected_app_server is None:
         return
     await _cancel_auto_forwarder_task(session_id)
-    leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+    leftover_app_server = _pop_expected_codex_app_server(session_id, expected_app_server)
     if leftover_app_server is not None:
         with contextlib.suppress(Exception):
             await leftover_app_server.close()
@@ -249,6 +298,75 @@ async def teardown_all_codex_native_app_servers() -> None:
     for session_id in list(_AUTO_CODEX_APP_SERVERS):
         with contextlib.suppress(Exception):
             await teardown_codex_native_app_server(session_id)
+
+
+def _pop_expected_codex_app_server(
+    session_id: str,
+    expected: CodexNativeAppServer,
+) -> CodexNativeAppServer | None:
+    """Remove an app-server only when this launch still owns the registry slot."""
+    if _AUTO_CODEX_APP_SERVERS.get(session_id) is not expected:
+        return None
+    return _AUTO_CODEX_APP_SERVERS.pop(session_id)
+
+
+async def _rollback_codex_managed_startup(
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    startup_generation: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    app_server: CodexNativeAppServer,
+    event_client: CodexAppServerClient | None = None,
+    terminal_instance: TerminalInstance | None = None,
+    terminal_resource_published: bool = False,
+    subagent_router: SubagentRouter | None = None,
+    turn_router: TurnRouter | None = None,
+    clear_bridge: bool = True,
+) -> None:
+    """Roll back exactly one failed managed Codex startup generation."""
+    from omnigent.codex_native_bridge import clear_bridge_runtime_state
+
+    # A resume publishes bridge state before its TUI launch. Retract it first so
+    # a concurrent turn cannot discover the app-server while rollback closes it.
+    if clear_bridge:
+        clear_bridge_runtime_state(
+            bridge_dir,
+            expected_generation=startup_generation,
+        )
+
+    if terminal_instance is not None:
+        terminal_id = terminal_resource_id("codex", "main")
+        closed = False
+        with contextlib.suppress(Exception):
+            closed = await resource_registry.close_terminal(
+                session_id,
+                terminal_id,
+                expected=terminal_instance,
+            )
+        if closed and terminal_resource_published:
+            with contextlib.suppress(Exception):
+                publish_event(
+                    session_id,
+                    {
+                        "type": "session.resource.deleted",
+                        "resource_id": terminal_id,
+                        "resource_type": "terminal",
+                        "session_id": session_id,
+                    },
+                )
+
+    if event_client is not None:
+        with contextlib.suppress(Exception):
+            await event_client.close()
+
+    _pop_expected_codex_app_server(session_id, app_server)
+    with contextlib.suppress(Exception):
+        await app_server.close()
+
+    await _shutdown_session_router_async(session_id, subagent_router)
+    await _shutdown_session_turn_router_async(session_id, turn_router)
 
 
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
@@ -3850,6 +3968,7 @@ async def _auto_create_codex_terminal(
         codex_home_for_bridge_dir,
         prepare_bridge_dir,
         socket_path_for_bridge_dir,
+        write_bridge_startup_generation,
     )
     from omnigent.inner.codex_executor import codex_extended_catalog_env
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -4192,6 +4311,12 @@ async def _auto_create_codex_terminal(
         # review. See trust_all_codex_hooks.
         trust_all_hooks=True,
     )
+    # From this point onward, every asynchronous launch gate spends from one
+    # monotonic budget. Rollback ownership begins before either router starts.
+    _startup_deadline = _CodexManagedStartupDeadline.start()
+    _startup_generation = uuid.uuid4().hex
+    write_bridge_startup_generation(bridge_dir, _startup_generation)
+
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
     # the server decides per spawn whether to route. Any Smart Routing session,
@@ -4219,15 +4344,45 @@ async def _auto_create_codex_terminal(
     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of
     # its own), and live before the app-server starts because the hook can
     # fire on the very first prompt.
-    _codex_turn_router = _start_turn_router_for_native_session(
-        session_id,
-        bridge_dir=bridge_dir,
-        harness="codex-native",
-        server_client=server_client,
-        turn_routing=launch_config.turn_routing,
-    )
+    try:
+        _codex_turn_router = _start_turn_router_for_native_session(
+            session_id,
+            bridge_dir=bridge_dir,
+            harness="codex-native",
+            server_client=server_client,
+            turn_routing=launch_config.turn_routing,
+        )
+    except BaseException:
+        await _rollback_codex_managed_startup(
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            startup_generation=_startup_generation,
+            resource_registry=resource_registry,
+            publish_event=publish_event,
+            app_server=app_server,
+            subagent_router=_codex_router,
+        )
+        raise
     app_server.listen_url = codex_ws_url
-    await app_server.start()
+    try:
+        # Keep the local CLI/model-discovery 10-second default unchanged; only
+        # this managed instance may wait through the shared cold-start budget.
+        app_server.readiness_timeout_seconds = _startup_deadline.remaining(
+            "waiting for app-server readiness"
+        )
+        await _startup_deadline.run("starting the app-server", app_server.start)
+    except BaseException:
+        await _rollback_codex_managed_startup(
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            startup_generation=_startup_generation,
+            resource_registry=resource_registry,
+            publish_event=publish_event,
+            app_server=app_server,
+            subagent_router=_codex_router,
+            turn_router=_codex_turn_router,
+        )
+        raise
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
 
     event_client = CodexAppServerClient(
@@ -4238,19 +4393,40 @@ async def _auto_create_codex_terminal(
         from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
 
         try:
-            await preload_codex_thread_for_resume(
-                codex_ws_url,
-                launch_config.external_session_id,
-                terminal_launch_args=launch_config.terminal_launch_args,
+            await _startup_deadline.run(
+                "preloading the Codex resume thread",
+                lambda: preload_codex_thread_for_resume(
+                    codex_ws_url,
+                    launch_config.external_session_id,
+                    terminal_launch_args=launch_config.terminal_launch_args,
+                ),
             )
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                await _rollback_codex_managed_startup(
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    startup_generation=_startup_generation,
+                    resource_registry=resource_registry,
+                    publish_event=publish_event,
+                    app_server=app_server,
+                    event_client=event_client,
+                    subagent_router=_codex_router,
+                    turn_router=_codex_turn_router,
+                )
+                raise
             if not is_unreadable_thread_error(exc):
-                # The app-server started above must not outlive a refused resume:
-                # without this close, every retry stacked another live codex
-                # process (and only the newest stayed tracked for teardown).
-                with contextlib.suppress(Exception):
-                    await app_server.close()
-                _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+                await _rollback_codex_managed_startup(
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    startup_generation=_startup_generation,
+                    resource_registry=resource_registry,
+                    publish_event=publish_event,
+                    app_server=app_server,
+                    event_client=event_client,
+                    subagent_router=_codex_router,
+                    turn_router=_codex_turn_router,
+                )
                 raise
             # Codex cannot load this thread's rollout, so no retry can resume
             # it. Start a fresh thread on the same app-server instead of
@@ -4290,15 +4466,22 @@ async def _auto_create_codex_terminal(
             # Connect the listener BEFORE launching the TUI so it observes the
             # ``thread/started`` the TUI emits on startup (the client buffers
             # notifications, so there is no created-before-listening race).
-            await event_client.connect()
-        except Exception:
-            # connect() may have half-opened the ws before the initialize
-            # handshake failed, so close the listener too — not just the
-            # app-server.
-            with contextlib.suppress(Exception):
-                await event_client.close()
-            await app_server.close()
-            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            await _startup_deadline.run(
+                "connecting the app-server event client",
+                event_client.connect,
+            )
+        except BaseException:
+            await _rollback_codex_managed_startup(
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                startup_generation=_startup_generation,
+                resource_registry=resource_registry,
+                publish_event=publish_event,
+                app_server=app_server,
+                event_client=event_client,
+                subagent_router=_codex_router,
+                turn_router=_codex_turn_router,
+            )
             raise
 
     # Register the Codex TUI as a streamable terminal resource attached to
@@ -4321,6 +4504,8 @@ async def _auto_create_codex_terminal(
     # setup (arg build + config resolve) shares the terminal launch's teardown
     # below: a raise here must still close them and drop the
     # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
+    terminal_instance: TerminalInstance | None = None
+    terminal_resource_published = False
     try:
         codex_remote_args = build_codex_remote_args(
             codex_args=tuple(launch_config.terminal_launch_args or ()),
@@ -4374,38 +4559,47 @@ async def _auto_create_codex_terminal(
         codex_launch_args = resolve_harness_args(
             "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
         )
-        terminal_view = await resource_registry.launch_auxiliary_terminal(
-            session_id=session_id,
-            terminal_name="codex",
-            session_key="main",
-            resource_role=CODEX_NATIVE_TERMINAL_ROLE,
-            parent_os_env=agent_os_env,
-            spec=TerminalEnvSpec(
-                os_env=OSEnvSpec(
-                    type="caller_process",
-                    cwd=workspace,
-                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+        terminal_view = await _startup_deadline.run(
+            "launching the Codex terminal",
+            lambda: resource_registry.launch_auxiliary_terminal(
+                session_id=session_id,
+                terminal_name="codex",
+                session_key="main",
+                resource_role=CODEX_NATIVE_TERMINAL_ROLE,
+                parent_os_env=agent_os_env,
+                spec=TerminalEnvSpec(
+                    os_env=OSEnvSpec(
+                        type="caller_process",
+                        cwd=workspace,
+                        sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+                    ),
+                    command=codex_command,
+                    args=codex_launch_args,
+                    env=codex_terminal_env(app_server),
+                    # Match the local ``omnigent codex`` terminal scrollback.
+                    scrollback=100_000,
+                    # Enable tmux passthrough so the Codex TUI's escape sequences
+                    # reach the web xterm.
+                    tmux_allow_passthrough=True,
+                    # Start the TUI at creation rather than on first attach,
+                    # mirroring claude-native. Deferring to attach (the local CLI
+                    # default) means the full-screen TUI cold-starts the instant
+                    # the web UI attaches over the runner tunnel; that initial
+                    # render burst starves the tunnel ping/pong and the host
+                    # recycles the unresponsive runner (the "runner
+                    # death on terminal attach" class). Starting now lets the TUI settle
+                    # in the detached tmux pane (no tunnel traffic) and create its
+                    # thread before anyone attaches.
+                    tmux_start_on_attach=False,
                 ),
-                command=codex_command,
-                args=codex_launch_args,
-                env=codex_terminal_env(app_server),
-                # Match the local ``omnigent codex`` terminal scrollback.
-                scrollback=100_000,
-                # Enable tmux passthrough so the Codex TUI's escape sequences
-                # reach the web xterm.
-                tmux_allow_passthrough=True,
-                # Start the TUI at creation rather than on first attach,
-                # mirroring claude-native. Deferring to attach (the local CLI
-                # default) means the full-screen TUI cold-starts the instant
-                # the web UI attaches over the runner tunnel; that initial
-                # render burst starves the tunnel ping/pong and the host
-                # recycles the unresponsive runner (the "runner
-                # death on terminal attach" class). Starting now lets the TUI settle
-                # in the detached tmux pane (no tunnel traffic) and create its
-                # thread before anyone attaches.
-                tmux_start_on_attach=False,
             ),
         )
+        terminal_registry = resource_registry.terminal_registry
+        if terminal_registry is None:
+            raise RuntimeError("Terminal registry disappeared after Codex terminal launch")
+        terminal_instance = terminal_registry.get(session_id, "codex", "main")
+        if terminal_instance is None:
+            raise RuntimeError("Codex terminal launch returned without a registered instance")
         publish_event(
             session_id,
             {
@@ -4413,10 +4607,21 @@ async def _auto_create_codex_terminal(
                 "resource": session_resource_view_to_dict(terminal_view),
             },
         )
-    except Exception:
-        await event_client.close()
-        await app_server.close()
-        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        terminal_resource_published = True
+    except BaseException:
+        await _rollback_codex_managed_startup(
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            startup_generation=_startup_generation,
+            resource_registry=resource_registry,
+            publish_event=publish_event,
+            app_server=app_server,
+            event_client=event_client,
+            terminal_instance=terminal_instance,
+            terminal_resource_published=terminal_resource_published,
+            subagent_router=_codex_router,
+            turn_router=_codex_turn_router,
+        )
         raise
 
     # Adopt the thread the fresh TUI creates and run the forwarder in the
@@ -4432,6 +4637,12 @@ async def _auto_create_codex_terminal(
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
+                startup_deadline=_startup_deadline,
+                startup_generation=_startup_generation,
+                app_server=app_server,
+                resource_registry=resource_registry,
+                publish_event=publish_event,
+                terminal_instance=terminal_instance,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4441,6 +4652,11 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 thread_id=launch_config.external_session_id,
+                startup_generation=_startup_generation,
+                app_server=app_server,
+                resource_registry=resource_registry,
+                publish_event=publish_event,
+                terminal_instance=terminal_instance,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4449,22 +4665,46 @@ async def _auto_create_codex_terminal(
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
 
-    # A prompt a previous launch blocked for routing but never got to replay
-    # exists nowhere else: the block consumed it and the marker stops the hook
-    # from ever asking again. Drain it once this launch's thread is live.
-    _recover_pending_turn_replay(
-        session_id,
-        bridge_dir=bridge_dir,
-        server_client=server_client,
-    )
+    try:
+        # A prompt a previous launch blocked for routing but never got to replay
+        # exists nowhere else: the block consumed it and the marker stops the hook
+        # from ever asking again. Drain it once this launch's thread is live.
+        _recover_pending_turn_replay(
+            session_id,
+            bridge_dir=bridge_dir,
+            server_client=server_client,
+        )
 
-    # Start the relay now (into codex's serve-mcp bridge dir) so tool_relay.json
-    # is on disk and the relay recorded before codex connects on its first turn:
-    # the first-turn `_ensure_comment_relay_started` then fast-paths, avoiding
-    # the ~30s stall (see its docstring for the lazy-bridge / await_notify=False
-    # rationale).
-    if ensure_comment_relay is not None:
-        await ensure_comment_relay(session_id, explicit_bridge_dir=bridge_dir, await_notify=False)
+        # Start the relay now (into codex's serve-mcp bridge dir) so
+        # tool_relay.json is on disk before codex connects on its first turn.
+        if ensure_comment_relay is not None:
+            await _startup_deadline.run(
+                "starting the native tool relay",
+                lambda: ensure_comment_relay(
+                    session_id,
+                    explicit_bridge_dir=bridge_dir,
+                    await_notify=False,
+                ),
+            )
+    except BaseException:
+        # Ownership has transferred to the forwarder, but it may not have run
+        # yet. Cancel it and also perform identity-safe rollback here so a task
+        # cancelled before its first instruction cannot leak the launch.
+        await _cancel_auto_forwarder_task(session_id)
+        await _rollback_codex_managed_startup(
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            startup_generation=_startup_generation,
+            resource_registry=resource_registry,
+            publish_event=publish_event,
+            app_server=app_server,
+            event_client=event_client,
+            terminal_instance=terminal_instance,
+            terminal_resource_published=True,
+            subagent_router=_codex_router,
+            turn_router=_codex_turn_router,
+        )
+        raise
 
     _logger.info(
         "Auto-created codex terminal + forwarder for session %s",
@@ -4483,6 +4723,12 @@ async def _codex_discover_thread_and_forward(
     event_client: CodexAppServerClient,
     routing_summary: str,
     login_required: bool = False,
+    startup_deadline: _CodexManagedStartupDeadline,
+    startup_generation: str,
+    app_server: CodexNativeAppServer,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    terminal_instance: TerminalInstance,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4519,6 +4765,13 @@ async def _codex_discover_thread_and_forward(
         the thread-start timeout), while thread discovery keeps listening
         so an interactive sign-in from the terminal still recovers the
         session.
+    :param startup_deadline: Absolute budget shared with app-server, client,
+        and terminal startup.
+    :param app_server: Exact app-server generation owned by this forwarder.
+    :param resource_registry: Registry used to retract this launch's terminal.
+    :param publish_event: Session event publisher used for terminal deletion.
+    :param terminal_instance: Exact tmux terminal generation owned by this
+        forwarder.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4564,6 +4817,7 @@ async def _codex_discover_thread_and_forward(
             "(`omnigent setup`), then send the message again.",
         )
 
+    bridge_published = False
     try:
         try:
             if login_required:
@@ -4571,7 +4825,10 @@ async def _codex_discover_thread_and_forward(
                 # so this wait only serves a possible interactive sign-in.
                 thread_id = await wait_for_thread_started(event_client, timeout=None)
             else:
-                thread_id = await wait_for_thread_started(event_client)
+                thread_id = await wait_for_thread_started(
+                    event_client,
+                    timeout=startup_deadline.remaining("waiting for thread/started"),
+                )
         except (TimeoutError, RuntimeError) as exc:
             # Expected failure modes of wait_for_thread_started: the TUI exited
             # at startup, or the event stream ended before a thread was
@@ -4611,6 +4868,7 @@ async def _codex_discover_thread_and_forward(
                 cwd=workspace,
             ),
         )
+        bridge_published = True
 
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
@@ -4669,21 +4927,20 @@ async def _codex_discover_thread_and_forward(
             auth=_RunnerDatabricksAuth(auth_factory),
         )
     finally:
-        # Tear down the listener and the per-session app-server whenever
-        # forwarding ends — discovery failed, the app-server connection dropped
-        # (``supervise_forwarder`` returned), or the task was cancelled on
-        # session teardown. ``supervise_forwarder`` also closes ``event_client``
-        # in its own ``finally``; ``close()`` is idempotent. The app-server
-        # subprocess is ours to stop, else it orphans one process per session.
-        # Pop first so the dict never holds a closed reference.
-        leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-        with contextlib.suppress(Exception):
-            await event_client.close()
-        if leftover_app_server is not None:
-            with contextlib.suppress(Exception):
-                await leftover_app_server.close()
-        await _shutdown_session_router_async(session_id, subagent_router)
-        await _shutdown_session_turn_router_async(session_id, turn_router)
+        await _rollback_codex_managed_startup(
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            startup_generation=startup_generation,
+            resource_registry=resource_registry,
+            publish_event=publish_event,
+            app_server=app_server,
+            event_client=event_client,
+            terminal_instance=terminal_instance,
+            terminal_resource_published=True,
+            subagent_router=subagent_router,
+            turn_router=turn_router,
+            clear_bridge=not bridge_published,
+        )
 
 
 async def _codex_forward_known_thread(
@@ -4692,6 +4949,11 @@ async def _codex_forward_known_thread(
     bridge_dir: Path,
     codex_ws_url: str,
     thread_id: str,
+    startup_generation: str,
+    app_server: CodexNativeAppServer,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    terminal_instance: TerminalInstance,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4704,6 +4966,11 @@ async def _codex_forward_known_thread(
         ``"ws://127.0.0.1:9876"``.
     :param thread_id: Existing Codex app-server thread id, e.g.
         ``"thread_abc123"``.
+    :param app_server: Exact app-server generation owned by this forwarder.
+    :param resource_registry: Registry used to retract this launch's terminal.
+    :param publish_event: Session event publisher used for terminal deletion.
+    :param terminal_instance: Exact tmux terminal generation owned by this
+        forwarder.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4733,12 +5000,19 @@ async def _codex_forward_known_thread(
             auth=_RunnerDatabricksAuth(auth_factory),
         )
     finally:
-        leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
-        if leftover_app_server is not None:
-            with contextlib.suppress(Exception):
-                await leftover_app_server.close()
-        await _shutdown_session_router_async(session_id, subagent_router)
-        await _shutdown_session_turn_router_async(session_id, turn_router)
+        await _rollback_codex_managed_startup(
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            startup_generation=startup_generation,
+            resource_registry=resource_registry,
+            publish_event=publish_event,
+            app_server=app_server,
+            terminal_instance=terminal_instance,
+            terminal_resource_published=True,
+            subagent_router=subagent_router,
+            turn_router=turn_router,
+            clear_bridge=False,
+        )
 
 
 async def _run_antigravity_reader(

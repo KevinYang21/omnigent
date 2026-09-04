@@ -22,10 +22,16 @@ from omnigent import native_bridge_common
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
+# One end-to-end budget for a managed Codex launch to publish its app-server
+# thread and bridge state. Keep every startup participant on this value.
+CODEX_NATIVE_THREAD_START_TIMEOUT_SECONDS = 180.0
+# Bridge publication may trail the runner deadline by one scheduling handoff.
+CODEX_NATIVE_BRIDGE_STATE_TIMEOUT_SECONDS = CODEX_NATIVE_THREAD_START_TIMEOUT_SECONDS + 5.0
 
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
+_STARTUP_GENERATION_FILE = "startup_generation"
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
 # forwarder (and by ``wait_for_thread_started`` while it drains startup
@@ -645,6 +651,29 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
         _write_bridge_state_unlocked(bridge_dir, state)
 
 
+def write_bridge_startup_generation(bridge_dir: Path, generation: str) -> None:
+    """Claim bridge runtime ownership for one managed startup generation.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param generation: Opaque unique token for this launch.
+    :returns: None.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with _bridge_state_lock(bridge_dir):
+        path = bridge_dir / _STARTUP_GENERATION_FILE
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{_STARTUP_GENERATION_FILE}.",
+            dir=str(bridge_dir),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"{generation}\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+
+
 def clear_bridge_state(bridge_dir: Path) -> None:
     """
     Remove stale native Codex runtime state for a bridge directory.
@@ -663,12 +692,46 @@ def clear_bridge_state(bridge_dir: Path) -> None:
         for name in (
             _STATE_FILE,
             _STARTUP_ERROR_FILE,
+            _STARTUP_GENERATION_FILE,
             _MCP_STARTUP_FILE,
         ):
             try:
                 (bridge_dir / name).unlink()
             except FileNotFoundError:
                 continue
+
+
+def clear_bridge_runtime_state(
+    bridge_dir: Path,
+    *,
+    expected_generation: str,
+) -> bool:
+    """Remove live runtime pointers while preserving an actionable startup error.
+
+    Rollback calls this after recording why startup failed. Using
+    :func:`clear_bridge_state` there would also delete ``startup_error.json``
+    and replace the specific runner diagnosis with the executor's generic
+    timeout message. The generation comparison prevents a delayed predecessor
+    from deleting a successor launch's state.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param expected_generation: Generation token owned by the cleanup caller.
+    :returns: ``True`` when this generation still owned and cleared the runtime
+        files; ``False`` when a successor owns them or no claim exists.
+    """
+    with _bridge_state_lock(bridge_dir):
+        try:
+            current_generation = (
+                (bridge_dir / _STARTUP_GENERATION_FILE).read_text(encoding="utf-8").strip()
+            )
+        except OSError:
+            return False
+        if current_generation != expected_generation:
+            return False
+        for name in (_STATE_FILE, _MCP_STARTUP_FILE, _STARTUP_GENERATION_FILE):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / name).unlink()
+    return True
 
 
 def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:

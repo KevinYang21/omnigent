@@ -239,6 +239,49 @@ async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
+async def test_control_attach_never_advertises_launchd_term_dumb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The persistent browser control client advertises a capable terminal."""
+    sock, target = await _new_private_tmux("sleep 30")
+    tmux = shutil.which("tmux")
+    assert tmux
+    monkeypatch.setenv("TERM", "dumb")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws,
+            socket_path=str(sock),
+            tmux_target=target,
+            read_only=False,
+        )
+    )
+    try:
+        client_terms: list[str] = []
+        for _ in range(50):
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                str(sock),
+                "list-clients",
+                "-F",
+                "#{client_termname}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await proc.communicate()
+            client_terms = stdout.decode().splitlines()
+            if client_terms:
+                break
+            await asyncio.sleep(0.05)
+
+        assert client_terms == ["xterm-256color"]
+    finally:
+        await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
 async def test_control_bridge_outer_cancellation_joins_child_tasks() -> None:
     """Cancelling the route cannot leave bridge reader/sender tasks detached."""
     sock, target = await _new_private_tmux("sleep 30")

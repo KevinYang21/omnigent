@@ -43,6 +43,7 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import re
 import shutil
 from collections.abc import Callable
@@ -551,6 +552,11 @@ async def bridge_tmux_control_to_websocket(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # launchd commonly gives the host ``TERM=dumb``. tmux records the
+            # attaching control client's TERM as ``#{client_termname}``, and
+            # Codex uses that capability signal even though the pane itself has
+            # a rich TERM. Never let a browser attach downgrade the live TUI.
+            env={**os.environ, "TERM": "xterm-256color"},
             # Raise the stdout StreamReader buffer above the 64 KiB default so a
             # single ``read`` can pull a whole output burst (see
             # _CONTROL_STDOUT_BUFFER_LIMIT).

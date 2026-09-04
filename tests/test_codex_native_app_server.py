@@ -844,6 +844,44 @@ def _test_app_server(
     )
 
 
+async def test_app_server_readiness_honors_managed_instance_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed readiness can exceed the local app-server timeout boundary."""
+    from omnigent import codex_native_app_server
+
+    attempts = 0
+
+    class _RetryingClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def connect(self) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise OSError("not listening yet")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _RetryingClient)
+    monkeypatch.setattr(codex_native_app_server, "_CONNECT_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(codex_native_app_server, "_CONNECT_RETRY_DELAY_SECONDS", 0.0)
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        tmp_path,
+    )
+    server.readiness_timeout_seconds = 1.0
+
+    await server._wait_until_ready()
+
+    assert attempts == 3
+
+
 async def test_start_upserts_mcp_server_config_across_relaunches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

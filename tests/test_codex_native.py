@@ -11255,37 +11255,72 @@ def test_resolve_native_codex_launch_databricks_provider_sets_summary(
     assert launch.summary == "Databricks ucode profile 'my-profile'"
 
 
+class _FakeManagedStartupClosable:
+    """Minimal app-server/client cleanup target for discovery helper tests."""
+
+    async def close(self) -> None:
+        """Accept rollback cleanup."""
+
+
+class _FakeManagedStartupRegistry:
+    """Minimal terminal registry facade for discovery helper tests."""
+
+    async def close_terminal(
+        self,
+        _session_id: str,
+        _terminal_id: str,
+        *,
+        expected: object,
+    ) -> bool:
+        """Confirm identity-scoped terminal cleanup."""
+        return expected is not None
+
+
 def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A startup timeout records the launch routing summary in the bridge error (#2745)."""
     from omnigent import codex_native_forwarder as _fwd
-    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.codex_native_bridge import (
+        read_bridge_startup_error,
+        write_bridge_startup_generation,
+    )
     from omnigent.runner.native import orchestration as native_orch
 
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    async def _timeout(_client: object) -> str:
+    async def _timeout(
+        _client: object,
+        *,
+        timeout: float | None = 30.0,
+    ) -> str:
+        assert timeout is not None
         raise TimeoutError("no thread event")
 
     monkeypatch.setattr(_fwd, "wait_for_thread_started", _timeout)
 
-    class _FakeClient:
-        async def close(self) -> None:
-            return None
+    startup_generation = "routing-summary-timeout-generation"
+    write_bridge_startup_generation(bridge_dir, startup_generation)
 
-    asyncio.run(
-        native_orch._codex_discover_thread_and_forward(
+    async def _run_discovery() -> None:
+        await native_orch._codex_discover_thread_and_forward(
             session_id="conv_test",
             bridge_dir=bridge_dir,
             codex_ws_url="ws://127.0.0.1:9999",
             codex_home=tmp_path / "codex-home",
             workspace=str(tmp_path / "workspace"),
-            event_client=_FakeClient(),
+            event_client=_FakeManagedStartupClosable(),  # type: ignore[arg-type]
             routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
+            startup_deadline=native_orch._CodexManagedStartupDeadline.start(),
+            startup_generation=startup_generation,
+            app_server=_FakeManagedStartupClosable(),  # type: ignore[arg-type]
+            resource_registry=_FakeManagedStartupRegistry(),  # type: ignore[arg-type]
+            publish_event=lambda *_args: None,
+            terminal_instance=object(),  # type: ignore[arg-type]
         )
-    )
+
+    asyncio.run(_run_discovery())
 
     err = read_bridge_startup_error(bridge_dir)
     assert err is not None
@@ -11308,7 +11343,10 @@ def test_codex_discover_thread_login_required_records_error_before_waiting(
     thread-start timeout (the "Codex TUI never started a thread" hang).
     """
     from omnigent import codex_native_forwarder as _fwd
-    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.codex_native_bridge import (
+        read_bridge_startup_error,
+        write_bridge_startup_generation,
+    )
     from omnigent.runner.native import orchestration as native_orch
 
     bridge_dir = tmp_path / "bridge"
@@ -11325,22 +11363,28 @@ def test_codex_discover_thread_login_required_records_error_before_waiting(
 
     monkeypatch.setattr(_fwd, "wait_for_thread_started", _wait)
 
-    class _FakeClient:
-        async def close(self) -> None:
-            return None
+    startup_generation = "login-required-failure-generation"
+    write_bridge_startup_generation(bridge_dir, startup_generation)
 
-    asyncio.run(
-        native_orch._codex_discover_thread_and_forward(
+    async def _run_discovery() -> None:
+        await native_orch._codex_discover_thread_and_forward(
             session_id="conv_test",
             bridge_dir=bridge_dir,
             codex_ws_url="ws://127.0.0.1:9999",
             codex_home=tmp_path / "codex-home",
             workspace=str(tmp_path / "workspace"),
-            event_client=_FakeClient(),
+            event_client=_FakeManagedStartupClosable(),  # type: ignore[arg-type]
             routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
             login_required=True,
+            startup_deadline=native_orch._CodexManagedStartupDeadline.start(),
+            startup_generation=startup_generation,
+            app_server=_FakeManagedStartupClosable(),  # type: ignore[arg-type]
+            resource_registry=_FakeManagedStartupRegistry(),  # type: ignore[arg-type]
+            publish_event=lambda *_args: None,
+            terminal_instance=object(),  # type: ignore[arg-type]
         )
-    )
+
+    asyncio.run(_run_discovery())
 
     assert error_at_wait_time and error_at_wait_time[0] is not None
     recorded = error_at_wait_time[0]
@@ -11365,6 +11409,7 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     from omnigent.codex_native_bridge import (
         read_bridge_startup_error,
         read_bridge_state,
+        write_bridge_startup_generation,
     )
     from omnigent.runner.native import orchestration as native_orch
 
@@ -11381,22 +11426,28 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     monkeypatch.setattr(_fwd, "supervise_forwarder", _forward)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:1")
 
-    class _FakeClient:
-        async def close(self) -> None:
-            return None
+    startup_generation = "login-required-success-generation"
+    write_bridge_startup_generation(bridge_dir, startup_generation)
 
-    asyncio.run(
-        native_orch._codex_discover_thread_and_forward(
+    async def _run_discovery() -> None:
+        await native_orch._codex_discover_thread_and_forward(
             session_id="conv_test",
             bridge_dir=bridge_dir,
             codex_ws_url="ws://127.0.0.1:9999",
             codex_home=tmp_path / "codex-home",
             workspace=str(tmp_path / "workspace"),
-            event_client=_FakeClient(),
+            event_client=_FakeManagedStartupClosable(),  # type: ignore[arg-type]
             routing_summary="Codex CLI login (no provider configured)",
             login_required=True,
+            startup_deadline=native_orch._CodexManagedStartupDeadline.start(),
+            startup_generation=startup_generation,
+            app_server=_FakeManagedStartupClosable(),  # type: ignore[arg-type]
+            resource_registry=_FakeManagedStartupRegistry(),  # type: ignore[arg-type]
+            publish_event=lambda *_args: None,
+            terminal_instance=object(),  # type: ignore[arg-type]
         )
-    )
+
+    asyncio.run(_run_discovery())
 
     assert read_bridge_startup_error(bridge_dir) is None
     state = read_bridge_state(bridge_dir)

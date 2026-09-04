@@ -926,6 +926,27 @@ async def test_delete_terminal_closes_and_returns_confirmation(
 
 
 @pytest.mark.asyncio
+async def test_close_terminal_expected_instance_preserves_successor(tmp_path: Path) -> None:
+    """The resource facade forwards generation identity to terminal cleanup."""
+    session_id = "conv_expected_terminal_generation"
+    superseded = _make_instance("codex", "main", tmp_path / "old")
+    successor = _make_instance("codex", "main", tmp_path / "new")
+    terminal_registry = TerminalRegistry()
+    _seed_registry(terminal_registry, session_id, [successor])
+    resources = SessionResourceRegistry(terminal_registry=terminal_registry)
+
+    closed = await resources.close_terminal(
+        session_id,
+        terminal_resource_id("codex", "main"),
+        expected=superseded,
+    )
+
+    assert closed is False
+    assert terminal_registry.get(session_id, "codex", "main") is successor
+    assert successor.running is True
+
+
+@pytest.mark.asyncio
 async def test_delete_terminal_returns_404_for_unknown(
     client: httpx.AsyncClient,
 ) -> None:
