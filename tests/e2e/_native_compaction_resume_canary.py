@@ -189,9 +189,7 @@ def native_artifacts(
     payload = _session_payload(client, conversation_id)
     labels = payload.get("labels")
     bridge_id = (
-        labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
-        if isinstance(labels, dict)
-        else None
+        labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) if isinstance(labels, dict) else None
     ) or conversation_id
     home = codex_home_for_bridge_dir(codex_bridge_dir(str(bridge_id)))
     return sorted(home.glob(f"sessions/**/rollout-*-{external_session_id}.jsonl"))
@@ -381,9 +379,7 @@ def _wait_terminal_gone(
         if response.status_code == 200:
             resources = response.json().get("data", [])
             last_ids = [
-                str(resource.get("id"))
-                for resource in resources
-                if isinstance(resource, dict)
+                str(resource.get("id")) for resource in resources if isinstance(resource, dict)
             ]
             if expected not in last_ids:
                 return
@@ -658,9 +654,7 @@ def run_native_compaction_resume_canary(
                             "conversation_id": conversation_id,
                             "external_session_id": external_session_id,
                             "marker": marker,
-                            "native_artifacts": [
-                                str(path) for path in sorted(observed_paths)
-                            ],
+                            "native_artifacts": [str(path) for path in sorted(observed_paths)],
                             "items": diagnostic_items,
                         },
                         indent=2,

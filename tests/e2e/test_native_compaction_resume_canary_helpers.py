@@ -45,9 +45,7 @@ def test_canary_cases_default_to_three_and_cover_both_modes(
         ),
     ],
 )
-def test_conversation_id_parser_accepts_current_and_legacy_ids(
-    url: str, expected: str
-) -> None:
+def test_conversation_id_parser_accepts_current_and_legacy_ids(url: str, expected: str) -> None:
     match = _CONV_ID_RE.search(url)
     assert match is not None
     assert match.group(1) == expected
