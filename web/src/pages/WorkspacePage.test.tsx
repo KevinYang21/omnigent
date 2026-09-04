@@ -41,6 +41,12 @@ vi.mock("@/hooks/useSession", () => ({
   useSession: () => ({ session: null, isLoading: false, error: null }),
 }));
 
+vi.mock("@/shell/SessionWorkspaceDock", () => ({
+  SessionWorkspaceDock: ({ conversationId, label }: { conversationId: string; label: string }) => (
+    <aside aria-label={`Workspace for ${label}`} data-conversation-id={conversationId} />
+  ),
+}));
+
 vi.mock("./ChatPage", () => ({
   ChatPage: ({ conversationId, active = true }: { conversationId?: string; active?: boolean }) => (
     <div data-testid={`chat-${conversationId ?? "landing"}`} data-active={String(active)}>
@@ -131,6 +137,53 @@ describe("WorkspacePage", () => {
 
     expect(screen.getByTestId(`pane-title-${firstPaneId}`)).toHaveTextContent("First task");
     expect(screen.getByTestId(`pane-title-${secondPaneId}`)).toHaveTextContent("Second task");
+  });
+
+  it("renders one corresponding workspace dock for every split chat", () => {
+    const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
+
+    renderWorkspace("/c/session-b");
+
+    expect(screen.getByRole("complementary", { name: "Workspace for First task" })).toHaveAttribute(
+      "data-conversation-id",
+      "session-a",
+    );
+    expect(
+      screen.getByRole("complementary", { name: "Workspace for Second task" }),
+    ).toHaveAttribute("data-conversation-id", "session-b");
+  });
+
+  it("toggles each chat's workspace independently from its pane header", () => {
+    const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
+
+    renderWorkspace("/c/session-b");
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse workspace for First task" }));
+
+    expect(screen.queryByRole("complementary", { name: "Workspace for First task" })).toBeNull();
+    expect(
+      screen.getByRole("complementary", { name: "Workspace for Second task" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Expand workspace for First task" }),
+    ).toBeInTheDocument();
+  });
+
+  it("reflows each chat's own dock below or right at the SP2K column threshold", () => {
+    const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
+
+    renderWorkspace("/c/session-b");
+
+    for (const sessionId of ["session-a", "session-b"]) {
+      const column = screen.getByTestId(`session-column-${sessionId}`);
+      expect(column.className).toContain("@container/session-column");
+      const dockLayout = screen.getByTestId(`session-dock-${sessionId}`);
+      expect(dockLayout.className).toContain("flex-col");
+      expect(dockLayout.className).toContain("@min-[720px]/session-column:flex-row");
+    }
   });
 
   it("uses pane titles without a focused border or global-header clearance", async () => {

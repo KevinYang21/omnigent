@@ -544,6 +544,10 @@ interface WorkspacePanelProps {
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
   inert?: boolean;
+  /** Layout geometry: the global AppShell rail or a per-session responsive dock. */
+  variant?: "global" | "session-column";
+  /** Accessible label for the workspace surface. */
+  ariaLabel?: string;
   /**
    * Props for the left-edge resize handle (onMouseDown/onKeyDown + ARIA),
    * from ``useResizableInlinePanel().handleProps``.
@@ -648,6 +652,8 @@ export function WorkspacePanel({
   width,
   handleProps,
   inert,
+  variant = "global",
+  ariaLabel = "Workspace",
   rightRailTab,
   onRightRailTabChange,
   showFilesPanel,
@@ -697,7 +703,8 @@ export function WorkspacePanel({
   );
   return (
     <aside
-      aria-label="Workspace"
+      aria-label={ariaLabel}
+      data-conversation-id={conversationId}
       inert={inert}
       // Full-height desktop surface flush to the window edge, separated from
       // the main content by a left divider — no outer margin, rounding, or
@@ -715,18 +722,20 @@ export function WorkspacePanel({
       // against.
       data-maximized={maximized || undefined}
       className={cn(
-        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
-        maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-border md:bg-card",
+        maximized
+          ? cn("md:absolute md:inset-0", variant === "global" && "md:border-l")
+          : variant === "session-column"
+            ? "md:h-[45%] md:w-full md:shrink-0 md:border-t @min-[720px]/session-column:md:h-auto @min-[720px]/session-column:md:w-[45%] @min-[720px]/session-column:md:border-t-0 @min-[720px]/session-column:md:border-l"
+            : "md:shrink-0 md:border-l",
       )}
-      // Width is fixed by the resize handle normally; maximized ignores it and
-      // stretches to the absolute inset instead.
-      style={maximized ? undefined : { width }}
+      style={maximized || variant === "session-column" ? undefined : { width }}
     >
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
-      {!maximized && (
+      {!maximized && variant === "global" && (
         <div
           {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
         />
       )}
       {/* Tab strip, in display order Files · Changes · Agents.
@@ -941,6 +950,7 @@ export function WorkspacePanel({
         ) : (
           showFilesPanel && (
             <FilesPanel
+              conversationId={conversationId}
               frameless
               onFileSelect={openFileViewer}
               flatView={rightRailTab === "changes"}

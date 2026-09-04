@@ -1,10 +1,11 @@
 import { useDroppable } from "@dnd-kit/core";
-import { X } from "lucide-react";
+import { PanelRightCloseIcon, PanelRightIcon, X } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
+  useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { useNavigate, useParams } from "@/lib/routing";
@@ -22,6 +23,9 @@ import {
 import { useConversations } from "@/hooks/useConversations";
 import { useSession } from "@/hooks/useSession";
 import { useSessionDragDrop } from "@/shell/SessionDragDropProvider";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readDefaultWorkspacePanelOpen } from "@/lib/workspacePanelPreferences";
+import { SessionWorkspaceDock } from "@/shell/SessionWorkspaceDock";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { ChatPage } from "./ChatPage";
 
@@ -154,6 +158,17 @@ function WorkspaceSplitView({
   );
 }
 
+function useWorkspacePaneTitle(sessionId: string): string {
+  const { data: conversationsData } = useConversations("", true);
+  const { session } = useSession(sessionId);
+  return useMemo(() => {
+    const listed = conversationsData?.pages
+      .flatMap((page) => page.data)
+      .find((conversation) => conversation.id === sessionId);
+    return listed?.title || session?.title || UNTITLED_CONVERSATION_LABEL;
+  }, [conversationsData, session, sessionId]);
+}
+
 function WorkspaceLeafView({
   node,
   focused,
@@ -167,18 +182,26 @@ function WorkspaceLeafView({
   const focusPane = useWorkspaceLayoutStore((state) => state.focusPane);
   const closePane = useWorkspaceLayoutStore((state) => state.closePane);
   const sessionId = node.sessionId;
+  const title = useWorkspacePaneTitle(sessionId ?? "");
+  const [workspaceOpen, setWorkspaceOpen] = useState(() =>
+    sessionId
+      ? (readSessionWorkspaceState(sessionId).open ?? readDefaultWorkspacePanelOpen())
+      : false,
+  );
 
-  // Non-focused panes have no route driving switchTo, so hydrate their
-  // conversation in the background — after a reload only the focused pane's
-  // conversation is live, and an unbound pane must not paint the focused
-  // pane's transcript.
+  useEffect(() => {
+    setWorkspaceOpen(
+      sessionId
+        ? (readSessionWorkspaceState(sessionId).open ?? readDefaultWorkspacePanelOpen())
+        : false,
+    );
+  }, [sessionId]);
+
   useEffect(() => {
     if (!sessionId || focused) return;
     void useChatStore.getState().loadInBackground(sessionId);
   }, [sessionId, focused]);
 
-  // A visible pane's conversation must never lose its stream slot: eviction
-  // would drop the entry and the pane would fall back to an empty transcript.
   useEffect(() => {
     if (!sessionId) return;
     conversationRegistry.pin(sessionId);
@@ -202,6 +225,21 @@ function WorkspaceLeafView({
     }
   };
 
+  const toggleWorkspace = () => {
+    if (!sessionId) return;
+    const next = !workspaceOpen;
+    setWorkspaceOpen(next);
+    writeSessionWorkspaceState(sessionId, { open: next });
+  };
+
+  const chat = sessionId ? (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <ChatStoreScopeProvider conversationId={sessionId}>
+        <ChatPage conversationId={sessionId} active={focused} />
+      </ChatStoreScopeProvider>
+    </div>
+  ) : null;
+
   return (
     <div
       className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background"
@@ -211,20 +249,34 @@ function WorkspaceLeafView({
       onPointerDownCapture={focus}
     >
       {leafCount > 1 && sessionId ? (
-        <WorkspacePaneHeader
-          paneId={node.id}
-          sessionId={sessionId}
-          focused={focused}
-          onClose={close}
-        />
-      ) : null}
-      {sessionId ? (
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <ChatStoreScopeProvider conversationId={sessionId}>
-            <ChatPage conversationId={sessionId} active={focused} />
-          </ChatStoreScopeProvider>
-        </div>
-      ) : null}
+        <>
+          <WorkspacePaneHeader
+            paneId={node.id}
+            sessionId={sessionId}
+            title={title}
+            focused={focused}
+            workspaceOpen={workspaceOpen}
+            onToggleWorkspace={toggleWorkspace}
+            onClose={close}
+          />
+          <div
+            data-testid={`session-column-${sessionId}`}
+            className="@container/session-column flex min-h-0 min-w-0 flex-1"
+          >
+            <div
+              data-testid={`session-dock-${sessionId}`}
+              className="flex min-h-0 min-w-0 flex-1 flex-col @min-[720px]/session-column:flex-row"
+            >
+              {chat}
+              {workspaceOpen ? (
+                <SessionWorkspaceDock key={sessionId} conversationId={sessionId} label={title} />
+              ) : null}
+            </div>
+          </div>
+        </>
+      ) : (
+        chat
+      )}
       <WorkspaceDropZones paneId={node.id} />
     </div>
   );
@@ -233,23 +285,20 @@ function WorkspaceLeafView({
 function WorkspacePaneHeader({
   paneId,
   sessionId,
+  title,
   focused,
+  workspaceOpen,
+  onToggleWorkspace,
   onClose,
 }: {
   paneId: string;
   sessionId: string;
+  title: string;
   focused: boolean;
+  workspaceOpen: boolean;
+  onToggleWorkspace: () => void;
   onClose: () => void;
 }) {
-  const { data: conversationsData } = useConversations("", true);
-  const { session } = useSession(sessionId);
-  const title = useMemo(() => {
-    const listed = conversationsData?.pages
-      .flatMap((page) => page.data)
-      .find((conversation) => conversation.id === sessionId);
-    return listed?.title || session?.title || UNTITLED_CONVERSATION_LABEL;
-  }, [conversationsData, session, sessionId]);
-
   return (
     <div className="flex h-8 shrink-0 items-center gap-1 border-b bg-muted/30 pr-1.5 pl-3">
       <span
@@ -261,6 +310,21 @@ function WorkspacePaneHeader({
       >
         {title}
       </span>
+      <button
+        type="button"
+        aria-label={`${workspaceOpen ? "Collapse" : "Expand"} workspace for ${title}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          onToggleWorkspace();
+        }}
+        className="flex size-5 shrink-0 items-center justify-center rounded text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        {workspaceOpen ? (
+          <PanelRightCloseIcon className="size-3" />
+        ) : (
+          <PanelRightIcon className="size-3" />
+        )}
+      </button>
       <button
         type="button"
         aria-label={`Close pane ${sessionId}`}
@@ -275,7 +339,6 @@ function WorkspacePaneHeader({
     </div>
   );
 }
-
 /* SP2K-style drop targets: a plus/cross of five invisible zones armed only
  * while a session drag is active. Nothing shows until the pointer enters a
  * zone, which then lights up with a subtle accent highlight — no icons. */

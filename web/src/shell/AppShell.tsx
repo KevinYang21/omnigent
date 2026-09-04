@@ -1729,6 +1729,7 @@ export function AppShell() {
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
+    !workspaceSplit &&
     hasRailContent &&
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
