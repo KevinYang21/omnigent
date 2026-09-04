@@ -3207,6 +3207,67 @@ def _native_message_from_transcript_record(
     return {"type": "message", "role": role, "content": content}
 
 
+def _compacted_messages_from_summary_chain(
+    records: list[dict[str, object]],
+    *,
+    summary: Mapping[str, object],
+    boundary: Mapping[str, object] | None,
+) -> list[dict[str, object]]:
+    """
+    Build Claude's compacted context in resumable transcript order.
+
+    ``preservedMessages.uuids`` is membership metadata, not an ordering
+    contract. Preserved records are copied from the pre-boundary main chain,
+    so order them by their durable transcript position after proving that
+    each record is an ancestor of the boundary. This excludes sidechains even
+    when their UUIDs appear in malformed metadata and keeps assistant
+    ``tool_use`` records ahead of their user ``tool_result`` children.
+    """
+    summary_message = _native_message_from_transcript_record(summary)
+    if summary_message is None:
+        raise ValueError("compact summary has no native message")
+    snapshot = [summary_message]
+    if boundary is None:
+        return snapshot
+
+    metadata = boundary.get("compactMetadata")
+    preserved = metadata.get("preservedMessages") if isinstance(metadata, dict) else None
+    preserved_uuids = preserved.get("uuids") if isinstance(preserved, dict) else None
+    if not isinstance(preserved_uuids, list):
+        return snapshot
+    requested = {value for value in preserved_uuids if isinstance(value, str)}
+    if not requested:
+        return snapshot
+
+    by_uuid = {
+        record_uuid: record
+        for record in records
+        if isinstance((record_uuid := record.get("uuid")), str)
+    }
+    ancestor_uuids: set[str] = set()
+    parent_uuid = boundary.get("parentUuid")
+    while isinstance(parent_uuid, str) and parent_uuid not in ancestor_uuids:
+        ancestor_uuids.add(parent_uuid)
+        parent = by_uuid.get(parent_uuid)
+        if parent is None:
+            break
+        parent_uuid = parent.get("parentUuid")
+
+    for record in records:
+        record_uuid = record.get("uuid")
+        if (
+            not isinstance(record_uuid, str)
+            or record_uuid not in requested
+            or record_uuid not in ancestor_uuids
+            or record.get("isSidechain") is True
+        ):
+            continue
+        message = _native_message_from_transcript_record(record)
+        if message is not None:
+            snapshot.append(message)
+    return snapshot
+
+
 def _read_native_compaction_snapshot(
     transcript_path: Path,
     summary_source_id: str,
@@ -3220,6 +3281,7 @@ def _read_native_compaction_snapshot(
     that boundary's ``compactMetadata.preservedMessages.uuids`` list.
     """
     summary_uuid = summary_source_id.split(":", 1)[0]
+    records: list[dict[str, object]] = []
     by_uuid: dict[str, dict[str, object]] = {}
     with transcript_path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -3231,6 +3293,7 @@ def _read_native_compaction_snapshot(
                 continue
             if not isinstance(value, dict):
                 continue
+            records.append(value)
             record_uuid = value.get("uuid")
             if isinstance(record_uuid, str):
                 by_uuid[record_uuid] = value
@@ -3238,30 +3301,17 @@ def _read_native_compaction_snapshot(
     summary = by_uuid.get(summary_uuid)
     if summary is None or summary.get("isCompactSummary") is not True:
         raise ValueError(f"compact summary {summary_uuid!r} is not durable in {transcript_path}")
-    summary_message = _native_message_from_transcript_record(summary)
-    if summary_message is None:
-        raise ValueError(f"compact summary {summary_uuid!r} has no native message")
-
-    snapshot = [summary_message]
     parent_uuid = summary.get("parentUuid")
     boundary = by_uuid.get(parent_uuid) if isinstance(parent_uuid, str) else None
     if boundary is not None and (
         boundary.get("type") != "system" or boundary.get("subtype") != "compact_boundary"
     ):
         raise ValueError(f"compact summary {summary_uuid!r} has a non-boundary parent")
-    metadata = boundary.get("compactMetadata") if boundary is not None else None
-    preserved = metadata.get("preservedMessages") if isinstance(metadata, dict) else None
-    preserved_uuids = preserved.get("uuids") if isinstance(preserved, dict) else None
-    if isinstance(preserved_uuids, list):
-        for record_uuid in preserved_uuids:
-            if not isinstance(record_uuid, str) or record_uuid == summary_uuid:
-                continue
-            record = by_uuid.get(record_uuid)
-            if record is None:
-                continue
-            message = _native_message_from_transcript_record(record)
-            if message is not None:
-                snapshot.append(message)
+    snapshot = _compacted_messages_from_summary_chain(
+        records,
+        summary=summary,
+        boundary=boundary,
+    )
     return summary_uuid, snapshot
 
 
@@ -3370,25 +3420,6 @@ async def _handle_compact_summary_item_unlocked(
             snapshot_source="transcript",
         )
     except httpx.HTTPError as exc:
-        if post_may_have_been_delivered(exc):
-            # Ambiguous delivery: the boundary may already be committed.
-            # Mark persisted and advance rather than risk a duplicate
-            # boundary — mirrors the item-forwarding ambiguous-failure rule.
-            _logger.warning(
-                "Ambiguous compaction boundary POST for %s (may be committed); "
-                "marking persisted to avoid a duplicate boundary; seq=%s",
-                session_id,
-                seq,
-                exc_info=True,
-            )
-            retry_tracker.clear(retry_key)
-            await _mark_compaction_persisted(
-                bridge_dir,
-                seq,
-                expect_completion_ack=True,
-                summary_id=summary_id,
-            )
-            return True
         decision = retry_tracker.record_failure(retry_key, exc)
         _logger.warning(
             "Failed to persist compaction boundary (transcript path); "
@@ -4703,6 +4734,7 @@ async def _persist_native_compaction_item(
     summary_override: str | None = None,
     compacted_messages_override: list[dict[str, object]] | None = None,
     snapshot_source: str = "hook_fallback",
+    fallback_snapshot_loaded: bool = False,
 ) -> None:
     """
     Persist a compaction boundary item to the conversation store.
@@ -4744,23 +4776,8 @@ async def _persist_native_compaction_item(
     # Read the post-compaction session messages so session resume can
     # reconstruct context in ephemeral environments.
     compacted_messages = compacted_messages_override
-    if compacted_messages is None:
-        try:
-            from claude_agent_sdk import get_session_messages
-
-            claude_sid = read_claude_session_id(bridge_dir)
-            if claude_sid:
-                msgs = get_session_messages(claude_sid)
-                compacted_messages = [
-                    {"type": "message", "role": m.type, "content": m.message.get("content", [])}
-                    for m in msgs
-                    if isinstance(m.message, dict)
-                ]
-        except Exception:  # noqa: BLE001
-            _logger.debug(
-                "Failed to read Claude session messages for compaction fallback",
-                exc_info=True,
-            )
+    if compacted_messages is None and not fallback_snapshot_loaded:
+        compacted_messages = await _read_sdk_compaction_snapshot(bridge_dir)
 
     summary = (
         summary_override
@@ -4785,6 +4802,37 @@ async def _persist_native_compaction_item(
         },
     )
     resp.raise_for_status()
+
+
+async def _read_sdk_compaction_snapshot(
+    bridge_dir: Path,
+) -> list[dict[str, object]] | None:
+    """Read the synchronous Claude SDK fallback without blocking the loop."""
+
+    def _read() -> list[dict[str, object]] | None:
+        try:
+            from claude_agent_sdk import get_session_messages
+
+            claude_sid = read_claude_session_id(bridge_dir)
+            if not claude_sid:
+                return None
+            return [
+                {
+                    "type": "message",
+                    "role": message.type,
+                    "content": message.message.get("content", []),
+                }
+                for message in get_session_messages(claude_sid)
+                if isinstance(message.message, dict)
+            ]
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Failed to read Claude session messages for compaction fallback",
+                exc_info=True,
+            )
+            return None
+
+    return await asyncio.to_thread(_read)
 
 
 async def _patch_external_session_id(
@@ -5357,22 +5405,41 @@ async def _maybe_persist_compaction_fallback(
             or pending.seq in state.persisted_seqs
         ):
             return False
+
+        pending_seq = pending.seq
+
+    # The SDK API is synchronous and may perform slow disk reads. Keep both it
+    # and its worker-thread wait outside the reconciliation lock so a durable
+    # transcript summary that arrives meanwhile can supersede this fallback.
+    compacted_messages = await _read_sdk_compaction_snapshot(bridge_dir)
+
+    async with _compaction_lock(bridge_dir):
+        latest = _read_compaction_state(bridge_dir)
+        if (
+            latest.pending is None
+            or latest.pending.seq != pending_seq
+            or latest.fallback_persisted_seq == pending_seq
+            or pending_seq in latest.persisted_seqs
+        ):
+            return False
         try:
             await _persist_native_compaction_item(
                 client,
                 session_id=session_id,
                 bridge_dir=bridge_dir,
+                compacted_messages_override=compacted_messages,
                 snapshot_source="hook_fallback",
+                fallback_snapshot_loaded=True,
             )
         except httpx.HTTPError as exc:
             if not post_may_have_been_delivered(exc):
                 raise
         latest = _read_compaction_state(bridge_dir)
-        if latest.pending is None or latest.pending.seq != pending.seq:
+        if latest.pending is None or latest.pending.seq != pending_seq:
             return False
         _write_compaction_state(
             bridge_dir,
-            replace(latest, fallback_persisted_seq=pending.seq),
+            replace(latest, fallback_persisted_seq=pending_seq),
         )
         return True
 

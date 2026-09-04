@@ -7252,24 +7252,6 @@ def _write_compaction_transcript(
     """Write the native boundary/summary shape emitted by Claude Code."""
     records = [
         {
-            "type": "system",
-            "subtype": "compact_boundary",
-            "uuid": "boundary-uuid",
-            "parentUuid": None,
-            "compactMetadata": {
-                "preservedMessages": {
-                    "uuids": ["preserved-user", "preserved-assistant"],
-                }
-            },
-        },
-        {
-            "type": "user",
-            "uuid": summary_uuid,
-            "parentUuid": "boundary-uuid",
-            "isCompactSummary": True,
-            "message": {"role": "user", "content": summary},
-        },
-        {
             "type": "user",
             "uuid": "preserved-user",
             "parentUuid": None,
@@ -7283,6 +7265,24 @@ def _write_compaction_transcript(
                 "role": "assistant",
                 "content": [{"type": "text", "text": "preserved answer"}],
             },
+        },
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary-uuid",
+            "parentUuid": "preserved-assistant",
+            "compactMetadata": {
+                "preservedMessages": {
+                    "uuids": ["preserved-user", "preserved-assistant"],
+                }
+            },
+        },
+        {
+            "type": "user",
+            "uuid": summary_uuid,
+            "parentUuid": "boundary-uuid",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": summary},
         },
     ]
     path.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
@@ -7319,6 +7319,119 @@ async def test_compact_summary_first_claims_generation_from_artifact(tmp_path: P
             "role": "assistant",
             "content": [{"type": "text", "text": "preserved answer"}],
         },
+    ]
+
+
+def test_compaction_snapshot_orders_shuffled_tools_and_excludes_sidechain(
+    tmp_path: Path,
+) -> None:
+    """Preserved UUID metadata is membership-only; the main transcript chain orders it."""
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {
+            "type": "user",
+            "uuid": "prompt",
+            "parentUuid": None,
+            "isSidechain": False,
+            "message": {"role": "user", "content": "inspect the file"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "tool-use",
+            "parentUuid": "prompt",
+            "isSidechain": False,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_read",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/example"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "tool-result",
+            "parentUuid": "tool-use",
+            "isSidechain": False,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_read",
+                        "content": "contents",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "sidechain",
+            "parentUuid": "prompt",
+            "isSidechain": True,
+            "message": {"role": "assistant", "content": "side investigation"},
+        },
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary",
+            "parentUuid": "tool-result",
+            "isSidechain": False,
+            "compactMetadata": {
+                "preservedMessages": {
+                    # Deliberately reverse tool records and include a sidechain.
+                    "uuids": ["tool-result", "sidechain", "prompt", "tool-use"],
+                }
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "summary",
+            "parentUuid": "boundary",
+            "isSidechain": False,
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "summary context"},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    summary_id, snapshot = forwarder._read_native_compaction_snapshot(
+        transcript,
+        "summary:0:compact_summary",
+    )
+
+    assert summary_id == "summary"
+    assert [(message["role"], message["content"]) for message in snapshot] == [
+        ("user", "summary context"),
+        ("user", "inspect the file"),
+        (
+            "assistant",
+            [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_read",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/example"},
+                }
+            ],
+        ),
+        (
+            "user",
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_read",
+                    "content": "contents",
+                }
+            ],
+        ),
     ]
 
 
@@ -7408,6 +7521,143 @@ async def test_fallback_is_superseded_once_by_durable_summary(tmp_path: Path) ->
     state = _read_compaction_state(bridge_dir)
     assert state.persisted_summary_ids == ("summary-uuid",)
     assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_sdk_read_does_not_block_event_loop(tmp_path: Path) -> None:
+    """A blocked synchronous SDK snapshot runs in a worker thread."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=None,
+    )
+    await _acknowledge_compaction_completion(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=None,
+        now=10.0,
+    )
+    sdk_entered = threading.Event()
+    sdk_release = threading.Event()
+
+    def blocking_session_read(_session_id: str) -> list[Any]:
+        sdk_entered.set()
+        assert sdk_release.wait(timeout=5.0)
+        return []
+
+    persist = _persist_mock()
+    with (
+        patch(
+            "omnigent.claude_native_forwarder.read_claude_session_id",
+            return_value="claude-1",
+        ),
+        patch(
+            "claude_agent_sdk.get_session_messages",
+            side_effect=blocking_session_read,
+        ),
+        patch(
+            "omnigent.claude_native_forwarder._persist_native_compaction_item",
+            persist,
+        ),
+    ):
+        fallback = asyncio.create_task(
+            _maybe_persist_compaction_fallback(
+                AsyncMock(),
+                session_id="conv-heartbeat",
+                bridge_dir=bridge_dir,
+                now=12.0,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(sdk_entered.wait, 1.0)
+            heartbeat = asyncio.Event()
+
+            async def beat() -> None:
+                await asyncio.sleep(0)
+                heartbeat.set()
+
+            heartbeat_task = asyncio.create_task(beat())
+            await asyncio.wait_for(heartbeat.wait(), timeout=0.5)
+            await heartbeat_task
+        finally:
+            sdk_release.set()
+        assert await fallback is True
+
+    persist.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_transcript_summary_wins_during_threaded_fallback_read(
+    tmp_path: Path,
+) -> None:
+    """A durable summary arriving during the SDK read prevents a stale fallback POST."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    _write_compaction_transcript(transcript)
+    await _note_precompact(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+    )
+    await _acknowledge_compaction_completion(
+        bridge_dir,
+        claude_session_id="claude-1",
+        transcript_path=str(transcript),
+        now=10.0,
+    )
+    sdk_entered = threading.Event()
+    sdk_release = threading.Event()
+
+    def blocking_session_read(_session_id: str) -> list[Any]:
+        sdk_entered.set()
+        assert sdk_release.wait(timeout=5.0)
+        return []
+
+    persist = _persist_mock()
+    with (
+        patch(
+            "omnigent.claude_native_forwarder.read_claude_session_id",
+            return_value="claude-1",
+        ),
+        patch(
+            "claude_agent_sdk.get_session_messages",
+            side_effect=blocking_session_read,
+        ),
+        patch(
+            "omnigent.claude_native_forwarder._persist_native_compaction_item",
+            persist,
+        ),
+    ):
+        fallback = asyncio.create_task(
+            _maybe_persist_compaction_fallback(
+                AsyncMock(),
+                session_id="conv-race",
+                bridge_dir=bridge_dir,
+                now=12.0,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(sdk_entered.wait, 1.0)
+            assert await _handle_compact_summary_item(
+                AsyncMock(),
+                session_id="conv-race",
+                bridge_dir=bridge_dir,
+                item=_compact_summary_item(),
+                retry_tracker=_PostRetryTracker(),
+            )
+        finally:
+            sdk_release.set()
+
+        assert await fallback is False
+
+    persist.assert_awaited_once()
+    assert persist.call_args.kwargs["snapshot_source"] == "transcript"
+    state = _read_compaction_state(bridge_dir)
+    assert state.fallback_persisted_seq == 0
+    assert state.persisted_summary_ids == ("summary-uuid",)
 
 
 @pytest.mark.asyncio
@@ -7689,14 +7939,13 @@ async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
+async def test_ambiguous_authoritative_boundary_post_holds_cursor(tmp_path: Path) -> None:
     """
-    An ambiguous POST failure is treated as delivered (no duplicate boundary).
+    An ambiguous authoritative POST does not consume the summary.
 
-    Mirrors the item-forwarding rule: when the server may already have
-    committed the boundary (e.g. a dropped response on a 2xx), retrying would
-    risk a duplicate compaction bubble, so the sequence is marked persisted
-    and the record advanced.
+    The transcript snapshot is the authoritative compaction record. Without a
+    confirmed successful POST, its cursor must remain before the summary so a
+    later poll retries rather than silently losing resumable context.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -7708,10 +7957,7 @@ async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
 
     ambiguous = AsyncMock(side_effect=httpx.ReadError("connection dropped mid-response"))
 
-    with (
-        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ambiguous),
-        patch("omnigent.claude_native_forwarder.post_may_have_been_delivered", return_value=True),
-    ):
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ambiguous):
         handled = await _handle_compact_summary_item(
             AsyncMock(),
             session_id="conv_ambiguous",
@@ -7720,10 +7966,11 @@ async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
             retry_tracker=_PostRetryTracker(),
         )
 
-    assert handled is True
+    assert handled is False
     state = _read_compaction_state(bridge_dir)
-    assert 1 in state.persisted_seqs
-    assert state.pending is None
+    assert state.persisted_seqs == ()
+    assert state.pending is not None
+    assert state.pending.seq == 1
 
 
 @pytest.mark.asyncio
