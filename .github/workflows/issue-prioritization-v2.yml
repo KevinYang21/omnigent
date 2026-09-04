@@ -20,7 +20,7 @@ on:
       apply:
         description: Apply the planned changes instead of producing a dry run
         required: false
-        default: true
+        default: false
         type: boolean
       manual_dispatch:
         description: Use the caller's explicit duplicate-comment choice
