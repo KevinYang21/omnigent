@@ -13,6 +13,7 @@ import {
   ArrowLeftIcon,
   ArrowRightIcon,
   ArrowUpIcon,
+  CornerDownLeftIcon,
   Loader2Icon,
   type LucideIcon,
 } from "lucide-react";
@@ -787,9 +788,9 @@ export function TerminalView({
 }
 
 /**
- * The on-screen keys, left→right. Arrows render as icons; Esc renders as a
- * glyph and Shift+Tab as stacked words (lucide has no icon for either),
- * grouped so the arrow cluster reads as a unit between them.
+ * The on-screen keys, left→right. Arrows and Enter render as icons; Esc as a
+ * glyph and Shift+Tab as stacked words (lucide has no icon for either), with
+ * the arrow cluster reading as a unit in the middle.
  */
 const MOBILE_KEYS: readonly {
   key: TerminalMobileKey;
@@ -799,12 +800,13 @@ const MOBILE_KEYS: readonly {
   /** Stacked text lines, for keys with no single glyph (e.g. Shift+Tab). */
   lines?: readonly string[];
 }[] = [
+  { key: "shift-tab", label: "Shift + Tab", lines: ["SHIFT", "TAB"] },
   { key: "escape", label: "Escape", glyph: "esc" },
   { key: "left", label: "Left arrow", icon: ArrowLeftIcon },
   { key: "up", label: "Up arrow", icon: ArrowUpIcon },
   { key: "down", label: "Down arrow", icon: ArrowDownIcon },
   { key: "right", label: "Right arrow", icon: ArrowRightIcon },
-  { key: "shift-tab", label: "Shift + Tab", lines: ["SHIFT", "TAB"] },
+  { key: "enter", label: "Enter", icon: CornerDownLeftIcon },
 ];
 
 /**

@@ -442,11 +442,12 @@ describe("wheelReportPayload", () => {
 // ---------------------------------------------------------------------------
 describe("terminalMobileKeyPayload", () => {
   it("encodes mode-independent keys", () => {
-    // Esc and Shift+Tab (CSI Z backtab) don't depend on cursor-key mode, so
-    // both mode arguments must yield the same bytes.
+    // Esc, Shift+Tab (CSI Z backtab), and Enter (CR) don't depend on
+    // cursor-key mode, so both mode arguments must yield the same bytes.
     for (const appCursor of [false, true]) {
       expect(terminalMobileKeyPayload("escape", appCursor)).toBe("\x1b");
       expect(terminalMobileKeyPayload("shift-tab", appCursor)).toBe("\x1b[Z");
+      expect(terminalMobileKeyPayload("enter", appCursor)).toBe("\r");
     }
   });
 

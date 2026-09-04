@@ -814,17 +814,19 @@ describe("mobile terminal key bar", () => {
   it("renders the key bar on a mobile viewport", async () => {
     await renderOn(true);
     const bar = screen.getByTestId("terminal-mobile-keys");
-    // The six keys the phone keyboard lacks, in the requested order.
-    for (const label of [
+    // The keys the phone keyboard lacks, in the requested left→right order.
+    const order = within(bar)
+      .getAllByRole("button")
+      .map((b) => b.getAttribute("aria-label"));
+    expect(order).toEqual([
+      "Shift + Tab",
       "Escape",
       "Left arrow",
       "Up arrow",
       "Down arrow",
       "Right arrow",
-      "Shift + Tab",
-    ]) {
-      expect(within(bar).getByRole("button", { name: label })).toBeInTheDocument();
-    }
+      "Enter",
+    ]);
     // Shift+Tab shows its label as stacked words (no glyph); the accessible
     // name stays "Shift + Tab" via aria-label.
     const shiftTab = within(bar).getByRole("button", { name: "Shift + Tab" });
@@ -851,9 +853,11 @@ describe("mobile terminal key bar", () => {
 
     fireEvent.click(within(bar).getByRole("button", { name: "Escape" }));
     fireEvent.click(within(bar).getByRole("button", { name: "Up arrow" }));
+    fireEvent.click(within(bar).getByRole("button", { name: "Enter" }));
 
     expect(sendMobileKey).toHaveBeenNthCalledWith(1, "escape");
     expect(sendMobileKey).toHaveBeenNthCalledWith(2, "up");
+    expect(sendMobileKey).toHaveBeenNthCalledWith(3, "enter");
   });
 
   it("suppresses the pointer-down focus grab so the soft keyboard stays up", async () => {

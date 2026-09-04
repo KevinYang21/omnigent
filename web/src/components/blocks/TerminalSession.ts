@@ -225,7 +225,7 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
  * Keys the on-screen (mobile) key bar can send — the ones a phone soft
  * keyboard has no dedicated key for.
  */
-export type TerminalMobileKey = "escape" | "shift-tab" | "up" | "down" | "left" | "right";
+export type TerminalMobileKey = "escape" | "shift-tab" | "enter" | "up" | "down" | "left" | "right";
 
 /**
  * Terminal byte sequence for a {@link TerminalMobileKey}.
@@ -234,8 +234,8 @@ export type TerminalMobileKey = "escape" | "shift-tab" | "up" | "down" | "left" 
  * (application cursor keys — xterm's ``applicationCursorKeysMode``) expects the
  * ``ESC O x`` form; everything else expects plain ``ESC [ x``. Encoding against
  * the pane's live mode makes a tapped arrow byte-identical to a physical arrow
- * press, which is exactly what xterm's own ``onData`` emits. Escape (``ESC``)
- * and Shift+Tab (CSI ``Z`` — "backtab") are mode-independent.
+ * press, which is exactly what xterm's own ``onData`` emits. Escape (``ESC``),
+ * Shift+Tab (CSI ``Z`` — "backtab"), and Enter (``CR``) are mode-independent.
  *
  * Pure helper — exported for direct unit testing.
  *
@@ -253,6 +253,10 @@ export function terminalMobileKeyPayload(
       return "\x1b";
     case "shift-tab":
       return "\x1b[Z";
+    case "enter":
+      // Carriage return, matching a physical Return key; the pane's tty
+      // translates CR→LF as needed.
+      return "\r";
     case "up":
       return applicationCursorKeys ? "\x1bOA" : "\x1b[A";
     case "down":
