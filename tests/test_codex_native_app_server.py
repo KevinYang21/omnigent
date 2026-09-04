@@ -2395,3 +2395,53 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
             _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-9-9")
             == "databricks-gpt-9-9"
         )
+
+
+def test_probe_codex_home_bridges_provider_tables_and_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The probe home carries the provider tables its overrides name.
+
+    A launch shape resolved off the user's ``config.toml`` pins only a
+    provider *name* (``-c model_provider="Databricks"``). Codex refuses to
+    load a config that names an undefined provider, exiting before it binds
+    the listener, so a probe home holding only a credential yields no
+    catalog at all. Minimal keeps the user's MCP/hook/plugin config out.
+    """
+    from omnigent import codex_native_app_server
+
+    source = tmp_path / ".codex"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model_provider = "Databricks"\n'
+        "\n"
+        "[model_providers.Databricks]\n"
+        'base_url = "https://ws.example/serving-endpoints"\n'
+        "\n"
+        "[mcp_servers.slow]\n"
+        'command = "sleep"\n'
+    )
+    (source / ".credentials.json").write_text("{}")
+    (source / "hooks.json").write_text("{}")
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
+
+    config = (home / "config.toml").read_text()
+    assert "[model_providers.Databricks]" in config
+    assert "https://ws.example/serving-endpoints" in config
+    # The credential the account's catalog is gated on, in either spelling.
+    assert (home / ".credentials.json").is_symlink()
+    # Minimal: no MCPs to boot and no hooks to fire during a probe.
+    assert "mcp_servers" not in config
+    assert not (home / "hooks.json").exists()
+
+    # A persistent home must re-read an edited source config, not pin the
+    # tables copied on first use.
+    (source / "config.toml").write_text(
+        'model_provider = "Other"\n\n[model_providers.Other]\nbase_url = "https://two.example"\n'
+    )
+    home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
+    assert "https://two.example" in (home / "config.toml").read_text()

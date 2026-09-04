@@ -737,11 +737,11 @@ describe("LatestTurnSpacer", () => {
     vi.unstubAllGlobals();
   });
 
-  function rect(top: number): DOMRect {
+  function rect(top: number, bottom = top): DOMRect {
     return {
       top,
-      bottom: top,
-      height: 0,
+      bottom,
+      height: bottom - top,
       left: 0,
       right: 0,
       width: 0,
@@ -765,6 +765,8 @@ describe("LatestTurnSpacer", () => {
     anchorTop: number;
     spacerTop: number;
     anchor: "user" | "text" | "none";
+    /** Bottom edge of the content column, when its trailing padding matters. */
+    contentBottom?: number;
   }): number {
     const holder: { cb: (() => void) | null } = { cb: null };
     class StubResizeObserver {
@@ -801,6 +803,11 @@ describe("LatestTurnSpacer", () => {
     const { container } = render(<LatestTurnSpacer />);
     const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
     vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(opts.spacerTop));
+    if (opts.contentBottom !== undefined) {
+      vi.spyOn(spacer.parentElement!, "getBoundingClientRect").mockReturnValue(
+        rect(0, opts.contentBottom),
+      );
+    }
     // Re-measure now that the rects are pinned (mount ran against jsdom's 0s).
     act(() => holder.cb?.());
 
@@ -848,6 +855,36 @@ describe("LatestTurnSpacer", () => {
     expect(measureSpacer({ clientHeight: 600, anchorTop: 0, spacerTop: 400, anchor: "user" })).toBe(
       104,
     );
+  });
+
+  it("leaves the column's trailing padding out of the reservation", () => {
+    // The padding below the spacer scrolls with the content: reserving it
+    // again would leave the document 24px taller than the viewport — a
+    // phantom scroll range that paints a scrollbar thumb over a transcript
+    // that fully fits. 600 − 400 − 96 − 24 = 80, not 104.
+    expect(
+      measureSpacer({
+        clientHeight: 600,
+        anchorTop: 0,
+        spacerTop: 400,
+        anchor: "user",
+        contentBottom: 424,
+      }),
+    ).toBe(80);
+  });
+
+  it("clamps to zero when the trailing padding alone would overdraw the viewport", () => {
+    // Reply nearly fills the viewport: 600 − 490 − 96 = 14 raw, minus 24px of
+    // trailing padding goes negative — the spacer must not go below 0.
+    expect(
+      measureSpacer({
+        clientHeight: 600,
+        anchorTop: 0,
+        spacerTop: 490,
+        anchor: "user",
+        contentBottom: 514,
+      }),
+    ).toBe(0);
   });
 
   it("caps the reserved space so a short turn does not blank most of the viewport", () => {
@@ -1075,6 +1112,26 @@ describe("JumpToTopButton", () => {
     // Scrolling down (scrollTop increases) must not surface the pill.
     act(() => {
       metrics.scrollTop = 600;
+      fireEvent.scroll(scroll);
+    });
+    expect(pill().className).toContain("pointer-events-none");
+  });
+
+  it("does not mistake bottom re-anchoring for an upward scroll", () => {
+    const metrics = {
+      scrollTop: 600,
+      scrollHeight: 1000,
+      clientHeight: 400,
+    };
+    const { container, scroll, scroller } = makeScroller(metrics);
+
+    render(<JumpToTopButton containerEl={container} scroller={scroller} hasMoreHistory={true} />);
+
+    // Removing transient content can reduce both scrollHeight and scrollTop
+    // while the viewport remains pinned to the bottom.
+    act(() => {
+      metrics.scrollHeight = 800;
+      metrics.scrollTop = 400;
       fireEvent.scroll(scroll);
     });
     expect(pill().className).toContain("pointer-events-none");

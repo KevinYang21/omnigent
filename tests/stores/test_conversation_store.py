@@ -1200,6 +1200,137 @@ def test_list_items_cursor_scoped_to_conversation(
     assert before_page.data == []
 
 
+def _captured_item_statement_limits(store: SqlAlchemyConversationStore, run) -> list[int]:
+    """
+    Capture the LIMIT value of every ``conversation_items`` SELECT that
+    ``run()`` sends to the database.
+
+    Values are read from the statement objects at the engine boundary — the
+    same place a backend sees them — so the assertion holds for exactly what
+    each SQL statement asked for, not what the store returned.
+    """
+    limits: list[int] = []
+
+    def _before(conn, clauseelement, multiparams, params, execution_options):
+        limit_clause = getattr(clauseelement, "_limit_clause", None)
+        if limit_clause is None:
+            return
+        value = getattr(limit_clause, "value", None)
+        if isinstance(value, int) and "conversation_items" in str(clauseelement):
+            limits.append(value)
+
+    event.listen(store._conv_engine, "before_execute", _before)
+    try:
+        run()
+    finally:
+        event.remove(store._conv_engine, "before_execute", _before)
+    return limits
+
+
+def _append_n_messages(conversation_store: SqlAlchemyConversationStore, conv_id: str, n: int):
+    """Helper: append ``n`` small messages and return the persisted items."""
+    return conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_bulk",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"bulk-{i}"}],
+                ),
+            )
+            for i in range(n)
+        ],
+    )
+
+
+# The deployed managed-Postgres backend served item reads fine at
+# ``limit<=400`` and 500'd at ``limit>=500`` on a large conversation. Reads
+# above this row count are therefore proven to be unservable there; no single
+# SQL statement may ask for more.
+_DEPLOYED_SAFE_READ_ROWS = 400
+
+
+def test_list_items_large_page_reads_in_bounded_statements(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A large requested page must never become one oversized SQL read.
+
+    A deployed managed-Postgres backend failed a single big-page read of a
+    large conversation (500 at ``limit>=500``) while serving the same rows
+    fine in smaller statements — which broke every ``limit=1000`` caller,
+    most visibly claude-native cold resume. The page must be assembled from
+    bounded per-statement reads, while the returned page stays identical:
+    complete, ordered, and correctly flagged ``has_more``.
+    """
+    conv = conversation_store.create_conversation()
+    items = _append_n_messages(conversation_store, conv.id, 550)
+
+    pages = []
+    limits = _captured_item_statement_limits(
+        conversation_store,
+        lambda: pages.append(conversation_store.list_items(conv.id, limit=500)),
+    )
+    [page] = pages
+
+    assert limits, "expected at least one conversation_items SELECT"
+    oversized = [lim for lim in limits if lim > _DEPLOYED_SAFE_READ_ROWS]
+    assert not oversized, (
+        f"list_items sent statements asking for {oversized} rows — beyond the "
+        f"{_DEPLOYED_SAFE_READ_ROWS}-row reads the deployed backend is proven "
+        f"to serve; a big-conversation page must be stitched from bounded reads"
+    )
+
+    # The stitched page is byte-for-byte what one big read used to return.
+    assert [it.id for it in page.data] == [it.id for it in items[:500]]
+    assert page.has_more is True
+    assert page.first_id == items[0].id
+    assert page.last_id == items[499].id
+
+    # And the follow-up cursor page picks up exactly where it left off.
+    rest = conversation_store.list_items(conv.id, limit=500, after=page.last_id)
+    assert [it.id for it in rest.data] == [it.id for it in items[500:]]
+    assert rest.has_more is False
+
+
+def test_list_items_large_page_desc_and_cursor_cross_chunks(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Chunked assembly preserves ordering/cursor semantics in ``desc`` order
+    and with an ``after`` cursor that lands mid-conversation.
+    """
+    conv = conversation_store.create_conversation()
+    items = _append_n_messages(conversation_store, conv.id, 450)
+
+    desc_page = conversation_store.list_items(conv.id, limit=430, order="desc")
+    assert [it.id for it in desc_page.data] == [it.id for it in reversed(items)][:430]
+    assert desc_page.has_more is True
+
+    after_page = conversation_store.list_items(conv.id, limit=430, after=items[9].id)
+    assert [it.id for it in after_page.data] == [it.id for it in items[10:440]]
+    assert after_page.has_more is True
+
+
+def test_list_items_small_page_stays_single_statement(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Pages at or under the per-statement cap keep the single-SELECT shape —
+    the chunking is strictly a big-page fallback, not a per-page overhead.
+    """
+    conv = conversation_store.create_conversation()
+    _append_n_messages(conversation_store, conv.id, 12)
+
+    limits = _captured_item_statement_limits(
+        conversation_store,
+        lambda: conversation_store.list_items(conv.id, limit=10),
+    )
+    assert limits == [11], limits  # limit + 1 sentinel row, one statement
+
+
 # ── Conversation ID / response ID lookups ────────────
 
 
@@ -3026,6 +3157,58 @@ def test_create_session_with_agent_records_workspace(
     assert fetched is not None
     assert fetched.workspace == "/Users/corey/projects/cli-launch"
     assert fetched.host_id is None
+
+
+def test_create_session_with_agent_records_host_id_with_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify create_session_with_agent persists host_id alongside workspace.
+
+    The multipart ``POST /v1/sessions`` form accepts ``metadata.host_id``
+    for launching the bundled session's runner on an external host; the
+    binding must land on the row at creation so the launch flow (and the
+    session snapshot) sees it. Before this parameter existed, the
+    bundled-create path silently dropped the caller's host binding.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="5b6cf1f0662a1eab8722ca44e9d0b111",
+        agent_name="host-bound-bundle-agent",
+        agent_bundle_location="5b6cf1f0662a1eab8722ca44e9d0b111/bundle1",
+        agent_description=None,
+        workspace="/Users/corey/projects/bundled",
+        host_id="3f866cafac81246fb60ae6ceb1a738da",
+    )
+
+    fetched = conversation_store.get_conversation(created.conversation.id)
+    assert fetched is not None
+    assert fetched.host_id == "3f866cafac81246fb60ae6ceb1a738da"
+    assert fetched.workspace == "/Users/corey/projects/bundled"
+
+
+def test_create_session_with_agent_host_id_requires_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Verify host_id without a workspace is rejected at insert.
+
+    The ``workspace_required_for_host`` check constraint guards the
+    pairing; a caller that validated ``host_id`` but forgot the
+    workspace must fail loudly instead of writing a row the launch
+    flow can't use.
+    """
+    # MySQL reports check-constraint violations (error 3819) as
+    # OperationalError rather than IntegrityError.
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    with pytest.raises((IntegrityError, OperationalError)):
+        conversation_store.create_session_with_agent(
+            agent_id="9d1de2b7dd35c74faf05ff54c99ab222",
+            agent_name="host-no-ws-agent",
+            agent_bundle_location="9d1de2b7dd35c74faf05ff54c99ab222/bundle1",
+            agent_description=None,
+            host_id="3f866cafac81246fb60ae6ceb1a738da",
+        )
 
 
 def test_create_session_with_agent_workspace_defaults_to_none(

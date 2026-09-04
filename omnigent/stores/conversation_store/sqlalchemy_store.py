@@ -113,6 +113,15 @@ _logger = logging.getLogger(__name__)
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
+# Upper bound on rows fetched per SQL statement when listing conversation
+# items. A deployed managed-Postgres backend failed one oversized read of a
+# large conversation (multi-megabyte pages 500'd at limit>=500 while limit<=400
+# served fine), so ``list_items`` assembles bigger pages from bounded reads
+# stitched on ``position``. 200 keeps 2x headroom under the last known-good
+# read size (row payloads vary) while the default 100-row page stays the
+# single statement it always was.
+_LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
+
 # How many co-located sessions ``has_other_live_session_in_workspace`` will
 # name before it stops looking. Real directories hold one or two sessions; the
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
@@ -308,6 +317,7 @@ def _new_session_metadata_row(
     workspace: str | None = None,
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
+    host_id: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -321,6 +331,10 @@ def _new_session_metadata_row(
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper. ``None`` leaves it NULL; a list
         (including ``[]``) is JSON-encoded.
+    :param host_id: Optional external host the session binds to. Callers
+        must supply ``workspace`` alongside it (the
+        ``workspace_required_for_host`` check constraint enforces the
+        pairing). ``None`` leaves the column NULL.
     :returns: Unsaved :class:`SqlConversationMetadata` row.
     """
     return SqlConversationMetadata(
@@ -328,6 +342,7 @@ def _new_session_metadata_row(
         kind=encode_conversation_kind("sub_agent" if parent_conversation_id else "default"),
         runner_id=runner_id,
         project_id=project_id,
+        host_id=host_id,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -1870,6 +1885,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationItem.created_at,
                         SqlConversationItem.data,
                         SqlConversationItem.created_by,
+                        # position stitches chunked reads below; loading it here
+                        # avoids a per-chunk lazy refresh that would pull the
+                        # wide search_text column back in.
+                        SqlConversationItem.position,
                     )
                 )
                 .where(
@@ -1915,8 +1934,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                     if is_asc
                     else SqlConversationItem.position > sub
                 )
-            stmt = stmt.order_by(sort_fn(SqlConversationItem.position)).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
+            # Never ask the backend for more than the per-statement row cap:
+            # deployed managed Postgres failed one oversized read of a large
+            # conversation while serving the same rows fine in smaller
+            # statements. Chunks stitch on position (unique per conversation
+            # via the append counter); pages at or under the cap remain the
+            # single statement they always were.
+            stmt = stmt.order_by(sort_fn(SqlConversationItem.position))
+            target = limit + 1  # one sentinel row decides has_more
+            rows: list[SqlConversationItem] = []
+            last_position: int | None = None
+            while len(rows) < target:
+                chunk_stmt = stmt
+                if last_position is not None:
+                    chunk_stmt = chunk_stmt.where(
+                        SqlConversationItem.position > last_position
+                        if is_asc
+                        else SqlConversationItem.position < last_position
+                    )
+                chunk_size = min(target - len(rows), _LIST_ITEMS_MAX_ROWS_PER_STATEMENT)
+                chunk = list(session.execute(chunk_stmt.limit(chunk_size)).scalars().all())
+                rows.extend(chunk)
+                if len(chunk) < chunk_size:
+                    break
+                last_position = chunk[-1].position
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
@@ -3336,6 +3377,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        host_id: str | None = None,
     ) -> CreatedSession:
         """
         Atomically insert a conversation row and session-scoped agent.
@@ -3367,10 +3409,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``"/Users/corey/projects/myapp"``. CLI-launched
             sessions populate this with ``os.getcwd()``;
             multipart bundle uploads from the Web UI may pass
-            ``None``. ``None`` is allowed because this path
-            doesn't set ``host_id`` (so the
+            ``None`` — but only when ``host_id`` is also unset (the
             ``ck_conversations_workspace_required_for_host``
-            constraint isn't active).
+            constraint requires the pair).
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -3384,6 +3425,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             creation time, e.g. ``"runner_abc123"``. Child sessions
             inherit the parent's binding through this field so
             runner dispatch remains explicit in store state.
+        :param host_id: Optional external host the session binds to,
+            e.g. ``"host_a1b2c3d4..."``. Persisted at creation so a
+            bundled create with a caller-supplied host can launch a
+            runner on it, mirroring the JSON create path. Requires a
+            non-``None`` ``workspace``.
         :returns: A :class:`CreatedSession` with both entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -3403,6 +3449,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
             project_id=project_id,
+            host_id=host_id,
         )
 
     def _create_session_with_agent_with_id(
@@ -3421,6 +3468,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
+        host_id: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -3471,6 +3519,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             project_id=project_id,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
+            host_id=host_id,
         )
         with self._session("create_session_with_agent") as session:
             session.add(agent_row)

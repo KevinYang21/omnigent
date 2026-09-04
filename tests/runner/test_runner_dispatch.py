@@ -3106,6 +3106,7 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     create_posts = 0
     event_posts: list[dict[str, Any]] = []
+    dispatch_stamps: list[dict[str, Any]] = []
     published: list[dict[str, Any]] = []
 
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
@@ -3139,6 +3140,11 @@ async def test_sys_session_send_reuses_existing_child_session(
         if request.method == "POST" and request.url.path == "/v1/sessions":
             create_posts += 1
             return httpx.Response(500, json={"error": "duplicate"})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_existing":
+            dispatch_stamps.append(
+                {"events_before": len(event_posts), **json.loads(request.content)["labels"]}
+            )
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_existing/events":
             event_posts.append(json.loads(request.content))
             return httpx.Response(200, json={"ok": True})
@@ -3175,6 +3181,11 @@ async def test_sys_session_send_reuses_existing_child_session(
     assert "continued ok" not in payload["message"]
     assert event_posts[0]["created_by"] == "bob@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "continue"
+    # The new turn's dispatch id is stamped on the child before its message
+    # is posted, so a restart can tell this turn from the drained one.
+    [stamp] = dispatch_stamps
+    assert stamp["events_before"] == 0
+    assert stamp[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY].startswith("subagent_")
     assert published[-1]["type"] == "session.child_session.updated"
     assert published[-1]["child"]["current_task_status"] == "launching"
     assert published[-1]["child"]["busy"] is False
@@ -3273,6 +3284,8 @@ async def test_sys_session_send_existing_child_retries_without_rejected_actor(
                     "title": "worker:retry",
                 },
             )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_existing_retry":
+            return httpx.Response(200, json={"ok": True})
         if (
             request.method == "POST"
             and request.url.path == "/v1/sessions/conv_existing_retry/events"
@@ -4265,6 +4278,150 @@ async def test_sys_session_send_by_id_rejects_closed_child(
     assert registrations == []
 
 
+_BY_ID_CHILD_IDENTITY_SCENARIOS = [
+    # A sys_session_create child: verbatim title, no sub_agent_name, and
+    # agent_name is the child's own agent.
+    pytest.param("wake-check", "responder", None, "responder", "wake-check", id="verbatim-title"),
+    # A named child continued by id: the "<agent>:<title>" parse wins, so
+    # the parent's agent_name never leaks into the label.
+    pytest.param(
+        "researcher:auth", "orchestrator", "researcher", "researcher", "auth", id="parsed-title"
+    ),
+    # An Add-agent child continued by id: the "ui:<agent>:<label>" form
+    # parses the same way.
+    pytest.param(
+        "ui:claude-native-ui:1", "claude-native-ui", None, "claude-native-ui", "1", id="ui-title"
+    ),
+    # A renamed named child: the title no longer parses, and agent_name
+    # reports the parent when the sub-spec did not resolve, so
+    # sub_agent_name must outrank it.
+    pytest.param(
+        "wake-check", "orchestrator", "researcher", "researcher", "wake-check", id="sub-agent-name"
+    ),
+    # No title at all: the agent still comes from the snapshot and the
+    # instance title stays empty.
+    pytest.param(None, "responder", None, "responder", "", id="no-title"),
+    # Malformed agent fields: an empty sub_agent_name and a non-str
+    # agent_name both fall through to the last-resort label.
+    pytest.param("wake-check", 42, "", "agent", "wake-check", id="malformed-agent-fields"),
+]
+
+
+@pytest.mark.parametrize(
+    ("snapshot_title", "agent_name", "sub_agent_name", "expected_agent", "expected_title"),
+    _BY_ID_CHILD_IDENTITY_SCENARIOS,
+)
+@pytest.mark.asyncio
+async def test_sys_session_send_by_id_names_child_from_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_title: str | None,
+    agent_name: object,
+    sub_agent_name: str | None,
+    expected_agent: str,
+    expected_title: str,
+) -> None:
+    """
+    By-id ``sys_session_send`` names the child from its snapshot.
+
+    A child dispatched by session id (``sys_session_create`` followed by
+    ``sys_session_send(session_id=...)``) keeps the verbatim title it was
+    created with and has no ``sub_agent_name``, so the
+    ``"<agent>:<title>"`` parse alone yields nothing. Everything that
+    identifies the child downstream (the work entry the wake notice is
+    rendered from, the child-to-parent registration, the launching event
+    on the parent stream, the returned handle, and the launching tool
+    result) must fall through to the snapshot's agent fields instead of
+    a literal ``agent`` with an empty title. A parsed title keeps winning
+    over those fields, ``sub_agent_name`` outranks ``agent_name``, and
+    malformed agent fields fall through to the last-resort label.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param snapshot_title: The child's stored title, e.g. ``"wake-check"``.
+    :param agent_name: The snapshot's bound agent name; a non-str value
+        stands in for malformed JSON.
+    :param sub_agent_name: The snapshot's ``sub_agent_name``, or ``None``.
+    :param expected_agent: The agent label the dispatch must resolve.
+    :param expected_title: The instance title the dispatch must resolve.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    registrations: list[dict[str, Any]] = []
+    published: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    monkeypatch.setattr(
+        runner_app,
+        "register_child_session",
+        lambda child_id, **kwargs: registrations.append({"child_id": child_id, **kwargs}),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_by_id_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_by_id_child",
+                    "title": snapshot_title,
+                    "agent_name": agent_name,
+                    "sub_agent_name": sub_agent_name,
+                    "parent_session_id": "conv_parent_by_id",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_by_id_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_by_id_child/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_by_id_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_by_id",
+                session_inbox=session_inbox,
+                publish_event=_capturing_publish_event(published),
+            )
+            entry = runner_app.get_subagent_work("conv_by_id_child")
+        finally:
+            runner_app.unregister_subagent_work("conv_by_id_child")
+            runner_app._session_inboxes_ref.pop("conv_parent_by_id", None)
+
+    assert entry is not None, output
+    assert (entry.agent, entry.title) == (expected_agent, expected_title)
+    assert registrations == [
+        {
+            "child_id": "conv_by_id_child",
+            "parent_session_id": "conv_parent_by_id",
+            "title": snapshot_title or "",
+            "tool": expected_agent,
+            "session_name": expected_title,
+        }
+    ]
+    # The launching event is the Agents rail's live row for the child.
+    [launching] = published
+    assert launching["type"] == "session.child_session.updated"
+    assert launching["child"]["tool"] == expected_agent
+    assert launching["child"]["session_name"] == expected_title
+    assert launching["child"]["title"] == (snapshot_title or "")
+    handle = json.loads(output)
+    assert (handle["agent"], handle["title"]) == (expected_agent, expected_title)
+    assert f"sub-agent {expected_agent} title {expected_title!r}" in handle["message"]
+    # The wake notice is rendered from the registered entry, so this is the
+    # line the parent reads when the child finishes.
+    notice = runner_app._format_subagent_wake_notice(
+        agent=entry.agent, title=entry.title, status="completed", pending=1
+    )
+    assert f"sub-agent {expected_agent}/{expected_title} finished" in notice
+
+
 @pytest.mark.asyncio
 async def test_sys_session_send_completion_drains_from_parent_inbox(
     monkeypatch: pytest.MonkeyPatch,
@@ -4282,6 +4439,8 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
     monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    create_bodies: list[dict[str, Any]] = []
+    label_patches: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         """Serve child-session create, lookup, and message POST requests."""
@@ -4291,7 +4450,11 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
         ):
             return httpx.Response(200, json={"data": []})
         if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
             return httpx.Response(201, json={"id": "conv_child_inbox"})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child_inbox":
+            label_patches.append(json.loads(request.content)["labels"])
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child_inbox/events":
             return httpx.Response(202, json={"queued": True})
         if (
@@ -4342,6 +4505,11 @@ async def test_sys_session_send_completion_drains_from_parent_inbox(
 
     assert "sub-agent task conv_child_inbox completed" in inbox_output
     assert "worker:phase-a returned: CHILD_MARKER" in inbox_output
+    # The dispatch id rides along with child creation, and the drain writes
+    # it back as the delivered-id receipt a runner restart checks.
+    dispatch_id = create_bodies[0]["labels"][runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY]
+    assert dispatch_id.startswith("subagent_")
+    assert label_patches == [{runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: dispatch_id}]
 
 
 @pytest.mark.asyncio
@@ -4391,6 +4559,8 @@ async def test_subagent_inbox_cleanup_does_not_unregister_next_turn(
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
             return httpx.Response(201, json={"id": child_id})
+        if request.method == "PATCH" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
             return httpx.Response(202, json={"queued": True})
         if (
@@ -7971,6 +8141,68 @@ async def test_sys_session_get_info_hides_native_ui_wrapper_agent_name() -> None
 
 
 @pytest.mark.asyncio
+async def test_sys_session_send_failed_continuation_receipts_its_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continued turn stamped on the child but never sent gets a receipt.
+
+    The dispatch id is written before the message post so a runner restart can
+    find the turn. When the post then fails, the child keeps that stamp with no
+    turn behind it; without the receipt, recovery would replay the previous
+    turn's result as this one after a restart.
+
+    :param monkeypatch: Stubs the runner-local child registration so the
+        dispatch runs without a live runner.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    label_patches: list[dict[str, str]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "researcher:auth",
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            label_patches.append(json.loads(request.content)["labels"])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            return httpx.Response(503, json={"error": "child unavailable"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue please"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=asyncio.Queue(),
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert output.startswith("Error: failed to send message to child: 503")
+    assert runner_app.get_subagent_work("conv_child") is None
+    stamp, receipt = label_patches
+    dispatch_id = stamp[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY]
+    assert dispatch_id.startswith("subagent_")
+    assert receipt == {runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: dispatch_id}
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_session_id_posts_to_direct_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8003,6 +8235,8 @@ async def test_sys_session_send_session_id_posts_to_direct_child(
                     "title": "researcher:auth",
                 },
             )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             event_posts.append(json.loads(request.content))
             return httpx.Response(200, json={"ok": True})

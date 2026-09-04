@@ -1734,6 +1734,45 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("Bypass permissions")).toBeTruthy();
   });
 
+  it("falls back to Default when the host catalog stops listing the picked model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Haiku 4.5");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Haiku 4.5");
+
+    // The host's provider changes under the open modal: its next poll of the
+    // catalog no longer lists the pick.
+    const shrunk = {
+      data: CLAUDE_MODEL_OPTIONS_RESULT.data.filter((model) => model.id !== "haiku"),
+      isLoading: false,
+      isError: false,
+    };
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : shrunk) as unknown as ReturnType<
+          typeof useHostModelOptions
+        >,
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    const trigger = screen.getByTestId("new-chat-landing-config-model");
+    expect(trigger.textContent).toContain("Default");
+    expect(trigger.textContent).not.toContain("Haiku 4.5");
+
+    // Saving the fallback sends no override, so the launch uses the provider's default.
+    saveConfig();
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.model_override).toBeUndefined();
+  });
+
   it("shows the Codex approval-mode knob in the gear modal", () => {
     renderLanding();
     // Open Codex's (a2) config modal — it carries the approval-mode select.
@@ -2528,6 +2567,76 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
   });
 
+  it("offers a GitHub repo picker that fills the sandbox repo URL + branch", async () => {
+    // enabled_connections has github + a connected /repos response → the picker renders
+    // inside the repo chip and drives the same URL/branch state as the
+    // free-text fields.
+    authenticatedFetchMock.mockImplementation(((input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/connections/github/repos") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            connected: true,
+            repos: [
+              {
+                full_name: "octo/hello",
+                clone_url: "https://github.com/octo/hello.git",
+                default_branch: "main",
+                private: false,
+                pushed_at: "2026-07-28T00:00:00Z",
+              },
+            ],
+          }),
+        } as unknown as Response);
+      }
+      if (url.startsWith("/v1/connections/github/repos/octo/hello/branches")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ connected: true, branches: ["main", "dev"] }),
+        } as unknown as Response);
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response);
+    }) as unknown as typeof authenticatedFetch);
+
+    renderLanding({ managed_sandboxes_enabled: true, enabled_connections: ["github"] });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    // Open the searchable repo combobox, filter by typing, then pick the repo.
+    fireEvent.click(await screen.findByTestId("new-chat-landing-repo-select"));
+    fireEvent.change(await screen.findByTestId("new-chat-landing-repo-search"), {
+      target: { value: "hello" },
+    });
+    fireEvent.click(await screen.findByRole("option", { name: /octo\/hello/ }));
+
+    // Picking the repo composes the clone URL into the shared URL field.
+    expect((screen.getByTestId("new-chat-landing-repo-input") as HTMLInputElement).value).toBe(
+      "https://github.com/octo/hello.git",
+    );
+
+    // Its branches load into the searchable branch combobox; open it, wait for
+    // the async list, then choosing one fills the branch.
+    fireEvent.click(await screen.findByTestId("new-chat-landing-repo-branch-select"));
+    fireEvent.click(await screen.findByRole("option", { name: "dev" }));
+    expect(
+      (screen.getByTestId("new-chat-landing-repo-branch-input") as HTMLInputElement).value,
+    ).toBe("dev");
+  });
+
+  it("hides the GitHub repo picker when the GitHub App is disabled", async () => {
+    renderLanding({ managed_sandboxes_enabled: true, enabled_connections: [] });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("New Sandbox"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    // The free-text URL input is present; the connected-account picker is not.
+    await screen.findByTestId("new-chat-landing-repo-input");
+    expect(screen.queryByTestId("new-chat-landing-repo-select")).toBeNull();
+  });
+
   it("creates a managed session without host_id/workspace and no provisioning subtext", async () => {
     // Controlled promise so the in-flight state is observable
     // deterministically before the create resolves.
@@ -3168,6 +3277,12 @@ describe("NewChatLandingScreen skill pills", () => {
   });
 });
 
+// A dataTransfer for an OS file drag. ``types`` is what the handler reads
+// mid-drag — files are only exposed on drop.
+function fileDrag(files: File[] = []) {
+  return { types: ["Files"], files };
+}
+
 // Attachments on the landing composer — same paperclip affordance as the
 // in-session composer; files ride the pending-prompt handoff (covered in
 // the flow tests), this suite covers the local chip UI.
@@ -3195,24 +3310,54 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     // Dragging over the composer lifts the drop-target overlay.
-    fireEvent.dragOver(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
-    fireEvent.drop(composer, { dataTransfer: { files: [file] } });
+    fireEvent.drop(composer, { dataTransfer: fileDrag([file]) });
     expect(screen.getByText("dropped.txt")).toBeTruthy();
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
-  it("clears the drop overlay when the drag leaves the composer", () => {
+  // The whole landing surface is the drop target, not just the composer box.
+  it("attaches files dropped anywhere on the landing surface, not just on the composer", () => {
+    renderLanding();
+    const surface = screen.getByTestId("new-chat-landing");
+    fireEvent.dragEnter(surface, { dataTransfer: fileDrag() });
+    expect(screen.getByText("Drop files here")).toBeTruthy();
+    const file = new File(["hello"], "shot.png", { type: "image/png" });
+    fireEvent.drop(surface, { dataTransfer: fileDrag([file]) });
+    expect(screen.getByText("shot.png")).toBeTruthy();
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  // Outside it — the sidebar and the rest of the shell — nothing is claimed.
+  it("ignores files dropped outside the landing surface", () => {
+    renderLanding();
+    fireEvent.dragEnter(document.body, { dataTransfer: fileDrag() });
+    expect(screen.queryByText("Drop files here")).toBeNull();
+    const file = new File(["hello"], "elsewhere.txt", { type: "text/plain" });
+    fireEvent.drop(document.body, { dataTransfer: fileDrag([file]) });
+    expect(screen.queryByText("elsewhere.txt")).toBeNull();
+  });
+
+  it("clears the drop overlay when the drag leaves the landing surface", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
-    fireEvent.dragEnter(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragEnter(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
-    // relatedTarget defaults to null (outside the composer), so the active
-    // state clears rather than sticking when moving between child elements.
-    fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
+    fireEvent.dragLeave(composer, { dataTransfer: fileDrag() });
+    expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  // Dragging selected text (no "Files" type) must stay native so it can be
+  // dropped into the textarea — the page-wide handler ignores it.
+  it("ignores a drag that carries no files", () => {
+    renderLanding();
+    fireEvent.dragOver(screen.getByTestId("new-chat-landing-composer"), {
+      dataTransfer: { types: ["text/plain"], files: [] },
+    });
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
@@ -3237,7 +3382,7 @@ describe("NewChatLandingScreen attachments", () => {
     const composer = screen.getByTestId("new-chat-landing-composer");
     const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
     const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
-    fireEvent.drop(composer, { dataTransfer: { files: [ok, zip] } });
+    fireEvent.drop(composer, { dataTransfer: fileDrag([ok, zip]) });
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(screen.queryByText("photos.zip")).toBeNull();
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
@@ -3533,6 +3678,34 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     // Unset effort reads "Default" (mirrors the modal), never the "—" sentinel.
     expect(tooltip.textContent).toContain("Effort: Default");
     expect(tooltip.textContent).not.toContain("—");
+  });
+
+  it("shows the selected host's model provider in the gear tooltip", async () => {
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "claude-native"
+          ? {
+              ...CLAUDE_MODEL_OPTIONS_RESULT,
+              data: CLAUDE_MODEL_OPTIONS_RESULT.data.map((model) => ({
+                ...model,
+                source: { kind: "subscription", label: "Subscription", name: "claude" },
+              })),
+            }
+          : CODEX_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    renderLanding();
+
+    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("new-chat-landing-config-gear-tooltip").length).toBeGreaterThan(
+        0,
+      ),
+    );
+    const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
+    expect(tooltip).toHaveTextContent("Connection: Claude subscription");
+    expect(tooltip.textContent?.indexOf("Connection:")).toBeGreaterThan(
+      tooltip.textContent?.indexOf("Permissions:") ?? -1,
+    );
   });
 
   it("reflects an armed Codex bypass as the Approval value in the gear tooltip", async () => {
