@@ -2437,7 +2437,11 @@ def _prepare_claude_resume_forwarder(
         resolution=resolution,
         session_id=session_id,
     )
-    prefix = _measured_prefix_bytes(resolution.path) if resolution.synthesized else None
+    prefix = (
+        _measured_prefix_bytes(resolution.path)
+        if resolution.synthesized and resolution.path is not None
+        else None
+    )
     return prefix, degraded
 
 
@@ -4102,6 +4106,8 @@ async def _auto_create_codex_terminal(
 
         if server_client is None:
             raise RuntimeError("server_client is required to bind a forked Codex thread.")
+        source_session_id = launch_config.fork_source_id
+        source_thread_id = launch_config.fork_source_external_id
         proposed_thread_id = _mint_codex_thread_id()
         target_thread_id = await _bind_codex_thread_id_set_once(
             server_client,
@@ -4113,8 +4119,8 @@ async def _auto_create_codex_terminal(
         try:
             cloned_rollout = (
                 _clone_codex_rollout(
-                    source_session_id=launch_config.fork_source_id,
-                    source_thread_id=launch_config.fork_source_external_id,
+                    source_session_id=source_session_id,
+                    source_thread_id=source_thread_id,
                     target_thread_id=target_thread_id,
                     clone_codex_home=codex_home,
                     clone_workspace=clone_workspace,
