@@ -839,9 +839,12 @@ function MobileKeyBar({ onKey }: { onKey: (key: TerminalMobileKey) => void }) {
           {Icon ? (
             <Icon className="size-4" aria-hidden />
           ) : lines ? (
+            // `leading-none` stacks the words tightly; `translate-y-px` nudges
+            // the block down 1px to optically center it — all-caps text with no
+            // descenders otherwise reads top-heavy in the line box.
             <span
               aria-hidden
-              className="flex flex-col items-center font-semibold text-[9px] leading-tight tracking-tight"
+              className="flex translate-y-px flex-col items-center font-semibold text-[9px] leading-none tracking-tight"
             >
               {lines.map((line) => (
                 <span key={line}>{line}</span>
