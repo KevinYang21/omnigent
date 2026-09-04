@@ -56,7 +56,20 @@ async def test_local_claude_resume_preserves_valid_forwarder_state(
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
     transcript = claude_native._claude_project_dir_for_cwd(workspace) / f"{external_id}.jsonl"
     transcript.parent.mkdir(parents=True)
-    transcript.write_text('{"type":"user","uuid":"one"}\n', encoding="utf-8")
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "one",
+                "parentUuid": None,
+                "sessionId": external_id,
+                "cwd": str(workspace.resolve()),
+                "message": {"role": "user", "content": "remember me"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     bridge_dir = tmp_path / "bridge"
     payload = _write_cursor(
         bridge_dir,
@@ -141,7 +154,20 @@ async def test_invalid_claude_cursor_starts_at_eof_and_posts_notice(
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
     transcript = claude_native._claude_project_dir_for_cwd(workspace) / f"{external_id}.jsonl"
     transcript.parent.mkdir(parents=True)
-    transcript.write_text('{"type":"user","uuid":"local"}\n', encoding="utf-8")
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "local",
+                "parentUuid": None,
+                "sessionId": external_id,
+                "cwd": str(workspace.resolve()),
+                "message": {"role": "user", "content": "remember me"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     bridge_dir = tmp_path / "bridge"
     _write_cursor(bridge_dir, transcript, fingerprint="stale")
 
@@ -213,3 +239,62 @@ async def test_missing_claude_id_is_minted_synthesized_and_persisted(
     assert external_id == synthesized_ids[0]
     assert resolution.transcript == transcript
     assert patches == [{"external_session_id": external_id}]
+
+
+@pytest.mark.asyncio
+async def test_missing_claude_id_does_not_hide_history_fetch_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable history service must not be mistaken for empty history."""
+    import omnigent.claude_native as claude_native
+
+    async def _unavailable(*_args: Any, **_kwargs: Any) -> Path:
+        raise RuntimeError("history unavailable")
+
+    monkeypatch.setattr(
+        claude_native,
+        "_ensure_local_claude_resume_transcript",
+        _unavailable,
+    )
+
+    with pytest.raises(RuntimeError, match="history unavailable"):
+        await _resolve_missing_runner_claude_resume(
+            object(),  # type: ignore[arg-type]
+            session_id="conv-unavailable",
+            workspace=tmp_path,
+        )
+
+
+@pytest.mark.asyncio
+async def test_missing_claude_id_requires_persisted_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Do not launch a synthesized transcript under an uncommitted native id."""
+    import omnigent.claude_native as claude_native
+
+    transcript = tmp_path / "minted.jsonl"
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+
+    async def _synthesize(*_args: Any, **_kwargs: Any) -> Path:
+        return transcript
+
+    monkeypatch.setattr(
+        claude_native,
+        "_ensure_local_claude_resume_transcript",
+        _synthesize,
+    )
+
+    class _FailingResponse:
+        def raise_for_status(self) -> None:
+            raise RuntimeError("binding rejected")
+
+    class _Client:
+        async def patch(self, _url: str, **_kwargs: Any) -> _FailingResponse:
+            return _FailingResponse()
+
+    with pytest.raises(RuntimeError, match="binding rejected"):
+        await _resolve_missing_runner_claude_resume(
+            _Client(),  # type: ignore[arg-type]
+            session_id="conv-patch-failed",
+            workspace=tmp_path,
+        )

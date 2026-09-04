@@ -2422,7 +2422,10 @@ async def _resolve_runner_claude_resume(
         prior.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         candidates.extend(prior)
     for candidate in candidates:
-        if _is_resumable_claude_transcript(candidate):
+        if _is_resumable_claude_transcript(
+            candidate,
+            external_session_id=external_session_id,
+        ):
             cursor_valid = _claude_forward_cursor_is_valid(bridge_dir, candidate)
             return _ClaudeRunnerResume(
                 transcript=candidate,
@@ -2461,20 +2464,12 @@ async def _resolve_missing_runner_claude_resume(
     )
 
     minted_session_id = str(uuid.uuid4())
-    try:
-        transcript = await _ensure_local_claude_resume_transcript(
-            client,
-            session_id=session_id,
-            external_session_id=minted_session_id,
-            workspace=workspace,
-        )
-    except Exception:  # noqa: BLE001 — unavailable history keeps fresh fallback
-        _logger.warning(
-            "Could not inspect Claude history for missing-id session %s; launching fresh",
-            session_id,
-            exc_info=True,
-        )
-        return None, _ClaudeRunnerResume(transcript=None, reused_local=False)
+    transcript = await _ensure_local_claude_resume_transcript(
+        client,
+        session_id=session_id,
+        external_session_id=minted_session_id,
+        workspace=workspace,
+    )
     if transcript is None:
         if await _fetch_all_session_items_for_claude_resume(client, session_id):
             raise RuntimeError(
@@ -2486,19 +2481,12 @@ async def _resolve_missing_runner_claude_resume(
             session_id,
         )
         return None, _ClaudeRunnerResume(transcript=None, reused_local=False)
-    try:
-        resp = await client.patch(
-            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-            json={"external_session_id": minted_session_id},
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "Could not persist minted Claude session id for %s; relying on hook capture",
-            session_id,
-            exc_info=True,
-        )
+    resp = await client.patch(
+        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+        json={"external_session_id": minted_session_id},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
     return minted_session_id, _ClaudeRunnerResume(
         transcript=transcript,
         reused_local=False,
@@ -4334,15 +4322,7 @@ async def _auto_create_codex_terminal(
             _mint_codex_thread_id,
         )
 
-        try:
-            history = await _fetch_all_session_items_for_codex_resume(server_client, session_id)
-        except Exception:  # noqa: BLE001 — preserve the existing fresh fallback
-            history = []
-            _logger.warning(
-                "Could not inspect Codex history for missing-id session %s; launching fresh",
-                session_id,
-                exc_info=True,
-            )
+        history = await _fetch_all_session_items_for_codex_resume(server_client, session_id)
         if history:
             target_thread_id = _mint_codex_thread_id()
             await _ensure_local_codex_resume_rollout(
@@ -4358,19 +4338,12 @@ async def _auto_create_codex_terminal(
             launch_config = dataclasses.replace(
                 launch_config, external_session_id=target_thread_id
             )
-            try:
-                resp = await server_client.patch(
-                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                    json={"external_session_id": target_thread_id},
-                    timeout=10.0,
-                )
-                resp.raise_for_status()
-            except httpx.HTTPError:
-                _logger.warning(
-                    "Could not persist minted Codex thread id for session %s",
-                    session_id,
-                    exc_info=True,
-                )
+            resp = await server_client.patch(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                json={"external_session_id": target_thread_id},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
         else:
             _logger.warning(
                 "Codex session %s has no native thread id or committed history; launching fresh",
@@ -6950,33 +6923,24 @@ async def _auto_create_claude_terminal(
     # ``stat`` taken later routinely skips the freshly-injected message.
     resume_prefix_bytes: int | None = None
     if server_client is not None and session_external_id is not None:
-        try:
-            resolution = await _resolve_runner_claude_resume(
-                server_client,
-                session_id=session_id,
-                external_session_id=session_external_id,
-                workspace=Path(workspace).resolve(),
-                bridge_dir=bridge_dir,
+        resolution = await _resolve_runner_claude_resume(
+            server_client,
+            session_id=session_id,
+            external_session_id=session_external_id,
+            workspace=Path(workspace).resolve(),
+            bridge_dir=bridge_dir,
+        )
+        if resolution.transcript is not None:
+            resume_external_session_id = session_external_id
+            resume_prefix_bytes = _prepare_claude_resume_forwarder(
+                bridge_dir, resolution
             )
-            if resolution.transcript is not None:
-                resume_external_session_id = session_external_id
-                resume_prefix_bytes = _prepare_claude_resume_forwarder(
-                    bridge_dir, resolution
+            reset_forward_state = False
+            if resolution.degraded_sync:
+                await _post_claude_degraded_sync_notice(
+                    session_id=session_id,
+                    server_client=server_client,
                 )
-                reset_forward_state = False
-                if resolution.degraded_sync:
-                    await _post_claude_degraded_sync_notice(
-                        session_id=session_id,
-                        server_client=server_client,
-                    )
-        except RuntimeError:
-            raise
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            _logger.warning(
-                "Could not resolve Claude resume transcript for %s; launching without --resume",
-                session_id,
-                exc_info=True,
-            )
     elif session_external_id is None and fork_source_external_id is not None:
         # Forked clone with no native session yet: clone the SOURCE's
         # local Claude transcript into the clone's OWN project dir under a

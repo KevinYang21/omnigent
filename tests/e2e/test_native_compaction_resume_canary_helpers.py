@@ -14,6 +14,7 @@ from tests.e2e._native_compaction_resume_canary import (
     codex_compact_record,
     configured_session_count,
 )
+from tests.e2e._native_resume_helpers import _CONV_ID_RE
 
 
 def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
@@ -29,6 +30,27 @@ def test_canary_cases_default_to_three_and_cover_both_modes(
         (1, "server-reconstruction"),
         (2, "local-artifact"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "http://127.0.0.1:56850/c/d0dcbb91ba9249b6b4d180c2a065e73e",
+            "d0dcbb91ba9249b6b4d180c2a065e73e",
+        ),
+        (
+            "http://127.0.0.1:56850/c/conv_25cf39e3b0ea4d0c8721277215",
+            "conv_25cf39e3b0ea4d0c8721277215",
+        ),
+    ],
+)
+def test_conversation_id_parser_accepts_current_and_legacy_ids(
+    url: str, expected: str
+) -> None:
+    match = _CONV_ID_RE.search(url)
+    assert match is not None
+    assert match.group(1) == expected
 
 
 @pytest.mark.parametrize("value", ["0", "2", "not-an-int"])
