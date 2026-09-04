@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TypeGuard
 
 import click
 import httpx
@@ -1731,7 +1732,7 @@ def _find_codex_rollout(codex_home: Path, thread_id: str) -> Path | None:
     return matches[0]
 
 
-def _is_safe_codex_thread_id(thread_id: object) -> bool:
+def _is_safe_codex_thread_id(thread_id: object) -> TypeGuard[str]:
     """Return whether *thread_id* is a path-safe UUID Codex can resume.
 
     Newly minted ids are UUIDv7, but already-persisted Codex thread ids may

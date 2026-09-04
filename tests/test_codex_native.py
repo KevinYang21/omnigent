@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11208,6 +11210,413 @@ def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
         {"type": "external_compaction_status", "data": {"status": "in_progress"}},
         {"type": "external_compaction_status", "data": {"status": "completed"}},
     ]
+
+
+def _codex_compaction_rollout(tmp_path: Path, *, thread_id: str = "thread_123") -> Path:
+    """Create bridge state and return its live Codex rollout path."""
+    codex_home = tmp_path / "codex-home"
+    rollout_dir = codex_home / "sessions" / "2026" / "09" / "03"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / f"rollout-2026-09-03T12-00-00-{thread_id}.jsonl"
+    rollout.write_text('{"type":"session_meta","payload":{}}\n', encoding="utf-8")
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id=thread_id,
+            codex_home=str(codex_home),
+        ),
+    )
+    return rollout
+
+
+def _codex_compacted_line(marker: str, *, window_id: int = 7) -> str:
+    """Build one realistic Codex compacted rollout record."""
+    return json.dumps(
+        {
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": marker}],
+                    }
+                ],
+                "window_id": window_id,
+            },
+        }
+    )
+
+
+def _codex_compaction_transport(
+    posted: list[dict[str, Any]],
+    *,
+    fail_posts: list[bool] | None = None,
+    existing_items: list[dict[str, Any]] | None = None,
+) -> httpx.MockTransport:
+    """Return a mock Omnigent transport for compaction scanner tests."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"data": existing_items or [{"id": "msg_boundary"}]},
+            )
+        payload = json.loads(request.content)
+        if fail_posts and fail_posts.pop(0):
+            return httpx.Response(503, json={"detail": "retry"})
+        posted.append(payload)
+        return httpx.Response(202, json={"queued": True})
+
+    return httpx.MockTransport(handler)
+
+
+def test_codex_compaction_periodic_scan_recovers_missing_notification(tmp_path: Path) -> None:
+    """A rollout compaction persists even when Codex emits no usable signal."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("periodic") + "\n")
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+                interval_seconds=0.01,
+            )
+            scanner.start()
+            try:
+
+                async def persisted() -> None:
+                    while not posted:
+                        await asyncio.sleep(0.005)
+
+                await asyncio.wait_for(persisted(), timeout=1)
+            finally:
+                await scanner.close()
+
+    asyncio.run(run())
+    assert posted[0]["data"]["window_id"] == 7
+    assert posted[0]["data"]["compacted_messages"][0]["content"][0]["text"] == "periodic"
+
+
+def test_codex_compaction_notification_before_write_recovers_later(tmp_path: Path) -> None:
+    """A completion notification racing before the append is retried periodically."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+                interval_seconds=0.01,
+            )
+            state = codex_native_forwarder._CodexForwarderState(compaction_scanner=scanner)
+            scanner.start()
+            try:
+                await codex_native_forwarder._scan_codex_compactions_after_signal(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    forwarder_state=state,
+                )
+                assert posted == []
+                with rollout.open("a", encoding="utf-8") as handle:
+                    handle.write(_codex_compacted_line("delayed") + "\n")
+                while not posted:
+                    await asyncio.sleep(0.005)
+            finally:
+                await scanner.close()
+
+    asyncio.run(asyncio.wait_for(run(), timeout=1))
+    assert len(posted) == 1
+
+
+def test_codex_compaction_duplicate_signals_persist_once(tmp_path: Path) -> None:
+    """Repeated completion signals converge on one rollout record POST."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("duplicate") + "\n")
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            state = codex_native_forwarder._CodexForwarderState(compaction_scanner=scanner)
+            for _ in range(2):
+                await codex_native_forwarder._scan_codex_compactions_after_signal(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    forwarder_state=state,
+                )
+
+    asyncio.run(run())
+    assert len(posted) == 1
+
+
+def test_codex_compaction_restart_does_not_replay_persisted_record(tmp_path: Path) -> None:
+    """A new scanner loads durable identities and skips prior compactions."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("restart") + "\n")
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            for _ in range(2):
+                scanner = codex_native_forwarder._CodexCompactionScanner(
+                    client,
+                    session_id="conv_123",
+                    thread_id="thread_123",
+                    bridge_dir=tmp_path,
+                )
+                await scanner.scan_now()
+
+    asyncio.run(run())
+    assert len(posted) == 1
+    durable = codex_native_forwarder._read_codex_compaction_state(tmp_path)
+    assert len(durable.observed_record_ids) == 1
+
+
+def test_codex_compaction_initial_scan_adopts_existing_server_row(tmp_path: Path) -> None:
+    """An upgrade seeds state from an exact row instead of duplicating it."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("legacy") + "\n")
+    history = json.loads(_codex_compacted_line("legacy"))["payload"]["replacement_history"]
+    posted: list[dict[str, Any]] = []
+    existing = [
+        {
+            "id": "compact_existing",
+            "type": "compaction",
+            "compacted_messages": history,
+            "window_id": 7,
+        }
+    ]
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted, existing_items=existing),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            await scanner.scan_now()
+
+    asyncio.run(run())
+    assert posted == []
+    assert (
+        len(codex_native_forwarder._read_codex_compaction_state(tmp_path).observed_record_ids) == 1
+    )
+
+
+def test_codex_compaction_state_reads_legacy_integer_cursor(tmp_path: Path) -> None:
+    """State loading preserves old bare offsets and ignores unknown fields."""
+    state_path = tmp_path / codex_native_forwarder._CODEX_COMPACTION_STATE_FILE
+    state_path.write_text(
+        json.dumps(
+            {
+                "cursors": {"/old/rollout.jsonl": 41},
+                "observed_record_ids": ["record_a", 17],
+                "future_field": {"safe": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = codex_native_forwarder._read_codex_compaction_state(tmp_path)
+
+    assert state.cursors["/old/rollout.jsonl"].offset == 41
+    assert state.cursors["/old/rollout.jsonl"].fingerprint is None
+    assert state.observed_record_ids == ("record_a",)
+
+
+def test_codex_compaction_rollout_path_change_preserves_identity(tmp_path: Path) -> None:
+    """Moving a rollout to the archive neither duplicates nor hides later records."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("before move") + "\n")
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            await scanner.scan_now()
+            archived = tmp_path / "codex-home" / "archived_sessions" / rollout.name
+            archived.parent.mkdir(parents=True)
+            rollout.replace(archived)
+            await scanner.scan_now()
+            with archived.open("a", encoding="utf-8") as handle:
+                handle.write(_codex_compacted_line("after move") + "\n")
+            await scanner.scan_now()
+
+    asyncio.run(run())
+    assert [
+        payload["data"]["compacted_messages"][0]["content"][0]["text"] for payload in posted
+    ] == ["before move", "after move"]
+
+
+def test_codex_compaction_same_window_new_record_is_not_deduped(tmp_path: Path) -> None:
+    """Artifact identity, not window id, distinguishes successive compactions."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            for marker in ("first", "second"):
+                with rollout.open("a", encoding="utf-8") as handle:
+                    handle.write(_codex_compacted_line(marker, window_id=7) + "\n")
+                await scanner.scan_now()
+
+    asyncio.run(run())
+    assert [payload["data"]["window_id"] for payload in posted] == [7, 7]
+    assert [
+        payload["data"]["compacted_messages"][0]["content"][0]["text"] for payload in posted
+    ] == ["first", "second"]
+
+
+def test_codex_compaction_post_failure_retries_same_record(tmp_path: Path) -> None:
+    """A failed POST leaves the artifact unobserved for the next scan."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(_codex_compacted_line("retry") + "\n")
+    posted: list[dict[str, Any]] = []
+    failures = [True, False]
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted, fail_posts=failures),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            with pytest.raises(httpx.HTTPStatusError):
+                await scanner.scan_now()
+            assert (
+                codex_native_forwarder._read_codex_compaction_state(tmp_path).observed_record_ids
+                == ()
+            )
+            await scanner.scan_now()
+
+    asyncio.run(run())
+    assert len(posted) == 1
+
+
+def test_codex_compaction_partial_trailing_line_waits_for_completion(tmp_path: Path) -> None:
+    """A partial JSON tail is retried from its first byte after the newline lands."""
+    rollout = _codex_compaction_rollout(tmp_path)
+    line = _codex_compacted_line("partial")
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport(posted),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            await scanner.scan_now()
+            assert posted == []
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write("\n")
+            await scanner.scan_now()
+
+    asyncio.run(run())
+    assert len(posted) == 1
+
+
+def test_codex_compaction_rollout_scan_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Slow rollout I/O runs in a worker while other async work proceeds."""
+    _codex_compaction_rollout(tmp_path)
+    original = codex_native_forwarder._read_codex_compacted_records
+    scan_started = threading.Event()
+
+    def slow_read(*args: Any, **kwargs: Any) -> Any:
+        scan_started.set()
+        time.sleep(0.15)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(codex_native_forwarder, "_read_codex_compacted_records", slow_read)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=_codex_compaction_transport([]),
+        ) as client:
+            scanner = codex_native_forwarder._CodexCompactionScanner(
+                client,
+                session_id="conv_123",
+                thread_id="thread_123",
+                bridge_dir=tmp_path,
+            )
+            scan_task = asyncio.create_task(scanner.scan_now())
+            await asyncio.to_thread(scan_started.wait)
+            heartbeat = asyncio.create_task(asyncio.sleep(0.01))
+            await asyncio.wait_for(heartbeat, timeout=0.05)
+            assert not scan_task.done()
+            await scan_task
+
+    asyncio.run(run())
 
 
 def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:
