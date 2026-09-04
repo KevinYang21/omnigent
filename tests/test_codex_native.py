@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -10907,6 +10908,49 @@ async def test_ensure_local_codex_resume_rollout_empty_server_starts_blank(
     assert [record["type"] for record in records] == ["session_meta"]
     assert codex_native._codex_rollout_is_resumable(rollout, thread_id)
     assert "starting a blank Codex thread" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_resolve_codex_cold_resume_keeps_existing_non_v7_thread_id(
+    tmp_path: Path,
+) -> None:
+    """Persisted UUID thread ids must resume even when they are not v7.
+
+    Reminting would PATCH a new ``external_session_id`` over a set-once
+    column and leave the existing rollout unreachable.
+    """
+    recorded_id = "11111111-2222-4333-8444-555566667777"
+    assert uuid.UUID(recorded_id).version == 4
+    patches: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    existing = _write_source_rollout(
+        codex_home=tmp_path / "codex-home",
+        thread_id=recorded_id,
+        source_cwd="/repo",
+    )
+    before = existing.read_bytes()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        thread_id = await codex_native._resolve_codex_cold_resume_thread_id(
+            client,
+            session_id="conv_codex",
+            external_session_id=recorded_id,
+            codex_home=tmp_path / "codex-home",
+            workspace=tmp_path.resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    assert thread_id == recorded_id
+    assert patches == []
+    assert existing.read_bytes() == before
 
 
 @pytest.mark.asyncio

@@ -1732,14 +1732,20 @@ def _find_codex_rollout(codex_home: Path, thread_id: str) -> Path | None:
 
 
 def _is_safe_codex_thread_id(thread_id: object) -> bool:
-    """Return whether *thread_id* is a canonical UUIDv7 safe for rollout paths."""
+    """Return whether *thread_id* is a path-safe UUID Codex can resume.
+
+    Newly minted ids are UUIDv7, but already-persisted Codex thread ids may
+    be any RFC-4122 version. Reminting those would try to overwrite
+    ``external_session_id``, which the store rejects, and would orphan the
+    local rollout.
+    """
     if not isinstance(thread_id, str) or not _CODEX_THREAD_ID_RE.fullmatch(thread_id):
         return False
     try:
-        parsed = uuid.UUID(thread_id)
+        uuid.UUID(thread_id)
     except ValueError:
         return False
-    return parsed.version == 7 and str(parsed) == thread_id.lower()
+    return True
 
 
 def _codex_rollout_is_resumable(path: Path, thread_id: str) -> bool:
@@ -1793,7 +1799,6 @@ def _codex_rollout_is_resumable(path: Path, thread_id: str) -> bool:
         and bool(model_provider.strip())
         and isinstance(cwd, str)
         and bool(cwd.strip())
-        and Path(cwd).is_absolute()
         and isinstance(session_timestamp, str)
         and bool(session_timestamp.strip())
     )
