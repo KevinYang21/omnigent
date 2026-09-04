@@ -1,12 +1,33 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useWorkspaceLayoutStore } from "@/store/workspaceLayout";
 import { WorkspacePage } from "./WorkspacePage";
 
 const chatStoreMocks = vi.hoisted(() => ({ switchTo: vi.fn(), loadInBackground: vi.fn() }));
+
+let resizeObserverCallback: ResizeObserverCallback | null = null;
+
+class StubResizeObserver {
+  constructor(callback: ResizeObserverCallback) {
+    resizeObserverCallback = callback;
+  }
+
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+function resizeWorkspace(width: number) {
+  act(() => {
+    resizeObserverCallback?.(
+      [{ contentRect: { width } } as ResizeObserverEntry],
+      {} as ResizeObserver,
+    );
+  });
+}
 
 vi.mock("@/store/chatStore", () => ({
   ChatStoreScopeProvider: ({ children }: { children: ReactNode }) => children,
@@ -73,8 +94,14 @@ function renderWorkspace(path: string) {
 
 describe("WorkspacePage", () => {
   beforeEach(() => {
+    resizeObserverCallback = null;
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
     localStorage.clear();
     useWorkspaceLayoutStore.getState().reset("session-a");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("renders independent panes, focuses by pointer, and collapses on close", async () => {
@@ -184,6 +211,48 @@ describe("WorkspacePage", () => {
       expect(dockLayout.className).toContain("flex-col");
       expect(dockLayout.className).toContain("@min-[720px]/session-column:flex-row");
     }
+  });
+
+  it("stacks a horizontal chat split below two SP2K minimum columns", () => {
+    const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
+    const split = useWorkspaceLayoutStore.getState().root;
+    if (split.kind !== "split") throw new Error("expected split root");
+
+    renderWorkspace("/c/session-b");
+
+    const splitLayout = screen.getByTestId(`workspace-split-layout-${split.id}`);
+    expect(splitLayout.className).toContain("flex-col");
+    expect(splitLayout.className).toContain("@min-[720px]/workspace-split:flex-row");
+
+    resizeWorkspace(719);
+
+    expect(splitLayout).toHaveAttribute("data-effective-direction", "vertical");
+    const separator = screen.getByRole("separator", { name: "Resize horizontal split" });
+    expect(separator).toHaveAttribute("aria-orientation", "horizontal");
+    fireEvent.keyDown(separator, { key: "ArrowDown" });
+    expect(useWorkspaceLayoutStore.getState().root).toMatchObject({ sizes: [55, 45] });
+    expect(screen.getByRole("complementary", { name: "Workspace for First task" })).toBeVisible();
+    expect(screen.getByRole("complementary", { name: "Workspace for Second task" })).toBeVisible();
+  });
+
+  it("restores a horizontal split and horizontal resizing at 720px", () => {
+    const targetPaneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(targetPaneId, "session-b", "right"));
+    const split = useWorkspaceLayoutStore.getState().root;
+    if (split.kind !== "split") throw new Error("expected split root");
+
+    renderWorkspace("/c/session-b");
+    resizeWorkspace(720);
+
+    expect(screen.getByTestId(`workspace-split-layout-${split.id}`)).toHaveAttribute(
+      "data-effective-direction",
+      "horizontal",
+    );
+    const separator = screen.getByRole("separator", { name: "Resize horizontal split" });
+    expect(separator).toHaveAttribute("aria-orientation", "vertical");
+    fireEvent.keyDown(separator, { key: "ArrowRight" });
+    expect(useWorkspaceLayoutStore.getState().root).toMatchObject({ sizes: [55, 45] });
   });
 
   it("uses pane titles without a focused border or global-header clearance", async () => {

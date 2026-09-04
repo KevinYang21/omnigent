@@ -29,6 +29,8 @@ import { SessionWorkspaceDock } from "@/shell/SessionWorkspaceDock";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { ChatPage } from "./ChatPage";
 
+const HORIZONTAL_SPLIT_STACK_BREAKPOINT_PX = 720;
+
 export function WorkspacePage() {
   const { conversationId } = useParams<{ conversationId: string }>();
   const root = useWorkspaceLayoutStore((state) => state.root);
@@ -78,6 +80,7 @@ function WorkspaceSplitView({
   const resizeSplit = useWorkspaceLayoutStore((state) => state.resizeSplit);
   const containerRef = useRef<HTMLDivElement>(null);
   const horizontal = node.direction === "horizontal";
+  const effectiveHorizontal = useEffectiveHorizontalSplit(containerRef, horizontal);
 
   const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -85,8 +88,8 @@ function WorkspaceSplitView({
     if (!container) return;
     const rect = container.getBoundingClientRect();
     const update = (clientX: number, clientY: number) => {
-      const position = horizontal ? clientX - rect.left : clientY - rect.top;
-      const extent = horizontal ? rect.width : rect.height;
+      const position = effectiveHorizontal ? clientX - rect.left : clientY - rect.top;
+      const extent = effectiveHorizontal ? rect.width : rect.height;
       if (extent > 0) resizeSplit(node.id, (position / extent) * 100);
     };
     const onPointerMove = (moveEvent: PointerEvent) => update(moveEvent.clientX, moveEvent.clientY);
@@ -96,7 +99,7 @@ function WorkspaceSplitView({
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-    document.body.style.cursor = horizontal ? "col-resize" : "row-resize";
+    document.body.style.cursor = effectiveHorizontal ? "col-resize" : "row-resize";
     document.body.style.userSelect = "none";
     window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("pointerup", onPointerUp, { once: true });
@@ -107,55 +110,94 @@ function WorkspaceSplitView({
   return (
     <div
       ref={containerRef}
-      className={cn("flex min-h-0 min-w-0 flex-1", horizontal ? "flex-row" : "flex-col")}
+      className="@container/workspace-split flex min-h-0 min-w-0 flex-1"
       data-workspace-split={node.direction}
     >
-      <div className="flex min-h-0 min-w-0" style={{ flexBasis: `${node.sizes[0]}%` }}>
-        <WorkspaceNodeView
-          node={node.children[0]}
-          focusedPaneId={focusedPaneId}
-          leafCount={leafCount}
-        />
-      </div>
       <div
-        role="separator"
-        aria-label={`Resize ${node.direction} split`}
-        aria-orientation={horizontal ? "vertical" : "horizontal"}
-        tabIndex={0}
-        onPointerDown={startResize}
-        onKeyDown={(event) => {
-          if (event.key === (horizontal ? "ArrowLeft" : "ArrowUp")) {
-            event.preventDefault();
-            resizeByKeyboard(-5);
-          }
-          if (event.key === (horizontal ? "ArrowRight" : "ArrowDown")) {
-            event.preventDefault();
-            resizeByKeyboard(5);
-          }
-        }}
+        data-testid={`workspace-split-layout-${node.id}`}
+        data-effective-direction={effectiveHorizontal ? "horizontal" : "vertical"}
         className={cn(
-          "group relative z-20 shrink-0 bg-transparent focus:outline-none",
-          horizontal ? "w-1.5 cursor-col-resize" : "h-1.5 cursor-row-resize",
+          "flex h-full w-full min-h-0 min-w-0 flex-1 flex-col",
+          horizontal && "@min-[720px]/workspace-split:flex-row",
         )}
       >
+        <div className="flex min-h-0 min-w-0" style={{ flexBasis: `${node.sizes[0]}%` }}>
+          <WorkspaceNodeView
+            node={node.children[0]}
+            focusedPaneId={focusedPaneId}
+            leafCount={leafCount}
+          />
+        </div>
         <div
+          role="separator"
+          aria-label={`Resize ${node.direction} split`}
+          aria-orientation={effectiveHorizontal ? "vertical" : "horizontal"}
+          tabIndex={0}
+          onPointerDown={startResize}
+          onKeyDown={(event) => {
+            if (event.key === (effectiveHorizontal ? "ArrowLeft" : "ArrowUp")) {
+              event.preventDefault();
+              resizeByKeyboard(-5);
+            }
+            if (event.key === (effectiveHorizontal ? "ArrowRight" : "ArrowDown")) {
+              event.preventDefault();
+              resizeByKeyboard(5);
+            }
+          }}
           className={cn(
-            "absolute bg-border transition-colors group-hover:bg-primary/60 group-focus-visible:bg-primary/70",
-            horizontal
-              ? "inset-y-0 left-1/2 w-px -translate-x-1/2"
-              : "inset-x-0 top-1/2 h-px -translate-y-1/2",
+            "group relative z-20 shrink-0 bg-transparent focus:outline-none",
+            effectiveHorizontal ? "w-1.5 cursor-col-resize" : "h-1.5 cursor-row-resize",
           )}
-        />
-      </div>
-      <div className="flex min-h-0 min-w-0" style={{ flexBasis: `${node.sizes[1]}%` }}>
-        <WorkspaceNodeView
-          node={node.children[1]}
-          focusedPaneId={focusedPaneId}
-          leafCount={leafCount}
-        />
+        >
+          <div
+            className={cn(
+              "absolute bg-border transition-colors group-hover:bg-primary/60 group-focus-visible:bg-primary/70",
+              effectiveHorizontal
+                ? "inset-y-0 left-1/2 w-px -translate-x-1/2"
+                : "inset-x-0 top-1/2 h-px -translate-y-1/2",
+            )}
+          />
+        </div>
+        <div className="flex min-h-0 min-w-0" style={{ flexBasis: `${node.sizes[1]}%` }}>
+          <WorkspaceNodeView
+            node={node.children[1]}
+            focusedPaneId={focusedPaneId}
+            leafCount={leafCount}
+          />
+        </div>
       </div>
     </div>
   );
+}
+
+function useEffectiveHorizontalSplit(
+  containerRef: React.RefObject<HTMLDivElement | null>,
+  horizontal: boolean,
+): boolean {
+  const [effectiveHorizontal, setEffectiveHorizontal] = useState(false);
+
+  useLayoutEffect(() => {
+    if (!horizontal) {
+      setEffectiveHorizontal(false);
+      return;
+    }
+
+    const container = containerRef.current;
+    if (!container) return;
+    const update = (width: number) => {
+      setEffectiveHorizontal(width >= HORIZONTAL_SPLIT_STACK_BREAKPOINT_PX);
+    };
+
+    update(container.getBoundingClientRect().width);
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries.find((candidate) => candidate.target === container) ?? entries[0];
+      update(entry?.contentRect.width ?? container.getBoundingClientRect().width);
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [containerRef, horizontal]);
+
+  return horizontal && effectiveHorizontal;
 }
 
 function useWorkspacePaneTitle(sessionId: string): string {
