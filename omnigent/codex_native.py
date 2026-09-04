@@ -11,6 +11,7 @@ import re
 import secrets
 import shutil
 import socket
+import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -1181,7 +1182,7 @@ async def _prepare_codex_terminal(
             existing_terminal = await _find_running_codex_terminal(client, session_id)
             external_session_id = payload.get("external_session_id")
             thread_id = external_session_id if isinstance(external_session_id, str) else None
-            if existing_terminal is not None and thread_id is not None:
+            if existing_terminal is not None:
                 reattach_bridge_dir = bridge_dir_for_bridge_id(bridge_id)
                 reattach_unix_socket = socket_path_for_bridge_dir(reattach_bridge_dir)
                 # The running terminal's real transport lives in its bridge
@@ -1491,7 +1492,12 @@ async def _initialize_fresh_terminal_thread(
         headers=headers,
         timeout=httpx.Timeout(30.0),
     ) as client:
-        await _patch_external_session_id(client, prepared.session_id, thread_id)
+        authoritative_id = await _patch_external_session_id(client, prepared.session_id, thread_id)
+    if authoritative_id != thread_id:
+        raise click.ClickException(
+            f"Codex thread {thread_id!r} lost a concurrent binding race to "
+            f"{authoritative_id!r}; refusing to orphan the losing thread."
+        )
     write_bridge_state(
         prepared.bridge_dir,
         CodexNativeBridgeState(
@@ -1749,16 +1755,24 @@ def _is_safe_codex_thread_id(thread_id: object) -> TypeGuard[str]:
     return True
 
 
-def _codex_rollout_is_resumable(path: Path, thread_id: str) -> bool:
+def _codex_rollout_is_resumable(
+    path: Path,
+    thread_id: str,
+    *,
+    codex_version: tuple[int, ...] | None = None,
+) -> bool:
     """
     Validate the structural fields Codex requires to resume a rollout.
 
     Historical payloads, including encrypted provider-owned content, remain
     opaque. Provider-switch handling is intentionally deferred; this check
-    only requires the provider stamp to be structurally present.
+    gates the metadata introduced in Codex 0.133 on the installed launch
+    version. An unavailable version probe stays conservative and preserves
+    older local artifacts.
     """
     session_meta: _JsonObject | None = None
     first_record = True
+    requires_current_metadata = codex_version is not None and codex_version >= (0, 133)
     try:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -1773,10 +1787,10 @@ def _codex_rollout_is_resumable(path: Path, thread_id: str) -> bool:
                 if (
                     not isinstance(record_type, str)
                     or not record_type
-                    or not isinstance(timestamp, str)
-                    or not timestamp
                     or not isinstance(payload, dict)
                 ):
+                    return False
+                if requires_current_metadata and (not isinstance(timestamp, str) or not timestamp):
                     return False
                 if first_record and record_type != "session_meta":
                     return False
@@ -1794,14 +1808,19 @@ def _codex_rollout_is_resumable(path: Path, thread_id: str) -> bool:
     cwd = session_meta.get("cwd")
     session_timestamp = session_meta.get("timestamp")
     return (
-        isinstance(cli_version, str)
-        and bool(cli_version.strip())
-        and isinstance(model_provider, str)
-        and bool(model_provider.strip())
+        (
+            not requires_current_metadata
+            or (
+                isinstance(cli_version, str)
+                and bool(cli_version.strip())
+                and isinstance(model_provider, str)
+                and bool(model_provider.strip())
+                and isinstance(session_timestamp, str)
+                and bool(session_timestamp.strip())
+            )
+        )
         and isinstance(cwd, str)
         and bool(cwd.strip())
-        and isinstance(session_timestamp, str)
-        and bool(session_timestamp.strip())
     )
 
 
@@ -1830,10 +1849,18 @@ async def _resolve_codex_cold_resume_thread_id(
     terminal_launch_args: Sequence[str] | None = None,
 ) -> str:
     """Repair a missing/malformed thread id and prepare its local rollout."""
-    thread_id = external_session_id
-    if not _is_safe_codex_thread_id(thread_id):
-        thread_id = _mint_codex_thread_id()
-        await _patch_external_session_id(client, session_id, thread_id)
+    proposed_thread_id = (
+        external_session_id
+        if _is_safe_codex_thread_id(external_session_id)
+        else _mint_codex_thread_id()
+    )
+    thread_id = await _bind_codex_thread_id_set_once(
+        client,
+        session_id=session_id,
+        proposed_thread_id=proposed_thread_id,
+        binding_required=not _is_safe_codex_thread_id(external_session_id),
+    )
+    if thread_id != external_session_id:
         click.echo(
             f"Warning: conversation {session_id!r} had no resumable Codex thread id; "
             "created a safe replacement.",
@@ -1971,7 +1998,13 @@ def _clone_codex_rollout(
     target_dir = clone_codex_home / rel_dir
     target = target_dir / source.name.replace(source_thread_id, target_thread_id)
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = target.with_suffix(".jsonl.tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
         _copy_rollout_with_cwd(
             source=source,
@@ -2040,9 +2073,18 @@ async def _ensure_local_codex_resume_rollout(
             f"Cannot resume Codex session {session_id!r}: persisted thread id "
             f"{external_session_id!r} is not a safe Codex rollout id."
         )
+    cli_version_tuple: tuple[int, ...] | None = None
+    if codex_path is not None:
+        from omnigent.inner.codex_executor import _codex_cli_version
+
+        cli_version_tuple = await _codex_cli_version(codex_path)
     existing = _find_codex_rollout(codex_home, external_session_id)
     if existing is not None:
-        if _codex_rollout_is_resumable(existing, external_session_id):
+        if _codex_rollout_is_resumable(
+            existing,
+            external_session_id,
+            codex_version=cli_version_tuple,
+        ):
             return existing
         backup = _backup_unparseable_codex_rollout(existing)
         click.echo(
@@ -2058,13 +2100,11 @@ async def _ensure_local_codex_resume_rollout(
             "starting a blank Codex thread.",
             err=True,
         )
-    cli_version = None
-    if codex_path is not None:
-        from omnigent.inner.codex_executor import _codex_cli_version
-
-        version_tuple = await _codex_cli_version(codex_path)
-        if version_tuple is not None:
-            cli_version = ".".join(str(part) for part in version_tuple)
+    cli_version = (
+        ".".join(str(part) for part in cli_version_tuple)
+        if cli_version_tuple is not None
+        else None
+    )
     records = _codex_rollout_records_from_session_items(
         items,
         session_id=session_id,
@@ -2075,7 +2115,13 @@ async def _ensure_local_codex_resume_rollout(
         terminal_launch_args=terminal_launch_args,
     )
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = target.with_suffix(".jsonl.tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
         with tmp.open("w", encoding="utf-8") as handle:
             for record in records:
@@ -2642,27 +2688,71 @@ def _codex_rollout_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+async def _bind_codex_thread_id_set_once(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    proposed_thread_id: str,
+    binding_required: bool = True,
+) -> str:
+    """
+    Bind a proposed Codex id once, resolving a concurrent winner safely.
+
+    :param client: HTTP client pointed at AP.
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :param proposed_thread_id: Safe Codex thread id this caller wants to bind.
+    :param binding_required: Whether a PATCH is needed. Existing valid server
+        bindings pass ``False`` and are returned without a write.
+    :returns: The authoritative safe thread id. This is either the proposal or
+        the id won by a concurrent caller.
+    :raises click.ClickException: If the proposal is unsafe, the server is
+        unavailable, or a refused binding has no safe authoritative winner.
+    """
+    if not _is_safe_codex_thread_id(proposed_thread_id):
+        raise click.ClickException(
+            f"Cannot bind unsafe Codex thread id {proposed_thread_id!r} "
+            f"for conversation {session_id!r}."
+        )
+    if not binding_required:
+        return proposed_thread_id
+    resp = await client.patch(
+        f"/v1/sessions/{url_component(session_id)}",
+        json={"external_session_id": proposed_thread_id},
+        timeout=10.0,
+    )
+    if resp.status_code < 400:
+        return proposed_thread_id
+
+    # Set-once stores reject the losing concurrent PATCH. Re-read instead of
+    # launching the loser: the winner is authoritative if and only if it is a
+    # path-safe Codex id. Transport/refetch failures remain fail-closed.
+    try:
+        payload = await _fetch_codex_session(client, session_id)
+    except Exception as exc:
+        raise click.ClickException(
+            f"Codex thread bind failed ({resp.status_code}) and the "
+            f"authoritative session could not be reloaded: {error_text(resp)}"
+        ) from exc
+    authoritative = payload.get("external_session_id")
+    if _is_safe_codex_thread_id(authoritative):
+        return authoritative
+    raise click.ClickException(
+        f"Codex thread bind failed ({resp.status_code}) and conversation "
+        f"{session_id!r} has no safe authoritative thread id: {error_text(resp)}"
+    )
+
+
 async def _patch_external_session_id(
     client: httpx.AsyncClient,
     session_id: str,
     thread_id: str,
-) -> None:
-    """
-    Persist the native Codex thread id on the Omnigent session.
-
-    :param client: HTTP client pointed at AP.
-    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
-    :param thread_id: Codex thread id.
-    :returns: None.
-    """
-    resp = await client.patch(
-        f"/v1/sessions/{url_component(session_id)}",
-        json={"external_session_id": thread_id},
+) -> str:
+    """Backward-compatible set-once Codex thread binding wrapper."""
+    return await _bind_codex_thread_id_set_once(
+        client,
+        session_id=session_id,
+        proposed_thread_id=thread_id,
     )
-    if resp.status_code >= 400:
-        raise click.ClickException(
-            f"Codex thread bind failed ({resp.status_code}): {error_text(resp)}"
-        )
 
 
 async def _wait_for_thread_started(client: CodexAppServerClient) -> str:

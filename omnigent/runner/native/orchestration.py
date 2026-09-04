@@ -2441,29 +2441,6 @@ def _prepare_claude_resume_forwarder(
     return prefix, degraded
 
 
-def _codex_rollout_is_resumable(path: Path, *, thread_id: str) -> bool:
-    """Require the structural session metadata Codex needs on resume."""
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            first = next((line for line in handle if line.strip()), "")
-        record = json.loads(first)
-    except (OSError, UnicodeDecodeError, ValueError):
-        return False
-    if not isinstance(record, dict) or record.get("type") != "session_meta":
-        return False
-    payload = record.get("payload")
-    return (
-        isinstance(payload, dict)
-        and payload.get("id") == thread_id
-        and isinstance(payload.get("cwd"), str)
-        and bool(payload.get("cwd"))
-        and isinstance(payload.get("model_provider"), str)
-        and bool(payload.get("model_provider"))
-        and isinstance(payload.get("cli_version"), str)
-        and bool(payload.get("cli_version"))
-    )
-
-
 async def _post_claude_degraded_sync_notice(
     *,
     session_id: str,
@@ -4021,7 +3998,6 @@ async def _auto_create_codex_terminal(
         session_id=session_id,
         server_client=server_client,
     )
-    original_external_session_id = launch_config.external_session_id
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
@@ -4041,6 +4017,8 @@ async def _auto_create_codex_terminal(
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
+    from omnigent.codex_native import _is_safe_codex_thread_id
+
     # Explicit launches (model-flows design §4): validate an explicit request
     # against the shared catalog, and give a Default launch on codex's own
     # login the ACCOUNT's real default — so the ``model =`` line copied from
@@ -4116,17 +4094,33 @@ async def _auto_create_codex_terminal(
         and launch_config.fork_source_external_id is not None
         and launch_config.fork_source_id is not None
     ):
-        from omnigent.codex_native import _clone_codex_rollout, _mint_codex_thread_id
+        from omnigent.codex_native import (
+            _bind_codex_thread_id_set_once,
+            _clone_codex_rollout,
+            _mint_codex_thread_id,
+        )
 
-        target_thread_id = _mint_codex_thread_id()
+        if server_client is None:
+            raise RuntimeError("server_client is required to bind a forked Codex thread.")
+        proposed_thread_id = _mint_codex_thread_id()
+        target_thread_id = await _bind_codex_thread_id_set_once(
+            server_client,
+            session_id=session_id,
+            proposed_thread_id=proposed_thread_id,
+        )
+        launch_config = dataclasses.replace(launch_config, external_session_id=target_thread_id)
         clone_workspace = Path(workspace).resolve()
         try:
-            cloned_rollout = _clone_codex_rollout(
-                source_session_id=launch_config.fork_source_id,
-                source_thread_id=launch_config.fork_source_external_id,
-                target_thread_id=target_thread_id,
-                clone_codex_home=codex_home,
-                clone_workspace=clone_workspace,
+            cloned_rollout = (
+                _clone_codex_rollout(
+                    source_session_id=launch_config.fork_source_id,
+                    source_thread_id=launch_config.fork_source_external_id,
+                    target_thread_id=target_thread_id,
+                    clone_codex_home=codex_home,
+                    clone_workspace=clone_workspace,
+                )
+                if target_thread_id == proposed_thread_id
+                else None
             )
         except Exception:  # noqa: BLE001 — best-effort; fall back to stored items
             cloned_rollout = None
@@ -4147,34 +4141,6 @@ async def _auto_create_codex_terminal(
             str(cloned_rollout) if cloned_rollout is not None else None,
             extra={"session_id": session_id},
         )
-        if cloned_rollout is not None:
-            # Resume our OWN clone via the existing resume path below.
-            launch_config = dataclasses.replace(
-                launch_config, external_session_id=target_thread_id
-            )
-            # Record the assigned thread id now so Omnigent reflects the clone's
-            # own Codex thread immediately and a later relaunch resumes it.
-            # Best-effort, like the claude-native fork branch.
-            if server_client is not None:
-                try:
-                    await server_client.patch(
-                        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                        json={"external_session_id": target_thread_id},
-                        timeout=10.0,
-                    )
-                except httpx.HTTPError:
-                    # The clone resumes via the known-thread forwarder (no
-                    # discovery), so nothing re-captures the id later: it stays
-                    # unset on the Omnigent session and a future relaunch of this
-                    # clone will start fresh rather than resume the cloned
-                    # rollout. The cloned rollout itself is already on disk, so
-                    # the current launch still resumes with history.
-                    _logger.warning(
-                        "Could not pre-set external_session_id for forked codex clone %s; "
-                        "it will remain unset and a future relaunch will start fresh",
-                        session_id,
-                        exc_info=True,
-                    )
     if (
         launch_config.external_session_id is None
         and launch_config.fork_carry_history
@@ -4188,30 +4154,28 @@ async def _auto_create_codex_terminal(
         # uses, so the clone opens with the prior conversation as Codex context.
         # Best-effort: launch fresh on failure. See designs/FORK_SESSION_UX.md.
         from omnigent.codex_native import (
+            _bind_codex_thread_id_set_once,
             _ensure_local_codex_resume_rollout,
             _mint_codex_thread_id,
         )
 
-        target_thread_id = _mint_codex_thread_id()
+        proposed_thread_id = _mint_codex_thread_id()
+        target_thread_id = await _bind_codex_thread_id_set_once(
+            server_client,
+            session_id=session_id,
+            proposed_thread_id=proposed_thread_id,
+        )
         clone_workspace = Path(workspace).resolve()
-        try:
-            built_rollout = await _ensure_local_codex_resume_rollout(
-                server_client,
-                session_id=session_id,
-                external_session_id=target_thread_id,
-                codex_home=codex_home,
-                workspace=clone_workspace,
-                model_provider=_session_meta_provider,
-                codex_path=_codex_cli_path,
-                terminal_launch_args=launch_config.terminal_launch_args,
-            )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            built_rollout = None
-            _logger.warning(
-                "Could not build rollout from items for forked codex clone %s; launching fresh",
-                session_id,
-                exc_info=True,
-            )
+        built_rollout = await _ensure_local_codex_resume_rollout(
+            server_client,
+            session_id=session_id,
+            external_session_id=target_thread_id,
+            codex_home=codex_home,
+            workspace=clone_workspace,
+            model_provider=_session_meta_provider,
+            codex_path=_codex_cli_path,
+            terminal_launch_args=launch_config.terminal_launch_args,
+        )
         _logger.info(
             "Codex terminal fork-rebuild decision: session=%s our_thread=%s "
             "clone_workspace=%s built_rollout=%s",
@@ -4221,47 +4185,29 @@ async def _auto_create_codex_terminal(
             str(built_rollout) if built_rollout is not None else None,
             extra={"session_id": session_id},
         )
-        if built_rollout is not None:
-            launch_config = dataclasses.replace(
-                launch_config, external_session_id=target_thread_id
-            )
-            try:
-                await server_client.patch(
-                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                    json={"external_session_id": target_thread_id},
-                    timeout=10.0,
-                )
-            except httpx.HTTPError:
-                _logger.warning(
-                    "Could not pre-set external_session_id for forked codex clone %s; "
-                    "it will remain unset and a future relaunch will start fresh",
-                    session_id,
-                    exc_info=True,
-                )
+        launch_config = dataclasses.replace(launch_config, external_session_id=target_thread_id)
 
+    resolved_standard_resume = False
     if (
-        launch_config.external_session_id is None
-        and original_external_session_id is None
+        not _is_safe_codex_thread_id(launch_config.external_session_id)
         and launch_config.fork_source_external_id is None
         and not launch_config.fork_carry_history
         and server_client is not None
     ):
-        # A missing id is no longer synonymous with an empty session. If the
-        # Omnigent conversation has committed history, mint a native thread,
-        # reconstruct its rollout, and persist the binding before launch.
+        # Missing and malformed ids share the CLI's conflict-aware set-once
+        # resolver. It binds before reconstruction, so a concurrent loser
+        # never launches or leaves a rollout under its private proposal.
         from omnigent.codex_native import (
-            _ensure_local_codex_resume_rollout,
             _fetch_all_session_items_for_codex_resume,
-            _mint_codex_thread_id,
+            _resolve_codex_cold_resume_thread_id,
         )
 
         history = await _fetch_all_session_items_for_codex_resume(server_client, session_id)
-        if history:
-            target_thread_id = _mint_codex_thread_id()
-            await _ensure_local_codex_resume_rollout(
+        if history or launch_config.external_session_id is not None:
+            target_thread_id = await _resolve_codex_cold_resume_thread_id(
                 server_client,
                 session_id=session_id,
-                external_session_id=target_thread_id,
+                external_session_id=launch_config.external_session_id,
                 codex_home=codex_home,
                 workspace=Path(workspace).resolve(),
                 model_provider=_session_meta_provider,
@@ -4271,39 +4217,18 @@ async def _auto_create_codex_terminal(
             launch_config = dataclasses.replace(
                 launch_config, external_session_id=target_thread_id
             )
-            resp = await server_client.patch(
-                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                json={"external_session_id": target_thread_id},
-                timeout=10.0,
-            )
-            resp.raise_for_status()
+            resolved_standard_resume = True
         else:
             _logger.warning(
                 "Codex session %s has no native thread id or committed history; launching fresh",
                 session_id,
             )
 
-    if launch_config.external_session_id is not None and original_external_session_id is not None:
-        from omnigent.codex_native import (
-            _ensure_local_codex_resume_rollout,
-            _find_codex_rollout,
-        )
+    if launch_config.external_session_id is not None and not resolved_standard_resume:
+        from omnigent.codex_native import _ensure_local_codex_resume_rollout
 
         if server_client is None:
             raise RuntimeError("server_client is required for Codex cold resume.")
-        existing_rollout = _find_codex_rollout(codex_home, launch_config.external_session_id)
-        if existing_rollout is not None and not _codex_rollout_is_resumable(
-            existing_rollout,
-            thread_id=launch_config.external_session_id,
-        ):
-            backup = _backup_unparseable_native_artifact(existing_rollout)
-            existing_rollout.unlink()
-            _logger.warning(
-                "Backed up invalid Codex rollout %s to %s before reconstruction",
-                existing_rollout,
-                backup,
-                extra={"session_id": session_id},
-            )
         await _ensure_local_codex_resume_rollout(
             server_client,
             session_id=session_id,

@@ -8589,6 +8589,71 @@ async def test_prepare_codex_terminal_hot_resume_does_not_rewrite_rollout(
 
 
 @pytest.mark.asyncio
+async def test_prepare_codex_terminal_reattaches_during_first_start_id_race(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A running terminal wins even before its thread id reaches the server."""
+    original_async_client = httpx.AsyncClient
+    session_id = "conv_first_start_race"
+    bridge_id = "bridge_first_start_race"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "bridges")
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == f"/v1/sessions/{session_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "labels": {
+                        "omnigent.wrapper": "codex-native-ui",
+                        "omnigent.codex_native.bridge_id": bridge_id,
+                    },
+                    "external_session_id": None,
+                },
+            )
+        if request.url.path.endswith("/resources/terminals/terminal_codex_main"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "terminal_codex_main",
+                    "metadata": {
+                        "tmux_socket": "/tmp/first-start.sock",
+                        "tmux_target": "first-start:main",
+                    },
+                },
+            )
+        return httpx.Response(500, json={"error": {"message": "must not relaunch"}})
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(codex_native.httpx, "AsyncClient", client_factory)
+    prepared = await codex_native._prepare_codex_terminal(
+        base_url="https://example.com",
+        headers={},
+        session_id=session_id,
+        runner_id="runner_local",
+        session_bundle=None,
+        codex_args=(),
+        command="/opt/codex/bin/codex",
+        model=None,
+    )
+
+    assert prepared.reattached is True
+    assert prepared.thread_id is None
+    assert prepared.terminal_id == "terminal_codex_main"
+    assert not any(method in {"PATCH", "POST"} for method, _path in calls)
+    bridge_dir = codex_native.bridge_dir_for_bridge_id(bridge_id)
+    assert not bridge_dir.exists(), "warm reattach must not clear or recreate bridge state"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status_code", "body"),
     [
@@ -10990,6 +11055,132 @@ async def test_resolve_codex_cold_resume_mints_and_persists_safe_id(
     rollout = codex_native._find_codex_rollout(codex_home, thread_id)
     assert rollout is not None
     assert codex_native._codex_rollout_is_resumable(rollout, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_missing_id_resumes_share_authoritative_winner(
+    tmp_path: Path,
+) -> None:
+    """A losing set-once bind reconstructs the winner and leaves no orphan."""
+    authoritative_id: str | None = None
+    proposals: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal authoritative_id
+        if request.method == "PATCH":
+            proposed = json.loads(request.content)["external_session_id"]
+            proposals.append(proposed)
+            if authoritative_id is None:
+                authoritative_id = proposed
+                return httpx.Response(200, json={"external_session_id": proposed})
+            return httpx.Response(409, json={"error": {"message": "already bound"}})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_race":
+            return httpx.Response(200, json={"external_session_id": authoritative_id})
+        if request.url.path == "/v1/sessions/conv_race/items":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "msg_1",
+                            "response_id": "turn_1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "keep me"}],
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    codex_home = tmp_path / "codex-home"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        resolved = await asyncio.gather(
+            *[
+                codex_native._resolve_codex_cold_resume_thread_id(
+                    client,
+                    session_id="conv_race",
+                    external_session_id=None,
+                    codex_home=codex_home,
+                    workspace=tmp_path.resolve(),
+                    model_provider="openai",
+                    codex_path=None,
+                )
+                for _ in range(2)
+            ]
+        )
+
+    assert len(set(proposals)) == 2
+    assert authoritative_id is not None
+    assert resolved == [authoritative_id, authoritative_id]
+    rollouts = list((codex_home / "sessions").glob("**/rollout-*.jsonl"))
+    assert len(rollouts) == 1
+    assert rollouts[0].name.endswith(f"-{authoritative_id}.jsonl")
+    assert "keep me" in rollouts[0].read_text()
+    assert not list(rollouts[0].parent.glob("*.tmp"))
+    loser = next(proposal for proposal in proposals if proposal != authoritative_id)
+    assert codex_native._find_codex_rollout(codex_home, loser) is None
+
+
+@pytest.mark.asyncio
+async def test_old_codex_rollout_without_cli_version_is_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex 0.132 may resume its native rollout without 0.133 metadata."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/repo",
+    )
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    records[0]["payload"].pop("cli_version")
+    records.append(
+        {
+            "timestamp": "2026-06-05T07:24:00.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "local-only tail"}],
+            },
+        }
+    )
+    rollout.write_text("".join(json.dumps(record) + "\n" for record in records))
+    before = rollout.read_bytes()
+
+    async def old_version(_path: str) -> tuple[int, ...]:
+        return (0, 132, 0)
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._codex_cli_version", old_version)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("compatible local rollout must not fetch server history")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        result = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_old",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=tmp_path,
+            model_provider="openai",
+            codex_path="/opt/codex-0.132/bin/codex",
+        )
+
+    assert result == rollout
+    assert rollout.read_bytes() == before
+    assert codex_native._codex_rollout_is_resumable(rollout, thread_id, codex_version=(0, 132, 0))
+    assert not codex_native._codex_rollout_is_resumable(
+        rollout, thread_id, codex_version=(0, 133, 0)
+    )
 
 
 @pytest.mark.asyncio
