@@ -10367,7 +10367,14 @@ def _write_source_rollout(*, codex_home: Path, thread_id: str, source_cwd: str) 
         {
             "timestamp": "2026-06-05T07:23:34.547Z",
             "type": "session_meta",
-            "payload": {"id": thread_id, "cwd": source_cwd, "originator": "test"},
+            "payload": {
+                "id": thread_id,
+                "cwd": source_cwd,
+                "originator": "test",
+                "cli_version": "0.136.0",
+                "model_provider": "openai",
+                "timestamp": "2026-06-05T07:23:34.547Z",
+            },
         },
         {
             "timestamp": "2026-06-05T07:23:34.549Z",
@@ -10816,6 +10823,127 @@ async def test_ensure_local_codex_resume_rollout_preserves_existing_rollout(
 
     assert rollout == existing
     assert existing.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_backs_up_corrupt_file_and_reconstructs(
+    tmp_path: Path,
+) -> None:
+    """A matching but unparseable rollout is preserved, then reconstructed."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    corrupt = _write_source_rollout(
+        codex_home=codex_home,
+        thread_id=thread_id,
+        source_cwd="/source",
+    )
+    corrupt_bytes = corrupt.read_bytes() + b'{"type":"response_item"\n'
+    corrupt.write_bytes(corrupt_bytes)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "msg_1",
+                        "response_id": "turn_1",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "recover me"}],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=tmp_path.resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    backups = list(corrupt.parent.glob(f"{corrupt.name}.omnigent-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == corrupt_bytes
+    assert rollout == corrupt
+    assert codex_native._codex_rollout_is_resumable(rollout, thread_id)
+    assert "recover me" in rollout.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_empty_server_starts_blank(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Empty server history produces a valid blank rollout and warning."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=tmp_path / "codex-home",
+            workspace=tmp_path.resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert [record["type"] for record in records] == ["session_meta"]
+    assert codex_native._codex_rollout_is_resumable(rollout, thread_id)
+    assert "starting a blank Codex thread" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_id", [None, "../../etc/passwd", "not-a-uuid"])
+async def test_resolve_codex_cold_resume_mints_and_persists_safe_id(
+    tmp_path: Path,
+    recorded_id: str | None,
+) -> None:
+    """Missing and malformed persisted IDs recover under a new UUIDv7."""
+    patches: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": [], "has_more": False})
+
+    codex_home = tmp_path / "codex-home"
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        thread_id = await codex_native._resolve_codex_cold_resume_thread_id(
+            client,
+            session_id="conv_codex",
+            external_session_id=recorded_id,
+            codex_home=codex_home,
+            workspace=tmp_path.resolve(),
+            model_provider="openai",
+            codex_path=None,
+        )
+
+    assert codex_native._is_safe_codex_thread_id(thread_id)
+    assert patches == [{"external_session_id": thread_id}]
+    rollout = codex_native._find_codex_rollout(codex_home, thread_id)
+    assert rollout is not None
+    assert codex_native._codex_rollout_is_resumable(rollout, thread_id)
 
 
 @pytest.mark.asyncio
