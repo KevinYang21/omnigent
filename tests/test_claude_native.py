@@ -1543,8 +1543,17 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_cold
     async def _fake_fetch_labels(_client: object, _session_id: str) -> dict[str, str]:
         return {}
 
-    async def _fake_resolve_cold_resume_args(_client: object, _session_id: str) -> tuple[str, ...]:
-        return ("--resume", "claude-sid-cold")
+    async def _fake_resolve_cold_resume_args(
+        _client: object, _session_id: str
+    ) -> tuple[tuple[str, ...], claude_native.ClaudeResumeTranscriptResolution]:
+        return (
+            ("--resume", "claude-sid-cold"),
+            claude_native.ClaudeResumeTranscriptResolution(
+                None,
+                reused_local=False,
+                synthesized=False,
+            ),
+        )
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -2734,11 +2743,12 @@ async def test_ensure_local_claude_resume_transcript_uses_workspace_dir(
     expected_dir = projects / claude_native._sanitize_claude_project_name(str(workspace))
     # Under the WORKSPACE-derived project dir (proves the param is
     # honoured, not Path.cwd()), and the file was actually created.
-    assert written == expected_dir / "sid123.jsonl"
-    assert written.is_file()
+    assert written.path == expected_dir / "sid123.jsonl"
+    assert written.synthesized is True
+    assert written.path.is_file()
     # The synthesized transcript holds the converted message, not an empty
     # file (an empty file would make ``claude --resume`` exit on launch).
-    assert written.read_text(encoding="utf-8").strip() != ""
+    assert written.path.read_text(encoding="utf-8").strip() != ""
 
 
 @pytest.mark.asyncio
@@ -2775,7 +2785,7 @@ async def test_ensure_local_claude_resume_transcript_returns_none_when_no_record
             workspace=workspace,
         )
 
-    assert written is None
+    assert written.path is None
     expected = (
         projects / claude_native._sanitize_claude_project_name(str(workspace)) / "sid123.jsonl"
     )
@@ -2951,7 +2961,8 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
             workspace=workspace,
         )
 
-    assert written == local
+    assert written.path == local
+    assert written.reused_local is True
     # The untouched local transcript is used as-is, never overwritten with
     # partial server state.
     assert local.read_bytes() == original
@@ -3170,8 +3181,8 @@ async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
             workspace=workspace,
         )
 
-    assert written is not None
-    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    assert written.path is not None
+    records = [json.loads(line) for line in written.path.read_text(encoding="utf-8").splitlines()]
     user_content = records[0]["message"]["content"]
     # A lone surviving block collapses to a plain string.
     texts = (
@@ -3186,7 +3197,7 @@ async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
     assert attached_path.parent == bridge_dir / "uploads"
     assert attached_path.read_bytes() == b"png-bytes"
     assert "look at this image" in " ".join(texts)
-    assert "file_id" not in written.read_text(encoding="utf-8")
+    assert "file_id" not in written.path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -3220,8 +3231,8 @@ async def test_ensure_local_claude_resume_transcript_marks_unresolvable_attachme
             workspace=workspace,
         )
 
-    assert written is not None
-    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    assert written.path is not None
+    records = [json.loads(line) for line in written.path.read_text(encoding="utf-8").splitlines()]
     user_content = records[0]["message"]["content"]
     texts = (
         [user_content]
@@ -3265,8 +3276,8 @@ async def test_ensure_local_claude_resume_transcript_survives_malformed_file_met
             workspace=workspace,
         )
 
-    assert written is not None
-    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    assert written.path is not None
+    records = [json.loads(line) for line in written.path.read_text(encoding="utf-8").splitlines()]
     user_content = records[0]["message"]["content"]
     texts = (
         [user_content]
@@ -5056,8 +5067,9 @@ async def test_resolve_cold_resume_args_injects_external_session_id(
         200,
     )
     async with client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args, resolution = await claude_native._resolve_cold_resume_args(client, "conv_abc")
     assert args == ("--resume", "claude-uuid-abc")
+    assert resolution.path is not None
 
 
 @pytest.mark.asyncio
@@ -5090,8 +5102,9 @@ async def test_resolve_cold_resume_args_declines_resume_when_no_history(
         items=[],
     )
     async with client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args, resolution = await claude_native._resolve_cold_resume_args(client, "conv_abc")
     assert args == ()
+    assert resolution.path is None
     # And it must not leave an empty transcript behind for a later launch.
     assert list((tmp_path / "projects").rglob("claude-uuid-abc.jsonl")) == []
 
@@ -5186,9 +5199,10 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args, resolution = await claude_native._resolve_cold_resume_args(client, "conv_abc")
 
     assert args == ("--resume", "claude-uuid-abc")
+    assert resolution.synthesized is True
     transcript_path = (
         projects
         / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
@@ -5307,9 +5321,10 @@ async def test_resolve_cold_resume_args_reuses_existing_local_claude_transcript(
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args, resolution = await claude_native._resolve_cold_resume_args(client, "conv_abc")
 
     assert args == ("--resume", "claude-uuid-abc")
+    assert resolution.reused_local is True
     assert item_requests == 0
     assert transcript_path.read_bytes() == original
 
@@ -5335,6 +5350,65 @@ def _write_resumable_local_transcript(path: Path, *, sid: str, cwd: Path, text: 
     return raw
 
 
+def test_resumable_transcript_accepts_historical_shapes_and_torn_tail(
+    tmp_path: Path,
+) -> None:
+    """Historical metadata plus one crash-torn final write remains resumable."""
+    sid = "02857840-6362-408f-b41f-309e396ed7c6"
+    real_cwd = tmp_path / "real-workspace"
+    real_cwd.mkdir()
+    stored_cwd = tmp_path / "symlink-workspace"
+    stored_cwd.symlink_to(real_cwd, target_is_directory=True)
+    project = tmp_path / claude_native._sanitize_claude_project_name(str(stored_cwd))
+    transcript = project / f"{sid}.jsonl"
+    project.mkdir()
+    records = [
+        {
+            "type": "file-history-snapshot",
+            "sessionId": sid,
+            "cwd": str(stored_cwd),
+            "snapshot": {},
+        },
+        {
+            "type": "user",
+            "parentUuid": "uuid-before-retained-history",
+            "sessionId": sid,
+            "cwd": str(stored_cwd),
+            "message": {"role": "user", "content": "restore this"},
+        },
+    ]
+    transcript.write_text(
+        "".join(json.dumps(record) + "\n" for record in records) + '{"type":"assistant"',
+        encoding="utf-8",
+    )
+
+    assert claude_native._is_resumable_claude_transcript(
+        transcript,
+        external_session_id=sid,
+    )
+
+
+def test_resumable_transcript_rejects_complete_earlier_corruption(
+    tmp_path: Path,
+) -> None:
+    """Only a non-newline-terminated final fragment gets crash tolerance."""
+    cwd = tmp_path / "workspace"
+    project = tmp_path / claude_native._sanitize_claude_project_name(str(cwd))
+    transcript = project / "sid.jsonl"
+    project.mkdir()
+    transcript.write_text(
+        '{"type":"user","message":{"role":"user","content":"ok"}}\n'
+        '{"broken":\n'
+        '{"type":"assistant"',
+        encoding="utf-8",
+    )
+
+    assert not claude_native._is_resumable_claude_transcript(
+        transcript,
+        external_session_id="sid",
+    )
+
+
 @pytest.mark.asyncio
 async def test_resume_searches_current_workspace_before_prior_without_server_fetch(
     monkeypatch: pytest.MonkeyPatch,
@@ -5352,7 +5426,9 @@ async def test_resume_searches_current_workspace_before_prior_without_server_fet
     current_raw = _write_resumable_local_transcript(
         current_path, sid="sid", cwd=current, text="current"
     )
-    _write_resumable_local_transcript(prior_path, sid="sid", cwd=prior, text="prior")
+    prior_raw = _write_resumable_local_transcript(prior_path, sid="sid", cwd=prior, text="prior")
+    prior_raw += b'{"type":"assistant"'
+    prior_path.write_bytes(prior_raw)
 
     def no_fetch(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"server context fetch was unexpected: {request.url}")
@@ -5366,7 +5442,8 @@ async def test_resume_searches_current_workspace_before_prior_without_server_fet
             external_session_id="sid",
             workspace=current,
         )
-    assert resolved == current_path
+    assert resolved.path == current_path
+    assert resolved.reused_local is True
     assert current_path.read_bytes() == current_raw
 
     current_path.unlink()
@@ -5379,7 +5456,60 @@ async def test_resume_searches_current_workspace_before_prior_without_server_fet
             external_session_id="sid",
             workspace=current,
         )
-    assert resolved == prior_path
+    assert resolved.path == current_path
+    assert resolved.reused_local is True
+    assert current_path.is_file()
+    redirected = json.loads(current_path.read_text(encoding="utf-8").splitlines()[0])
+    assert redirected["cwd"] == str(current)
+    assert redirected["sessionId"] == "sid"
+    assert current_path.read_bytes().endswith(b'{"type":"assistant"')
+    assert prior_path.read_bytes() == prior_raw
+
+
+@pytest.mark.asyncio
+async def test_invalid_current_transcript_cannot_shadow_valid_prior(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Back up an invalid current artifact, then atomically redirect prior."""
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    current = tmp_path / "current"
+    prior = tmp_path / "prior"
+    current_path = (
+        projects / claude_native._sanitize_claude_project_name(str(current)) / "sid.jsonl"
+    )
+    prior_path = projects / claude_native._sanitize_claude_project_name(str(prior)) / "sid.jsonl"
+    current_path.parent.mkdir(parents=True)
+    corrupt = b'{"broken":\n'
+    current_path.write_bytes(corrupt)
+    prior_raw = _write_resumable_local_transcript(
+        prior_path,
+        sid="sid",
+        cwd=prior,
+        text="prior survives",
+    )
+
+    def no_fetch(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server context fetch was unexpected: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(no_fetch), base_url="http://test"
+    ) as client:
+        resolved = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv",
+            external_session_id="sid",
+            workspace=current,
+        )
+
+    assert resolved.path == current_path
+    assert resolved.reused_local is True
+    assert b"prior survives" in current_path.read_bytes()
+    assert prior_path.read_bytes() == prior_raw
+    backups = list(current_path.parent.glob("sid.jsonl.omnigent-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == corrupt
 
 
 @pytest.mark.asyncio
@@ -5423,7 +5553,8 @@ async def test_wrong_workspace_artifact_is_backed_up_then_synthesized(
             external_session_id="sid",
             workspace=current,
         )
-    assert resolved == target
+    assert resolved.path == target
+    assert resolved.synthesized is True
     backups = list(target.parent.glob("sid.jsonl.omnigent-backup-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == corrupt_raw
@@ -5511,7 +5642,11 @@ def test_invalid_local_resume_cursor_emits_degraded_sync_notice(
 
     claude_native._prepare_cold_resume_forward_state(
         bridge_dir=bridge,
-        transcript=transcript,
+        resolution=claude_native.ClaudeResumeTranscriptResolution(
+            transcript,
+            reused_local=True,
+            synthesized=False,
+        ),
         session_id="conv",
     )
 
@@ -5521,19 +5656,12 @@ def test_invalid_local_resume_cursor_emits_degraded_sync_notice(
 
 
 @pytest.mark.asyncio
-async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_image(
+async def test_ensure_local_claude_resume_transcript_preserves_valid_local_image(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    An already-generated transcript with the old duplicate self-heals.
-
-    Pre-fix rebuilds wrote an intact image's base64 twice — once in the
-    rehydrated ``tool_result`` content block and again verbatim in
-    ``toolUseResult``. The resume helper always rewrites the transcript
-    from Omnigent items before launch (no cache, no migration), so a
-    stale affected file is repaired on the next resume: after the
-    rebuild the payload must appear exactly once.
+    A valid local transcript remains authoritative byte-for-byte.
     """
     # Padded so the fixture is already canonical standard base64.
     b64 = "iVBORw0KGgo" + "D" * 5000 + "="
@@ -5564,18 +5692,8 @@ async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_im
     transcript_path.write_text(json.dumps(stale_record) + "\n", encoding="utf-8")
     assert transcript_path.read_text(encoding="utf-8").count(b64) == 2, "pre-fix wedged state"
 
-    image_item = {
-        "id": "fco_1",
-        "response_id": "resp_1",
-        "type": "function_call_output",
-        "call_id": "toolu_1",
-        "output": json.dumps([image_block], separators=(",", ":")),
-    }
-
     def handler(request: httpx.Request) -> httpx.Response:
-        """Serve the AP-authoritative item page carrying the image output."""
-        del request
-        return httpx.Response(200, json=_items_response_body([image_item]))
+        raise AssertionError(f"local-first resume must not fetch history: {request.url}")
 
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
     transport = httpx.MockTransport(handler)
@@ -5587,13 +5705,14 @@ async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_im
             workspace=workspace.resolve(),
         )
 
-    assert written == transcript_path
-    text = written.read_text(encoding="utf-8")
-    assert text.count(b64) == 1, "rebuild must drop the duplicated toolUseResult base64"
+    assert written.path == transcript_path
+    assert written.reused_local is True
+    text = transcript_path.read_text(encoding="utf-8")
+    assert text.count(b64) == 2
     record = json.loads(text.splitlines()[0])
     content = record["message"]["content"][0]["content"]
     assert content[0]["source"]["data"] == b64, "the model-visible image must survive"
-    assert b64 not in record["toolUseResult"]
+    assert b64 in record["toolUseResult"]
 
 
 @pytest.mark.asyncio
@@ -5638,9 +5757,10 @@ async def test_resolve_cold_resume_args_warns_when_external_session_id_missing(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://test"
     ) as client:
-        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        args, resolution = await claude_native._resolve_cold_resume_args(client, "conv_abc")
     assert args[0] == "--resume"
     assert re.fullmatch(r"[0-9a-f-]{36}", args[1])
+    assert resolution.synthesized is True
     assert patches == [{"external_session_id": args[1]}]
     assert list((tmp_path / "projects").rglob(f"{args[1]}.jsonl"))
     assert capsys.readouterr().err == ""
@@ -5726,7 +5846,9 @@ async def test_resolve_cold_resume_args_warning_lands_in_logger(
     )
     async with client:
         result = await claude_native._resolve_cold_resume_args(client, "conv_abc")
-    assert result == ()
+    args, resolution = result
+    assert args == ()
+    assert resolution.path is None
     # Warning was issued — if a regression replaced
     # ``_logger.warning(...)`` with ``pass`` or a print, this
     # assertion catches it.
@@ -5770,7 +5892,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     async def _fake_resolve_cold_resume_args(
         _client: object,
         _session_id: str,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], claude_native.ClaudeResumeTranscriptResolution]:
         """
         Stand in for the real wrapper-label / external_session_id
         lookup. Returns the args that production injects.
@@ -5779,7 +5901,14 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
         :param _session_id: Unused conversation id.
         :returns: Fixed ``("--resume", "claude-sid-abc")``.
         """
-        return ("--resume", "claude-sid-abc")
+        return (
+            ("--resume", "claude-sid-abc"),
+            claude_native.ClaudeResumeTranscriptResolution(
+                None,
+                reused_local=False,
+                synthesized=False,
+            ),
+        )
 
     async def _fake_fetch_labels(
         _client: object,

@@ -248,9 +248,10 @@ async def test_valid_local_claude_transcript_wins_without_server_rewrite(
     monkeypatch.setattr(claude_native, "_claude_project_dir_for_cwd", lambda _cwd: target.parent)
 
     async with _async_client(live_server) as client:
-        args = await claude_native._resolve_cold_resume_args(client, session_id)
+        args, resolution = await claude_native._resolve_cold_resume_args(client, session_id)
 
     assert args == ("--resume", _CLAUDE_ID)
+    assert resolution.reused_local is True
     assert target.read_bytes() == before
     assert b"ALBATROSS" not in target.read_bytes()
 
@@ -306,9 +307,10 @@ async def test_missing_claude_id_is_minted_persisted_and_reconstructed(
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
 
     async with _async_client(live_server) as client:
-        args = await claude_native._resolve_cold_resume_args(client, session_id)
+        args, resolution = await claude_native._resolve_cold_resume_args(client, session_id)
 
     assert args[0] == "--resume"
+    assert resolution.synthesized is True
     minted = args[1]
     assert uuid.UUID(minted).version in (4, 7)
     snapshot = http_client.get(f"/v1/sessions/{session_id}")
@@ -368,9 +370,10 @@ async def test_corrupt_claude_transcript_is_backed_up_then_reconstructed(
     monkeypatch.setattr(claude_native, "_claude_project_dir_for_cwd", lambda _cwd: target.parent)
 
     async with _async_client(live_server) as client:
-        args = await claude_native._resolve_cold_resume_args(client, session_id)
+        args, resolution = await claude_native._resolve_cold_resume_args(client, session_id)
 
     assert args == ("--resume", _CLAUDE_ID)
+    assert resolution.synthesized is True
     backups = list(target.parent.glob(f"{target.name}.omnigent-backup-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == corrupt
@@ -494,9 +497,10 @@ async def test_claude_native_compaction_shapes_survive_public_api_reconstruction
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
 
     async with _async_client(live_server) as client:
-        args = await claude_native._resolve_cold_resume_args(client, session_id)
+        args, resolution = await claude_native._resolve_cold_resume_args(client, session_id)
 
     assert args == ("--resume", _CLAUDE_ID)
+    assert resolution.synthesized is True
     transcript = next(projects.rglob(f"{_CLAUDE_ID}.jsonl"))
     records = [json.loads(line) for line in transcript.read_text().splitlines()]
     assert [record["type"] for record in records] == ["system", "user", "assistant", "user"]
@@ -560,13 +564,13 @@ async def test_codex_native_compaction_shape_survives_public_api_reconstruction(
 
 
 @pytest.mark.asyncio
-async def test_cross_workspace_claude_transcript_is_discovered_without_move(
+async def test_cross_workspace_claude_transcript_is_redirected_for_current_cwd(
     http_client: httpx.Client,
     live_server: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A valid prior-workspace transcript resumes in place byte-for-byte."""
+    """A prior transcript is preserved and copied where cwd-scoped resume searches."""
     session_id = _native_session(http_client, CLAUDE_NATIVE_AGENT_NAME)
     _patch_external_id(http_client, session_id, _CLAUDE_ID)
     _post_history(http_client, session_id)
@@ -584,11 +588,13 @@ async def test_cross_workspace_claude_transcript_is_discovered_without_move(
     )
 
     async with _async_client(live_server) as client:
-        args = await claude_native._resolve_cold_resume_args(client, session_id)
+        args, resolution = await claude_native._resolve_cold_resume_args(client, session_id)
 
     assert args == ("--resume", _CLAUDE_ID)
+    assert resolution.path == current_target
+    assert resolution.reused_local is True
     assert prior.read_bytes() == before
-    assert not current_target.exists()
+    assert current_target.exists()
 
 
 def test_valid_claude_cursor_is_preserved_for_resume(tmp_path: Path) -> None:
@@ -648,8 +654,18 @@ async def test_invalid_claude_cursor_surfaces_degraded_notice_at_prepare_boundar
     async def _not_running(_client: object, _session_id: str) -> None:
         return None
 
-    async def _resume(_client: object, _session_id: str) -> tuple[str, str]:
-        return "--resume", _CLAUDE_ID
+    async def _resume(
+        _client: object,
+        _session_id: str,
+    ) -> tuple[tuple[str, str], claude_native.ClaudeResumeTranscriptResolution]:
+        return (
+            ("--resume", _CLAUDE_ID),
+            claude_native.ClaudeResumeTranscriptResolution(
+                transcript,
+                reused_local=True,
+                synthesized=False,
+            ),
+        )
 
     async def _launch(*_args: object, **_kwargs: object) -> str:
         return "terminal_claude_main"

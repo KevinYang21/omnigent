@@ -282,7 +282,6 @@ def _managed_settings_paths() -> tuple[Path, ...]:
 
 
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-_SYNTHESIZED_RESUME_TRANSCRIPTS: set[Path] = set()
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
 _RESUME_ACTION_LEAVE = "leave"
@@ -309,6 +308,22 @@ class _ResumeWorkspaceActionOption:
 
     action: str
     label: str
+
+
+@dataclass(frozen=True)
+class ClaudeResumeTranscriptResolution:
+    """One cold-resume transcript and its explicit provenance."""
+
+    path: Path | None
+    reused_local: bool
+    synthesized: bool
+
+    def __post_init__(self) -> None:
+        if self.path is None:
+            if self.reused_local or self.synthesized:
+                raise ValueError("an absent transcript cannot have provenance")
+        elif self.reused_local == self.synthesized:
+            raise ValueError("a transcript must be either reused or synthesized")
 
 
 @dataclass
@@ -2226,7 +2241,12 @@ def _redirect_claude_transcript_to_current_project(
 
 
 def _copy_transcript_with_cwd(
-    *, source: Path, target: Path, current: Path, new_session_id: str | None = None
+    *,
+    source: Path,
+    target: Path,
+    current: Path,
+    new_session_id: str | None = None,
+    sanitize_content: bool = True,
 ) -> None:
     """
     Copy *source* JSONL to *target* while rewriting top-level cwd.
@@ -2242,18 +2262,29 @@ def _copy_transcript_with_cwd(
         (the cwd-only redirect/move path) leaves ``sessionId`` untouched.
         The ``uuid`` / ``parentUuid`` chain is preserved verbatim in
         either case.
+    :param sanitize_content: Repair legacy cloned tool-result payloads.
+        Disabled for same-session cwd redirects, which may change only
+        structural cwd metadata.
     :returns: None.
     :raises click.ClickException: If a transcript line is malformed.
     """
     current_text = str(current)
     with source.open("r", encoding="utf-8") as src, target.open("w", encoding="utf-8") as dst:
-        for line_number, line in enumerate(src, start=1):
+        lines = src.readlines()
+        for line_number, line in enumerate(lines, start=1):
             if not line.strip():
                 dst.write(line)
                 continue
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError as exc:
+                if line_number == len(lines) and not line.endswith("\n"):
+                    # Claude can leave one torn final write after a crash.  It
+                    # ignores that incomplete tail on resume, so preserve it
+                    # byte-for-byte while still rejecting malformed complete
+                    # records (including every earlier line).
+                    dst.write(line)
+                    continue
                 raise click.ClickException(
                     f"Cannot redirect malformed Claude transcript {source}: "
                     f"line {line_number} is not valid JSON."
@@ -2263,7 +2294,8 @@ def _copy_transcript_with_cwd(
                     payload["cwd"] = current_text
                 if new_session_id is not None and isinstance(payload.get("sessionId"), str):
                     payload["sessionId"] = new_session_id
-                _sanitize_cloned_tool_result_record(payload)
+                if sanitize_content:
+                    _sanitize_cloned_tool_result_record(payload)
             dst.write(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
@@ -4540,6 +4572,11 @@ async def _prepare_claude_terminal(
         # and the warn-and-fallback path — share this hazard, so a
         # single ``cold_resumed`` flag covers both.
         cold_resumed = False
+        cold_resume_resolution = ClaudeResumeTranscriptResolution(
+            None,
+            reused_local=False,
+            synthesized=False,
+        )
         bridge_id: str | None = None
         if session_id is None:
             if session_bundle is None:
@@ -4608,7 +4645,10 @@ async def _prepare_claude_terminal(
                 startup_progress=startup_progress,
                 progress_message="Restoring Claude session...",
             )
-            cold_resume_args = await _resolve_cold_resume_args(client, session_id)
+            cold_resume_args, cold_resume_resolution = await _resolve_cold_resume_args(
+                client,
+                session_id,
+            )
             _mark_startup_step(
                 startup_profiler,
                 "cold resume args resolved",
@@ -4640,20 +4680,11 @@ async def _prepare_claude_terminal(
             "bridge dir prepared",
             startup_progress=startup_progress,
         )
-        resume_transcript: Path | None = None
-        if len(cold_resume_args) >= 2 and cold_resume_args[0] == "--resume":
-            resume_transcript = _find_claude_resume_transcript(
-                cold_resume_args[1],
-                workspace=Path.cwd().resolve(),
-            )
-        if resume_transcript is None:
-            reset_transcript_forward_state(bridge_dir)
-        else:
-            _prepare_cold_resume_forward_state(
-                bridge_dir=bridge_dir,
-                transcript=resume_transcript,
-                session_id=session_id,
-            )
+        _prepare_cold_resume_forward_state(
+            bridge_dir=bridge_dir,
+            resolution=cold_resume_resolution,
+            session_id=session_id,
+        )
         _mark_startup_step(
             startup_profiler,
             "transcript forward state prepared",
@@ -4703,31 +4734,35 @@ async def _prepare_claude_terminal(
 def _prepare_cold_resume_forward_state(
     *,
     bridge_dir: Path,
-    transcript: Path,
+    resolution: ClaudeResumeTranscriptResolution,
     session_id: str,
-) -> None:
-    """Preserve a valid local cursor or seed safely after the resume prefix."""
-    if transcript in _SYNTHESIZED_RESUME_TRANSCRIPTS:
-        _SYNTHESIZED_RESUME_TRANSCRIPTS.discard(transcript)
+) -> bool:
+    """Prepare a resume cursor and report degraded local synchronization."""
+    transcript = resolution.path
+    if transcript is None:
+        reset_transcript_forward_state(bridge_dir)
+        return False
+    if resolution.synthesized:
         reset_transcript_forward_state(bridge_dir)
         prepare_transcript_forward_state_for_resume(
             bridge_dir,
             transcript,
             session_id=session_id,
         )
-        return
+        return False
     if prepare_transcript_forward_state_for_resume(
         bridge_dir,
         transcript,
         session_id=session_id,
     ):
-        return
+        return False
     message = (
-        "Claude transcript forwarding cursor was invalid; resuming local "
+        "Claude transcript forwarding cursor was missing or invalid; resuming local "
         "context but synchronization will continue from the transcript end."
     )
     click.echo(f"warning: {message}", err=True)
     _logger.warning(message, extra={"session_id": session_id})
+    return True
 
 
 async def _fetch_claude_session_labels(
@@ -4769,7 +4804,7 @@ async def _fetch_claude_session_labels(
 async def _resolve_cold_resume_args(
     client: httpx.AsyncClient,
     session_id: str,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], ClaudeResumeTranscriptResolution]:
     """
     Build the ``claude --resume <sid>`` args for a cold-resume launch.
 
@@ -4781,8 +4816,7 @@ async def _resolve_cold_resume_args(
 
     :param client: HTTP client for the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :returns: ``("--resume", "<claude_sid>")`` or ``()`` when server
-        history is empty and no local transcript can be resumed.
+    :returns: Claude arguments plus the resolved transcript and provenance.
     :raises click.ClickException: Conversation missing or not claude-native.
     """
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
@@ -4818,17 +4852,17 @@ async def _resolve_cold_resume_args(
     )
     if minted:
         external_session_id = str(uuid.uuid4())
-    transcript = await _ensure_local_claude_resume_transcript(
+    resolution = await _ensure_local_claude_resume_transcript(
         client,
         session_id=session_id,
         external_session_id=external_session_id,
         workspace=Path.cwd().resolve(),
     )
-    if transcript is None:
+    if resolution.path is None:
         message = f"no Claude history exists for {session_id!r}; starting a fresh Claude session."
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
-        return ()
+        return (), resolution
     if minted:
         patch_resp = await client.patch(
             f"/v1/sessions/{url_component(session_id)}",
@@ -4839,7 +4873,7 @@ async def _resolve_cold_resume_args(
                 f"Failed to persist Claude session id for {session_id!r} "
                 f"({patch_resp.status_code}): {error_text(patch_resp)}"
             )
-    return ("--resume", external_session_id)
+    return ("--resume", external_session_id), resolution
 
 
 async def _ensure_local_claude_resume_transcript(
@@ -4848,15 +4882,15 @@ async def _ensure_local_claude_resume_transcript(
     session_id: str,
     external_session_id: str,
     workspace: Path,
-) -> Path | None:
+) -> ClaudeResumeTranscriptResolution:
     """
     Resolve Claude Code's local JSONL transcript for cold resume.
 
     Cross-machine resume has the Omnigent conversation and Claude external
     session id on the server, but not Claude Code's local
     ``~/.claude/projects/<cwd>/<sid>.jsonl`` file. Claude's
-    ``--resume <sid>`` consults that local project transcript. The
-    A valid local transcript is authoritative and is returned byte-for-byte
+    ``--resume <sid>`` consults that local project transcript. A
+    valid local transcript is authoritative and is returned byte-for-byte
     unchanged. Server reconstruction is used only when no valid local artifact
     exists.
 
@@ -4872,13 +4906,12 @@ async def _ensure_local_claude_resume_transcript(
         ``OMNIGENT_RUNNER_WORKSPACE``. Pass an already-resolved
         path (symlinks collapsed) so the project-dir encoding matches
         what Claude computes.
-    :returns: Path to a validated local or synthesized transcript; ``None``
-        if *external_session_id* is unsafe or server history is empty.
+    :returns: Validated transcript path and explicit local/synthesized origin.
     :raises click.ClickException: If Omnigent history cannot be fetched or
         the transcript cannot be written.
     """
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
-        return None
+        return ClaudeResumeTranscriptResolution(None, reused_local=False, synthesized=False)
     from omnigent.claude_native_bridge import bridge_dir_for_conversation_id
 
     current = workspace
@@ -4893,7 +4926,34 @@ async def _ensure_local_claude_resume_transcript(
             candidate,
             external_session_id=external_session_id,
         ):
-            return candidate
+            if candidate == target:
+                return ClaudeResumeTranscriptResolution(
+                    target,
+                    reused_local=True,
+                    synthesized=False,
+                )
+            target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            tmp = target.with_suffix(".jsonl.tmp")
+            try:
+                _copy_transcript_with_cwd(
+                    source=candidate,
+                    target=tmp,
+                    current=current,
+                    sanitize_content=False,
+                )
+                os.replace(tmp, target)
+            except OSError as exc:
+                raise click.ClickException(
+                    f"Failed to redirect Claude resume transcript {candidate} to {target}: {exc}"
+                ) from exc
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    tmp.unlink()
+            return ClaudeResumeTranscriptResolution(
+                target,
+                reused_local=True,
+                synthesized=False,
+            )
         _backup_unparseable_claude_transcript(candidate)
 
     items = await _fetch_all_session_items_for_claude_resume(client, session_id)
@@ -4909,7 +4969,7 @@ async def _ensure_local_claude_resume_transcript(
         bridge_dir=bridge_dir_for_conversation_id(session_id),
     )
     if not items:
-        return None
+        return ClaudeResumeTranscriptResolution(None, reused_local=False, synthesized=False)
     if not records:
         raise click.ClickException(
             f"Claude history for {session_id!r} is non-empty but contains no "
@@ -4929,8 +4989,11 @@ async def _ensure_local_claude_resume_transcript(
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
-    _SYNTHESIZED_RESUME_TRANSCRIPTS.add(target)
-    return target
+    return ClaudeResumeTranscriptResolution(
+        target,
+        reused_local=False,
+        synthesized=True,
+    )
 
 
 def _claude_resume_transcript_candidates(
@@ -4997,25 +5060,28 @@ def _is_resumable_claude_transcript(
 
     ``--resume`` against an empty or non-JSONL file exits fatally instead of
     starting, which for claude-native (terminal == agent) kills the session.
-    Every non-empty line must be a JSON object, native session ids must match,
-    and ``cwd`` metadata must agree with the containing Claude project
-    directory. At least one structurally complete user or assistant message is
-    required.
+    Every complete non-empty line must be a JSON object, native session ids
+    must match, and stored ``cwd`` metadata must agree with the containing
+    Claude project directory. One malformed final line without a newline is
+    tolerated because it is a normal crash artifact. At least one user or
+    assistant message is required.
 
     :param path: Candidate ``<sid>.jsonl`` transcript path.
     :returns: ``True`` when the file exists and holds a JSON-object line.
     """
     try:
         resumable = False
-        seen_uuids: set[str] = set()
         with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
+            lines = handle.readlines()
+            for line_number, raw_line in enumerate(lines, start=1):
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     record = json.loads(line)
                 except ValueError:
+                    if line_number == len(lines) and not raw_line.endswith("\n"):
+                        continue
                     return False
                 if not isinstance(record, dict):
                     return False
@@ -5028,21 +5094,11 @@ def _is_resumable_claude_transcript(
                     return False
                 cwd = record.get("cwd")
                 if isinstance(cwd, str) and (
-                    _sanitize_claude_project_name(str(Path(cwd).resolve())) != path.parent.name
+                    _sanitize_claude_project_name(cwd) != path.parent.name
                 ):
                     return False
-                record_uuid = record.get("uuid")
-                parent_uuid = record.get("parentUuid")
-                if isinstance(parent_uuid, str) and parent_uuid not in seen_uuids:
-                    return False
-                if isinstance(record_uuid, str):
-                    if record_uuid in seen_uuids:
-                        return False
-                    seen_uuids.add(record_uuid)
-                if (
-                    record.get("type") in {"user", "assistant"}
-                    and isinstance(record_uuid, str)
-                    and isinstance(record.get("message"), dict)
+                if record.get("type") in {"user", "assistant"} and isinstance(
+                    record.get("message"), dict
                 ):
                     resumable = True
         return resumable

@@ -28,7 +28,10 @@ from omnigent.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
-    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.claude_native import (
+        ClaudeNativeUcodeConfig,
+        ClaudeResumeTranscriptResolution,
+    )
     from omnigent.codex_native_app_server import CodexAppServerClient, CodexNativeAppServer
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.opencode_native_app_server import OpenCodeNativeServer
@@ -2342,15 +2345,6 @@ _CLAUDE_DEGRADED_SYNC_NOTICE = (
 )
 
 
-@dataclasses.dataclass(frozen=True)
-class _ClaudeRunnerResume:
-    """Runner-local cold-resume decision while shared APIs converge."""
-
-    transcript: Path | None
-    reused_local: bool
-    degraded_sync: bool = False
-
-
 def _backup_unparseable_native_artifact(path: Path) -> Path:
     """Preserve an unparseable native artifact before server reconstruction."""
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
@@ -2363,92 +2357,32 @@ def _backup_unparseable_native_artifact(path: Path) -> Path:
     return backup
 
 
-def _claude_forward_cursor_is_valid(bridge_dir: Path, transcript: Path) -> bool | None:
-    """Validate a saved Claude cursor; ``None`` means no cursor was saved."""
-    from omnigent.claude_native_forwarder import (
-        _read_forward_state,
-        _validated_transcript_state,
-    )
-
-    state_path = bridge_dir / "transcript_forwarder.json"
-    if not state_path.exists():
-        return None
-    state = _read_forward_state(bridge_dir)
-    if state is None or state.transcript_path != transcript:
-        return False
-    if state.byte_offset is None:
-        return False
-    return (
-        _validated_transcript_state(
-            state,
-            bridge_dir=bridge_dir,
-            session_id="runner-cold-resume-validation",
-        )
-        == state
-    )
-
-
 async def _resolve_runner_claude_resume(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     external_session_id: str,
     workspace: Path,
-    bridge_dir: Path,
-) -> _ClaudeRunnerResume:
-    """Reuse a valid local Claude transcript, synthesizing only when absent."""
+) -> ClaudeResumeTranscriptResolution:
+    """Resolve Claude resume state through the shared local-first policy."""
     from omnigent.claude_native import (
-        _CLAUDE_PROJECTS_DIR,
         _CLAUDE_SESSION_ID_RE,
-        _claude_project_dir_for_cwd,
+        ClaudeResumeTranscriptResolution,
         _ensure_local_claude_resume_transcript,
-        _is_resumable_claude_transcript,
     )
 
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
-        return _ClaudeRunnerResume(transcript=None, reused_local=False)
-    current = _claude_project_dir_for_cwd(workspace) / f"{external_session_id}.jsonl"
-    candidates: list[Path] = []
-    if current.is_file():
-        candidates.append(current)
-    if _CLAUDE_PROJECTS_DIR.is_dir():
-        prior = [
-            project_dir / current.name
-            for project_dir in _CLAUDE_PROJECTS_DIR.iterdir()
-            if project_dir.is_dir()
-            and project_dir / current.name != current
-            and (project_dir / current.name).is_file()
-        ]
-        prior.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-        candidates.extend(prior)
-    for candidate in candidates:
-        if _is_resumable_claude_transcript(
-            candidate,
-            external_session_id=external_session_id,
-        ):
-            cursor_valid = _claude_forward_cursor_is_valid(bridge_dir, candidate)
-            return _ClaudeRunnerResume(
-                transcript=candidate,
-                reused_local=True,
-                degraded_sync=cursor_valid is False,
-            )
-        _backup_unparseable_native_artifact(candidate)
-
-    transcript = await _ensure_local_claude_resume_transcript(
+        return ClaudeResumeTranscriptResolution(
+            None,
+            reused_local=False,
+            synthesized=False,
+        )
+    return await _ensure_local_claude_resume_transcript(
         client,
         session_id=session_id,
         external_session_id=external_session_id,
         workspace=workspace,
     )
-    if transcript is None:
-        from omnigent.claude_native import _fetch_all_session_items_for_claude_resume
-
-        if await _fetch_all_session_items_for_claude_resume(client, session_id):
-            raise RuntimeError(
-                f"Claude history for {session_id!r} could not be converted "
-                "into a resumable transcript."
-            )
-    return _ClaudeRunnerResume(transcript=transcript, reused_local=False)
 
 
 async def _resolve_missing_runner_claude_resume(
@@ -2456,56 +2390,55 @@ async def _resolve_missing_runner_claude_resume(
     *,
     session_id: str,
     workspace: Path,
-) -> tuple[str | None, _ClaudeRunnerResume]:
+) -> tuple[str | None, ClaudeResumeTranscriptResolution]:
     """Mint, synthesize, and persist a Claude id when server history exists."""
     from omnigent.claude_native import (
+        ClaudeResumeTranscriptResolution,
         _ensure_local_claude_resume_transcript,
-        _fetch_all_session_items_for_claude_resume,
     )
 
     minted_session_id = str(uuid.uuid4())
-    transcript = await _ensure_local_claude_resume_transcript(
+    resolution = await _ensure_local_claude_resume_transcript(
         client,
         session_id=session_id,
         external_session_id=minted_session_id,
         workspace=workspace,
     )
-    if transcript is None:
-        if await _fetch_all_session_items_for_claude_resume(client, session_id):
-            raise RuntimeError(
-                f"Claude history for {session_id!r} could not be converted "
-                "into a resumable transcript."
-            )
+    if resolution.path is None:
         _logger.warning(
             "Claude session %s has no native id or committed history; launching fresh",
             session_id,
         )
-        return None, _ClaudeRunnerResume(transcript=None, reused_local=False)
+        return None, ClaudeResumeTranscriptResolution(
+            None,
+            reused_local=False,
+            synthesized=False,
+        )
     resp = await client.patch(
         f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
         json={"external_session_id": minted_session_id},
         timeout=10.0,
     )
     resp.raise_for_status()
-    return minted_session_id, _ClaudeRunnerResume(
-        transcript=transcript,
-        reused_local=False,
-    )
+    return minted_session_id, resolution
 
 
 def _prepare_claude_resume_forwarder(
     bridge_dir: Path,
-    resolution: _ClaudeRunnerResume,
-) -> int | None:
-    """Preserve a valid local cursor or seed a reconstructed/invalid one."""
-    from omnigent.claude_native_forwarder import reset_transcript_forward_state
+    resolution: ClaudeResumeTranscriptResolution,
+    *,
+    session_id: str = "runner-cold-resume",
+) -> tuple[int | None, bool]:
+    """Atomically preserve/seed the cursor and return prefix plus degradation."""
+    from omnigent.claude_native import _prepare_cold_resume_forward_state
 
-    if resolution.reused_local and not resolution.degraded_sync:
-        return None
-    reset_transcript_forward_state(bridge_dir)
-    if resolution.transcript is None:
-        return None
-    return _measured_prefix_bytes(resolution.transcript)
+    degraded = _prepare_cold_resume_forward_state(
+        bridge_dir=bridge_dir,
+        resolution=resolution,
+        session_id=session_id,
+    )
+    prefix = _measured_prefix_bytes(resolution.path) if resolution.synthesized else None
+    return prefix, degraded
 
 
 def _codex_rollout_is_resumable(path: Path, *, thread_id: str) -> bool:
@@ -4358,9 +4291,7 @@ async def _auto_create_codex_terminal(
 
         if server_client is None:
             raise RuntimeError("server_client is required for Codex cold resume.")
-        existing_rollout = _find_codex_rollout(
-            codex_home, launch_config.external_session_id
-        )
+        existing_rollout = _find_codex_rollout(codex_home, launch_config.external_session_id)
         if existing_rollout is not None and not _codex_rollout_is_resumable(
             existing_rollout,
             thread_id=launch_config.external_session_id,
@@ -6807,19 +6738,6 @@ async def _auto_create_claude_terminal(
                 "Could not set bridge_id label for %s; relay may target wrong dir",
                 session_id,
             )
-    # Capture the previous claude_session_id from the bridge state file BEFORE
-    # prepare_bridge_dir unlinks it. read_claude_session_id reads _STATE_FILE,
-    # which prepare_bridge_dir removes as part of its refresh; reading it here
-    # lets the cold-resume fallback below use it when the server GET missed the
-    # external_session_id binding (e.g. workspace-scope ContextVar not set).
-    from omnigent.claude_native_bridge import (
-        bridge_dir_for_bridge_id as _bridge_dir_for_bridge_id,
-    )
-    from omnigent.claude_native_bridge import (
-        read_claude_session_id as _read_csid_pre_wipe,
-    )
-
-    _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
     # Resolved once here and reused below (env_spec) so the bridge's own
     # sys_os_* tools and the terminal process see the same sandbox — the
     # agent's declared os_env.sandbox, already overridden by any
@@ -6892,20 +6810,6 @@ async def _auto_create_claude_terminal(
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
 
-    # The server GET may miss the external_session_id binding when the
-    # reconnect request arrives without a workspace-scoped context (the
-    # ContextVar defaults to 0 on fresh tasks). Fall back to the claude_session_id
-    # captured from the bridge state file before prepare_bridge_dir wiped it.
-    if session_external_id is None and _pre_wipe_claude_sid is not None:
-        session_external_id = _pre_wipe_claude_sid
-        _logger.info(
-            "cold-resume fallback: server snapshot missing external_session_id, "
-            "using local bridge hint: session=%s local_claude_sid=%s",
-            session_id,
-            _pre_wipe_claude_sid,
-            extra={"session_id": session_id},
-        )
-
     # Cold resume: when this session wraps a prior Claude session,
     # synthesize the local ``~/.claude/projects/<workspace>/<sid>.jsonl``
     # transcript that Claude's ``--resume`` reads, then pass ``--resume``.
@@ -6928,15 +6832,16 @@ async def _auto_create_claude_terminal(
             session_id=session_id,
             external_session_id=session_external_id,
             workspace=Path(workspace).resolve(),
-            bridge_dir=bridge_dir,
         )
-        if resolution.transcript is not None:
+        if resolution.path is not None:
             resume_external_session_id = session_external_id
-            resume_prefix_bytes = _prepare_claude_resume_forwarder(
-                bridge_dir, resolution
+            resume_prefix_bytes, degraded_sync = _prepare_claude_resume_forwarder(
+                bridge_dir,
+                resolution,
+                session_id=session_id,
             )
             reset_forward_state = False
-            if resolution.degraded_sync:
+            if degraded_sync:
                 await _post_claude_degraded_sync_notice(
                     session_id=session_id,
                     server_client=server_client,
@@ -6956,19 +6861,25 @@ async def _auto_create_claude_terminal(
 
         our_uuid = str(uuid.uuid4())
         _clone_workspace = Path(workspace).resolve()
-        try:
-            _cloned = _clone_claude_transcript(
-                source_external_session_id=fork_source_external_id,
-                target_external_session_id=our_uuid,
-                clone_workspace=_clone_workspace,
+        _cloned = _clone_claude_transcript(
+            source_external_session_id=fork_source_external_id,
+            target_external_session_id=our_uuid,
+            clone_workspace=_clone_workspace,
+        )
+        if _cloned is None:
+            # The source artifact can be absent on a different runner.  The
+            # clone's copied Omnigent items are the authoritative fallback;
+            # conversion failures must abort instead of silently opening an
+            # empty Claude session.
+            from omnigent.claude_native import _ensure_local_claude_resume_transcript
+
+            _fallback = await _ensure_local_claude_resume_transcript(
+                server_client,
+                session_id=session_id,
+                external_session_id=our_uuid,
+                workspace=_clone_workspace,
             )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            _cloned = None
-            _logger.warning(
-                "Could not clone source transcript for forked clone %s; launching fresh",
-                session_id,
-                exc_info=True,
-            )
+            _cloned = _fallback.path
         _logger.info(
             "Claude terminal fork-resume decision: session=%s source_ext=%s "
             "our_uuid=%s clone_workspace=%s cloned_transcript=%s",
@@ -6983,24 +6894,14 @@ async def _auto_create_claude_terminal(
             # Resume our OWN clone (plain --resume, no --fork-session).
             resume_external_session_id = our_uuid
             resume_prefix_bytes = _measured_prefix_bytes(_cloned)
-            # Record the assigned id now so Omnigent reflects the clone's own
-            # Claude session immediately, and a later relaunch resumes it
-            # via the normal cold-resume path (this branch is gated on
-            # external_session_id being unset). Best-effort.
-            if server_client is not None:
-                try:
-                    await server_client.patch(
-                        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                        json={"external_session_id": our_uuid},
-                        timeout=10.0,
-                    )
-                except httpx.HTTPError:
-                    _logger.warning(
-                        "Could not pre-set external_session_id for forked clone %s; "
-                        "relying on hook capture",
-                        session_id,
-                        exc_info=True,
-                    )
+            # The assigned id must be durable before launching it. Relying on
+            # later hook capture can bind a different session after a race.
+            patch_resp = await server_client.patch(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                json={"external_session_id": our_uuid},
+                timeout=10.0,
+            )
+            patch_resp.raise_for_status()
     elif (
         server_client is not None
         and fork_carry_history
@@ -7020,21 +6921,13 @@ async def _auto_create_claude_terminal(
 
         our_uuid = str(uuid.uuid4())
         _clone_workspace = Path(workspace).resolve()
-        try:
-            _built = await _ensure_local_claude_resume_transcript(
-                server_client,
-                session_id=session_id,
-                external_session_id=our_uuid,
-                workspace=_clone_workspace,
-            )
-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
-            _built = None
-            _logger.warning(
-                "Could not build native transcript from items for forked clone %s; "
-                "launching fresh",
-                session_id,
-                exc_info=True,
-            )
+        _built_resolution = await _ensure_local_claude_resume_transcript(
+            server_client,
+            session_id=session_id,
+            external_session_id=our_uuid,
+            workspace=_clone_workspace,
+        )
+        _built = _built_resolution.path
         _logger.info(
             "Claude terminal fork-rebuild decision: session=%s our_uuid=%s "
             "clone_workspace=%s built_transcript=%s",
@@ -7047,22 +6940,12 @@ async def _auto_create_claude_terminal(
         if _built is not None:
             resume_external_session_id = our_uuid
             resume_prefix_bytes = _measured_prefix_bytes(_built)
-            # Record the assigned id so Omnigent reflects the clone's own Claude
-            # session and a later relaunch resumes it via the cold-resume
-            # path above. Best-effort, mirroring the clone branch.
-            try:
-                await server_client.patch(
-                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                    json={"external_session_id": our_uuid},
-                    timeout=10.0,
-                )
-            except httpx.HTTPError:
-                _logger.warning(
-                    "Could not pre-set external_session_id for forked clone %s; "
-                    "relying on hook capture",
-                    session_id,
-                    exc_info=True,
-                )
+            patch_resp = await server_client.patch(
+                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                json={"external_session_id": our_uuid},
+                timeout=10.0,
+            )
+            patch_resp.raise_for_status()
     elif (
         server_client is not None
         and session_external_id is None
@@ -7077,10 +6960,12 @@ async def _auto_create_claude_terminal(
             session_id=session_id,
             workspace=Path(workspace).resolve(),
         )
-        if minted_session_id is not None and resolution.transcript is not None:
+        if minted_session_id is not None and resolution.path is not None:
             resume_external_session_id = minted_session_id
-            resume_prefix_bytes = _prepare_claude_resume_forwarder(
-                bridge_dir, resolution
+            resume_prefix_bytes, _ = _prepare_claude_resume_forwarder(
+                bridge_dir,
+                resolution,
+                session_id=session_id,
             )
             reset_forward_state = False
     if reset_forward_state:
