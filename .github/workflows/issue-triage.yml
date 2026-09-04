@@ -792,5 +792,5 @@ jobs:
       )
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
-      issue_number: ${{ inputs.issue_number }}
+      issue_number: ${{ fromJSON(format('{0}', inputs.issue_number)) }}
     secrets: inherit
