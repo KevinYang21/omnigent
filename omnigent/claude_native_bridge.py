@@ -4713,7 +4713,7 @@ def _tool_relay_handler_factory(
             # process where these modules are already loaded.
             from omnigent.native_policy_hook import (
                 evaluation_response_to_hook_output,
-                fail_closed_hook_output,
+                fail_ask_hook_output,
                 hook_payload_to_evaluation_request,
             )
 
@@ -4763,7 +4763,7 @@ def _tool_relay_handler_factory(
                     last_error = "malformed EvaluationResponse body"
                 break
             if not isinstance(verdict, dict) or not verdict.get("result"):
-                self._respond_hook_output(fail_closed_hook_output(hook_event, last_error))
+                self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
                 return
             self._respond_hook_output(evaluation_response_to_hook_output(hook_event, verdict))
 

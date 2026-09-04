@@ -375,20 +375,26 @@ def test_fail_closed_unknown_event_fails_open() -> None:
     assert fail_closed_hook_output("SomeNewEvent") is None
 
 
-def test_fail_ask_pre_tool_use_returns_none() -> None:
+def test_fail_ask_pre_tool_use_returns_ask() -> None:
     """
-    ``fail_ask_hook_output`` returns ``None`` for ``PreToolUse``.
+    ``fail_ask_hook_output`` returns ``permissionDecision: "ask"`` for ``PreToolUse``.
 
-    Returning ``None`` (no hook output) makes the harness fall back to its
-    own native approval dialog instead of auto-denying, preserving human
-    oversight when the policy server is transiently unreachable.
+    Using ``"ask"`` explicitly prompts the user regardless of permission mode
+    (unlike ``None``, which fails open in ``bypassPermissions``/``acceptEdits``).
     """
-    assert fail_ask_hook_output("PreToolUse") is None
+    output = fail_ask_hook_output("PreToolUse")
+    assert output is not None
+    hook = output["hookSpecificOutput"]
+    assert hook["hookEventName"] == "PreToolUse"
+    assert hook["permissionDecision"] == "ask"
+    assert hook["permissionDecisionReason"]
 
 
-def test_fail_ask_pre_tool_use_with_detail_returns_none() -> None:
-    """Detail string does not change the fail-ask PreToolUse output."""
-    assert fail_ask_hook_output("PreToolUse", "server connection refused") is None
+def test_fail_ask_pre_tool_use_with_detail_includes_detail() -> None:
+    """Detail string is appended to the ask reason."""
+    output = fail_ask_hook_output("PreToolUse", "server connection refused")
+    assert output is not None
+    assert "server connection refused" in output["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 def test_fail_ask_user_prompt_submit_still_fails_closed() -> None:
