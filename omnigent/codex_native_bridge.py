@@ -5,13 +5,15 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import sys
 import tempfile
+import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -22,10 +24,17 @@ from omnigent import native_bridge_common
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
+# Outer ceiling for one runner-owned managed startup. Component watchdogs remain
+# nested inside this budget; this value must not replace their fail-fast limits.
+CODEX_NATIVE_MANAGED_STARTUP_TIMEOUT_SECONDS = 180.0
+# Allow the runner to publish its terminal startup result before the executor
+# reports a missing bridge after the shared deadline.
+CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS = 5.0
 
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
+_STARTUP_CLAIM_FILE = "startup.json"
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
 # forwarder (and by ``wait_for_thread_started`` while it drains startup
@@ -94,6 +103,26 @@ class CodexNativeBridgeState:
     codex_home: str
     active_turn_id: str | None = None
     cwd: str | None = None
+
+
+@dataclass(frozen=True)
+class CodexNativeStartupClaim:
+    """Runner-owned startup generation and its executor-visible deadline.
+
+    :param generation: Opaque token identifying one launch attempt.
+    :param started_at_unix: Wall-clock time when this attempt began.
+    :param deadline_unix: Wall-clock projection of the runner's monotonic
+        deadline. The runner enforces monotonic time; this value only prevents
+        a separately spawned executor from manufacturing a fresh wait budget.
+    :param stage: Current startup stage for diagnostics.
+    :param updated_at_unix: Wall-clock time when :attr:`stage` last changed.
+    """
+
+    generation: str
+    started_at_unix: float
+    deadline_unix: float
+    stage: str
+    updated_at_unix: float
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -645,6 +674,122 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
         _write_bridge_state_unlocked(bridge_dir, state)
 
 
+def _read_bridge_startup_claim_unlocked(bridge_dir: Path) -> CodexNativeStartupClaim | None:
+    """Read and validate the startup claim while the caller owns the lock."""
+    try:
+        raw = json.loads((bridge_dir / _STARTUP_CLAIM_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    generation = raw.get("generation")
+    started_at_unix = raw.get("started_at_unix")
+    deadline_unix = raw.get("deadline_unix")
+    stage = raw.get("stage")
+    updated_at_unix = raw.get("updated_at_unix")
+    numeric_values = (started_at_unix, deadline_unix, updated_at_unix)
+    if not isinstance(generation, str) or not generation:
+        return None
+    if not isinstance(stage, str) or not stage:
+        return None
+    if not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        for value in numeric_values
+    ):
+        return None
+    assert isinstance(started_at_unix, (int, float))
+    assert isinstance(deadline_unix, (int, float))
+    assert isinstance(updated_at_unix, (int, float))
+    if deadline_unix < started_at_unix:
+        return None
+    return CodexNativeStartupClaim(
+        generation=generation,
+        started_at_unix=float(started_at_unix),
+        deadline_unix=float(deadline_unix),
+        stage=stage,
+        updated_at_unix=float(updated_at_unix),
+    )
+
+
+def read_bridge_startup_claim(bridge_dir: Path) -> CodexNativeStartupClaim | None:
+    """Read the active managed-startup claim, if it is valid."""
+    with _bridge_state_lock(bridge_dir):
+        return _read_bridge_startup_claim_unlocked(bridge_dir)
+
+
+def _write_bridge_startup_claim_unlocked(
+    bridge_dir: Path,
+    claim: CodexNativeStartupClaim,
+) -> None:
+    """Atomically replace the startup claim while the caller owns the lock."""
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _STARTUP_CLAIM_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_CLAIM_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generation": claim.generation,
+                    "started_at_unix": claim.started_at_unix,
+                    "deadline_unix": claim.deadline_unix,
+                    "stage": claim.stage,
+                    "updated_at_unix": claim.updated_at_unix,
+                },
+                handle,
+                allow_nan=False,
+                sort_keys=True,
+            )
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def write_bridge_startup_claim(bridge_dir: Path, claim: CodexNativeStartupClaim) -> None:
+    """Claim bridge runtime ownership for one managed startup generation.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param claim: Generation, absolute deadline projection, and current stage.
+    :returns: None.
+    """
+    with _bridge_state_lock(bridge_dir):
+        _write_bridge_startup_claim_unlocked(bridge_dir, claim)
+
+
+def update_bridge_startup_stage(
+    bridge_dir: Path,
+    *,
+    expected_generation: str,
+    stage: str,
+) -> bool:
+    """Publish one stage only while this generation owns startup."""
+    with _bridge_state_lock(bridge_dir):
+        claim = _read_bridge_startup_claim_unlocked(bridge_dir)
+        if claim is None or claim.generation != expected_generation:
+            return False
+        _write_bridge_startup_claim_unlocked(
+            bridge_dir,
+            replace(claim, stage=stage, updated_at_unix=time.time()),
+        )
+    return True
+
+
+def write_bridge_state_if_generation(
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    *,
+    expected_generation: str,
+) -> bool:
+    """Publish bridge state only while this startup generation still owns it."""
+    with _bridge_state_lock(bridge_dir):
+        claim = _read_bridge_startup_claim_unlocked(bridge_dir)
+        if claim is None or claim.generation != expected_generation:
+            return False
+        _write_bridge_state_unlocked(bridge_dir, state)
+    return True
+
+
 def clear_bridge_state(bridge_dir: Path) -> None:
     """
     Remove stale native Codex runtime state for a bridge directory.
@@ -663,6 +808,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
         for name in (
             _STATE_FILE,
             _STARTUP_ERROR_FILE,
+            _STARTUP_CLAIM_FILE,
             _MCP_STARTUP_FILE,
         ):
             try:
@@ -671,14 +817,36 @@ def clear_bridge_state(bridge_dir: Path) -> None:
                 continue
 
 
-def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
-    """
-    Record why a native Codex app-server never started its thread (issue #59).
+def clear_bridge_runtime_state(
+    bridge_dir: Path,
+    *,
+    expected_generation: str,
+) -> bool:
+    """Remove live runtime pointers while preserving an actionable startup error.
+
+    Rollback calls this after recording why startup failed. Using
+    :func:`clear_bridge_state` there would also delete ``startup_error.json``
+    and replace the specific runner diagnosis with the executor's generic
+    timeout message. The generation comparison prevents a delayed predecessor
+    from deleting a successor launch's state.
 
     :param bridge_dir: Native Codex bridge directory.
-    :param message: Human-readable failure cause.
-    :returns: None.
+    :param expected_generation: Generation token owned by the cleanup caller.
+    :returns: ``True`` when this generation still owned and cleared the runtime
+        files; ``False`` when a successor owns them or no claim exists.
     """
+    with _bridge_state_lock(bridge_dir):
+        claim = _read_bridge_startup_claim_unlocked(bridge_dir)
+        if claim is None or claim.generation != expected_generation:
+            return False
+        for name in (_STATE_FILE, _MCP_STARTUP_FILE, _STARTUP_CLAIM_FILE):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / name).unlink()
+    return True
+
+
+def _write_bridge_startup_error_unlocked(bridge_dir: Path, message: str) -> None:
+    """Write a startup error while the caller owns the bridge-state lock."""
     try:
         bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = bridge_dir / _STARTUP_ERROR_FILE
@@ -695,6 +863,49 @@ def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
         return  # best-effort; the real failure is already logged
 
 
+def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
+    """
+    Record why a native Codex app-server never started its thread (issue #59).
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param message: Human-readable failure cause.
+    :returns: None.
+    """
+    with _bridge_state_lock(bridge_dir):
+        _write_bridge_startup_error_unlocked(bridge_dir, message)
+
+
+def write_bridge_startup_error_if_generation(
+    bridge_dir: Path,
+    message: str,
+    *,
+    expected_generation: str,
+) -> bool:
+    """Record a failure only while this startup generation still owns the bridge."""
+    with _bridge_state_lock(bridge_dir):
+        claim = _read_bridge_startup_claim_unlocked(bridge_dir)
+        if claim is None or claim.generation != expected_generation:
+            return False
+        _write_bridge_startup_error_unlocked(bridge_dir, message)
+    return True
+
+
+def ensure_bridge_startup_error_if_generation(
+    bridge_dir: Path,
+    message: str,
+    *,
+    expected_generation: str,
+) -> bool:
+    """Record a fallback failure without replacing a more specific diagnosis."""
+    with _bridge_state_lock(bridge_dir):
+        claim = _read_bridge_startup_claim_unlocked(bridge_dir)
+        if claim is None or claim.generation != expected_generation:
+            return False
+        if read_bridge_startup_error(bridge_dir) is None:
+            _write_bridge_startup_error_unlocked(bridge_dir, message)
+    return True
+
+
 def clear_bridge_startup_error(bridge_dir: Path) -> None:
     """
     Remove a recorded startup-failure message once startup has succeeded.
@@ -708,6 +919,21 @@ def clear_bridge_startup_error(bridge_dir: Path) -> None:
     """
     with _bridge_state_lock(bridge_dir), contextlib.suppress(FileNotFoundError):
         (bridge_dir / _STARTUP_ERROR_FILE).unlink()
+
+
+def clear_bridge_startup_error_if_generation(
+    bridge_dir: Path,
+    *,
+    expected_generation: str,
+) -> bool:
+    """Clear a startup error only while this generation owns the bridge."""
+    with _bridge_state_lock(bridge_dir):
+        claim = _read_bridge_startup_claim_unlocked(bridge_dir)
+        if claim is None or claim.generation != expected_generation:
+            return False
+        with contextlib.suppress(FileNotFoundError):
+            (bridge_dir / _STARTUP_ERROR_FILE).unlink()
+    return True
 
 
 def read_bridge_startup_error(bridge_dir: Path) -> str | None:

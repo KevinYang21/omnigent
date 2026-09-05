@@ -11,9 +11,12 @@ import pytest
 
 from omnigent.codex_native_app_server import CodexAppServerResponseError
 from omnigent.codex_native_bridge import (
+    CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
+    CodexNativeStartupClaim,
     read_bridge_state,
     read_codex_config_model,
+    write_bridge_startup_claim,
     write_bridge_startup_error,
     write_bridge_state,
 )
@@ -1147,11 +1150,12 @@ def test_run_turn_surfaces_recorded_startup_error(
     generic "bridge state is missing" (issue #59).
     """
 
-    async def _no_sleep(_seconds: float) -> None:
-        """No-op the poll backoff so the missing-state path is fast."""
+    async def _unexpected_sleep(_seconds: float) -> None:
+        """Fail if a recorded startup error does not stop polling immediately."""
+        raise AssertionError("recorded startup errors must surface before polling")
 
     # asyncio.run does not depend on asyncio.sleep, so patching it is safe.
-    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(asyncio, "sleep", _unexpected_sleep)
     write_bridge_startup_error(
         tmp_path,
         "Codex app-server never started a thread within the startup timeout.",
@@ -1166,6 +1170,114 @@ def test_run_turn_surfaces_recorded_startup_error(
     assert "never started" in error.message
     assert "startup timeout" in error.message
     assert error.message != "Codex native bridge state is missing"
+
+
+def test_run_turn_with_expired_startup_claim_fails_without_sleeping(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An expired runner claim fails immediately and names its last stage."""
+    write_bridge_startup_claim(
+        tmp_path,
+        CodexNativeStartupClaim(
+            generation="expired-generation",
+            started_at_unix=10.0,
+            deadline_unix=100.0,
+            stage="waiting for thread/started",
+            updated_at_unix=90.0,
+        ),
+    )
+
+    async def _unexpected_sleep(_seconds: float) -> None:
+        """Fail if an already-expired claim starts a new observer wait."""
+        raise AssertionError("an expired startup claim must not sleep")
+
+    monkeypatch.setattr(asyncio, "sleep", _unexpected_sleep)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_native_executor.time.time",
+        lambda: 100.0 + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
+    )
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.message == "Codex native startup expired while waiting for thread/started"
+
+
+def test_late_turn_uses_runner_claim_expiry_without_a_new_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A late observer only gets the time left on the runner's absolute claim."""
+    deadline_unix = 100.0
+    arrival_unix = 98.0
+    write_bridge_startup_claim(
+        tmp_path,
+        CodexNativeStartupClaim(
+            generation="in-flight-generation",
+            started_at_unix=10.0,
+            deadline_unix=deadline_unix,
+            stage="launching the Codex TUI",
+            updated_at_unix=90.0,
+        ),
+    )
+    wall_clock = [arrival_unix]
+    sleeps: list[float] = []
+
+    async def _advance_clock(seconds: float) -> None:
+        """Advance wall time without making the test wait in real time."""
+        sleeps.append(seconds)
+        wall_clock[0] += seconds
+
+    monkeypatch.setattr(asyncio, "sleep", _advance_clock)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_native_executor.time.time",
+        lambda: wall_clock[0],
+    )
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    expected_wait = deadline_unix - arrival_unix + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+    assert sum(sleeps) == pytest.approx(expected_wait)
+    assert sum(sleeps) < 60.0
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.message == "Codex native startup expired while launching the Codex TUI"
+
+
+def test_run_turn_without_startup_claim_retains_legacy_60_second_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A non-managed launch still gets the legacy 60-second observer budget."""
+    monotonic_clock = [0.0]
+    sleeps: list[float] = []
+
+    class _FakeLoop:
+        """Expose deterministic monotonic time to the executor wait loop."""
+
+        def time(self) -> float:
+            """Return the test-controlled monotonic timestamp."""
+            return monotonic_clock[0]
+
+    async def _advance_clock(seconds: float) -> None:
+        """Advance monotonic time without making the test wait in real time."""
+        sleeps.append(seconds)
+        monotonic_clock[0] += seconds
+
+    monkeypatch.setattr(asyncio, "get_running_loop", _FakeLoop)
+    monkeypatch.setattr(asyncio, "sleep", _advance_clock)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert sum(sleeps) == pytest.approx(60.0)
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.message == "Codex native bridge state is missing"
 
 
 # ── MCP startup: no client-side gate + Stop cancel (issue #2058) ────────

@@ -1487,11 +1487,16 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         terminal_id: str,
+        *,
+        expected: TerminalInstance | None = None,
     ) -> bool:
         """Close a terminal resource by id.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id.
+        :param expected: When given, close only if this exact terminal instance
+            still owns the resource id. This protects a replacement generation
+            from delayed cleanup belonging to its predecessor.
         :returns: ``True`` if a terminal was closed.
         """
         if self._terminal_registry is None:
@@ -1505,6 +1510,7 @@ class SessionResourceRegistry:
                     session_id,
                     entry.terminal_name,
                     entry.session_key,
+                    expected=expected,
                 )
                 if closed:
                     with self._lock:

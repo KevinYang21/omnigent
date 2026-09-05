@@ -8,6 +8,7 @@ import binascii
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
@@ -20,10 +21,12 @@ from omnigent.codex_native_app_server import (
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     mcp_startup_waiting_detail,
+    read_bridge_startup_claim,
     read_bridge_startup_error,
     read_bridge_state,
     read_mcp_startup,
@@ -56,6 +59,8 @@ _logger = logging.getLogger(__name__)
 
 _NO_ACTIVE_TURN_ERROR_CODE = -32600
 _NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
+_BRIDGE_STATE_POLL_INTERVAL_SECONDS = 1.0
+_LEGACY_BRIDGE_STATE_TIMEOUT_SECONDS = 60.0
 
 
 def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
@@ -366,20 +371,30 @@ class CodexNativeExecutor(Executor):
         # Wait for the bridge to boot OUTSIDE the injection lock: this is a
         # one-time poll for the state file to appear (first turn, app-server
         # starting), with no shared-state mutation, so holding the lock
-        # across its up-to-60s wait would needlessly block concurrent
+        # across its bounded startup wait would needlessly block concurrent
         # steering (enqueue_session_message). Once the state exists, the
         # decision/RPC/write below runs under the lock — re-reading state so
         # it's atomic with respect to a steer that landed during the wait.
         state = read_bridge_state(self._bridge_dir)
         if state is None:
-            for _ in range(60):
+            loop = asyncio.get_running_loop()
+            legacy_deadline = loop.time() + _LEGACY_BRIDGE_STATE_TIMEOUT_SECONDS
+            while state is None:
                 # Startup already failed; the runner recorded the cause — stop waiting.
                 if read_bridge_startup_error(self._bridge_dir) is not None:
                     break
-                await asyncio.sleep(1.0)
-                state = read_bridge_state(self._bridge_dir)
-                if state is not None:
+                startup_claim = read_bridge_startup_claim(self._bridge_dir)
+                remaining = (
+                    startup_claim.deadline_unix
+                    - time.time()
+                    + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS
+                    if startup_claim is not None
+                    else legacy_deadline - loop.time()
+                )
+                if remaining <= 0:
                     break
+                await asyncio.sleep(min(_BRIDGE_STATE_POLL_INTERVAL_SECONDS, remaining))
+                state = read_bridge_state(self._bridge_dir)
 
         # No client-side wait for Codex MCP startup: the app-server accepts
         # ``turn/start`` mid-startup and defers execution until the round
@@ -395,10 +410,15 @@ class CodexNativeExecutor(Executor):
             state = read_bridge_state(self._bridge_dir)
             if state is None:
                 startup_error = read_bridge_startup_error(self._bridge_dir)
+                startup_claim = read_bridge_startup_claim(self._bridge_dir)
                 error_msg = (
                     f"Codex native thread never started: {startup_error}"
                     if startup_error
-                    else "Codex native bridge state is missing"
+                    else (
+                        f"Codex native startup expired while {startup_claim.stage}"
+                        if startup_claim is not None
+                        else "Codex native bridge state is missing"
+                    )
                 )
             elif not _session_is_active(state.session_id, self._request_session_id):
                 error_msg = "Codex native session is no longer active"

@@ -1029,6 +1029,7 @@ class SubagentRouter:
     httpd: ThreadingHTTPServer
     advertised_dirs: set[Path] = field(default_factory=set)
     _closed: bool = False
+    _advertisements_removed: bool = False
 
     def advertise(self, bridge_dir: Path, session_id: str | None = None) -> Path:
         """Write this router's advertisement into *bridge_dir* and track it.
@@ -1058,6 +1059,13 @@ class SubagentRouter:
         self._closed = True
         self.httpd.shutdown()
         self.httpd.server_close()
+        self._remove_owned_advertisements()
+
+    def _remove_owned_advertisements(self) -> None:
+        """Remove advertisements that still name this router."""
+        if self._advertisements_removed:
+            return
+        self._advertisements_removed = True
         for bridge_dir in (*self.advertised_dirs, self.bridge_dir):
             path = bridge_dir / ADVERTISEMENT_FILE
             try:
@@ -1226,6 +1234,10 @@ def make_server_relay_resolver(
 # ── Per-session router lifecycle (runner side) ─────────────────────────────
 
 _session_routers: dict[str, SubagentRouter] = {}
+# Managed native launches may reuse the same router object across generations.
+# Ownership changes under the lifecycle lock so predecessor cleanup is atomic
+# with successor adoption.
+_session_router_generations: dict[str, str] = {}
 # Models the relay actually handed back, per session — the ledger the
 # codex ``SubagentStart`` audit is reconciled against.
 _relayed: dict[str, list[dict[str, Any]]] = {}
@@ -1322,6 +1334,7 @@ def ensure_session_router(
     bridge_dir: Path,
     server_client: httpx.AsyncClient,
     loop: asyncio.AbstractEventLoop | None = None,
+    owner_generation: str | None = None,
 ) -> SubagentRouter:
     """Start (once) the loopback router serving *session_id*.
 
@@ -1338,6 +1351,8 @@ def ensure_session_router(
     :param server_client: Runner→server client used to relay verdicts.
     :param loop: Event loop owning the relay. ``None`` uses the running
         loop.
+    :param owner_generation: Optional managed-startup generation adopting the
+        router. A later generation atomically supersedes the earlier owner.
     :returns: The running router handle.
     """
     resolver_loop = loop if loop is not None else asyncio.get_running_loop()
@@ -1345,6 +1360,10 @@ def ensure_session_router(
         existing = _session_routers.get(session_id)
         if existing is not None:
             existing.advertise(bridge_dir, session_id)
+            if owner_generation is None:
+                _session_router_generations.pop(session_id, None)
+            else:
+                _session_router_generations[session_id] = owner_generation
             return existing
         router = start_subagent_router(
             bridge_dir=bridge_dir,
@@ -1353,6 +1372,8 @@ def ensure_session_router(
             loop=resolver_loop,
         )
         _session_routers[session_id] = router
+        if owner_generation is not None:
+            _session_router_generations[session_id] = owner_generation
     # Nothing from the rendezvous is logged — neither the URL nor the paths
     # and ids that reach it — so a log file can never carry the bearer token
     # or the identifiers that address it. The advertisement on disk names both.
@@ -1369,6 +1390,7 @@ def ensure_session_router_quietly(
     loop: asyncio.AbstractEventLoop | None = None,
     caps: Any = None,
     routing_class: SessionRoutingClass = PLAIN_SESSION,
+    owner_generation: str | None = None,
 ) -> SubagentRouter | None:
     """Start the session's router, or return ``None`` instead of failing.
 
@@ -1405,6 +1427,8 @@ def ensure_session_router_quietly(
         stamped switch without any in-harness gate. Stamped at create, so
         flipping the gear's subagent-routing toggle on for a plain session
         stays inert until it is recreated.
+    :param owner_generation: Optional managed-startup generation adopting the
+        router. Used to make replacement cleanup generation-safe.
     :returns: The running router handle, or ``None`` when it could not
         start.
     """
@@ -1429,6 +1453,7 @@ def ensure_session_router_quietly(
             else router_dir_for_session(session_id),
             server_client=server_client,
             loop=loop,
+            owner_generation=owner_generation,
         )
     except (OSError, RuntimeError):
         # ``router_dir_for_session`` raises RuntimeError when the shared
@@ -1443,7 +1468,12 @@ def ensure_session_router_quietly(
         return None
 
 
-def shutdown_session_router(session_id: str, router: SubagentRouter | None = None) -> None:
+def shutdown_session_router(
+    session_id: str,
+    router: SubagentRouter | None = None,
+    *,
+    expected_owner_generation: str | None = None,
+) -> None:
     """Stop the router serving *session_id* and forget its state.
 
     Cheap and safe to call for a session that never had a router, and safe
@@ -1457,12 +1487,25 @@ def shutdown_session_router(session_id: str, router: SubagentRouter | None = Non
         installed, which would leave routing silently dead behind a
         still-valid advertisement. ``None`` tears down whatever is
         registered (session-delete paths that hold no handle).
+    :param expected_owner_generation: When given, close only if this startup
+        generation still owns the router. Adoption and cleanup compare under
+        the same lifecycle lock.
     """
     with _lifecycle_lock:
         current = _session_routers.get(session_id)
+        if (
+            expected_owner_generation is not None
+            and _session_router_generations.get(session_id) != expected_owner_generation
+        ):
+            return
         if router is not None and current is not router:
             return
+        if current is not None:
+            # Keep the identity check and unlink atomic with successor
+            # installation. ``close`` will only stop the detached server.
+            current._remove_owned_advertisements()
         _session_routers.pop(session_id, None)
+        _session_router_generations.pop(session_id, None)
         _relayed.pop(session_id, None)
     if current is None:
         return
