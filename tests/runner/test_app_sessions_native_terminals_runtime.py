@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import shutil
 import threading
 import uuid
@@ -328,6 +329,7 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
 async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Runner-owned Codex launch consumes persisted args and thread id.
@@ -345,6 +347,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     :returns: None.
     """
     import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harness_startup_config as startup_config_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
@@ -354,6 +357,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
     codex_native_bridge.write_bridge_state(
         bridge_dir,
@@ -507,6 +511,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert terminal_name == "codex"
             assert session_key == "main"
             assert resource_role == CODEX_NATIVE_TERMINAL_ROLE
+            preloaded_state = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert preloaded_state is not None
+            assert preloaded_state.thread_id == thread_id
             launched_specs.append(spec)
             return SessionResourceView(
                 id="terminal_codex_main",
@@ -555,6 +562,16 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
     monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _fake_preload_thread)
     monkeypatch.setattr(runner_app_mod, "_codex_forward_known_thread", _fake_forward_known_thread)
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_config",
+        lambda _cfg: (None, {"codex-native": {"command": "isaac"}}),
+    )
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_args",
+        lambda _harness, args, *, cfg: ["codex", "--", *args],
+    )
 
     agent_spec = AgentSpec(
         spec_version=1,
@@ -590,16 +607,16 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
     assert len(launched_specs) == 1
     launched = launched_specs[0]
-    assert launched.command == "/opt/codex/bin/codex"
-    assert launched.args[0] == "--dangerously-bypass-hook-trust"
-    assert launched.args[1:4] == [
+    assert launched.command == "isaac"
+    assert launched.args[:3] == ["codex", "--", "--dangerously-bypass-hook-trust"]
+    assert launched.args[3:6] == [
         "--config",
         "approval_policy=on-request",
         "resume",
     ]
-    assert launched.args[4] == "--remote"
-    assert launched.args[5].startswith("ws://127.0.0.1:")
-    assert launched.args[6] == thread_id
+    assert launched.args[6] == "--remote"
+    assert launched.args[7].startswith("ws://127.0.0.1:")
+    assert launched.args[8] == thread_id
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
@@ -636,6 +653,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     # Codex executor starts turns with the runner process's own cwd, so
     # web-driven shell tools run from the wrong directory.
     assert bridge_state.cwd == str(tmp_path / "workspace")
+    # Resume state is published before the configured wrapper starts, so the
+    # executor never needs a startup-timeout marker for this path.
+    assert codex_native_bridge.read_bridge_startup_timeout(bridge_dir) is None
+    assert "bridge state is preloaded" in caplog.text
+    assert "no bridge-state wait extension is needed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1435,9 +1457,12 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("marker_write_fails", [False, True])
 async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    marker_write_fails: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The tool relay is started at session creation, non-blocking.
 
@@ -1460,6 +1485,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     :returns: None.
     """
     import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harness_startup_config as startup_config_mod
     from omnigent.runner import app as runner_app_mod
 
     session_id = "de154ca6405fb8912623984a14a2b044"
@@ -1468,6 +1494,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
 
     class _SnapshotClient:
         """Fresh-session snapshot (no external thread → discovery path)."""
@@ -1541,15 +1568,37 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
                 name="Codex",
             )
 
+    discover_calls: list[dict[str, Any]] = []
+
     async def _fake_discover(**kwargs: Any) -> None:
         """:returns: None — stands in for the discovery forwarder."""
-        del kwargs
+        discover_calls.append(kwargs)
 
     monkeypatch.setattr(
         codex_app_mod, "build_codex_native_server", lambda **k: _FakeCodexAppServer()
     )
     monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _FakeDiscoveryClient)
     monkeypatch.setattr(runner_app_mod, "_codex_discover_thread_and_forward", _fake_discover)
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_config",
+        lambda _cfg: (None, {"codex-native": {"command": "isaac"}}),
+    )
+    monkeypatch.setattr(
+        startup_config_mod,
+        "resolve_harness_args",
+        lambda _harness, args, *, cfg: list(args),
+    )
+    if marker_write_fails:
+
+        def _raise_marker_write_error(_bridge_dir: Path, _timeout: float) -> None:
+            raise OSError("read-only bridge directory")
+
+        monkeypatch.setattr(
+            codex_native_bridge,
+            "write_bridge_startup_timeout",
+            _raise_marker_write_error,
+        )
 
     relay_calls: list[dict[str, Any]] = []
 
@@ -1587,6 +1636,12 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         session_id
     )
     assert relay_calls[0]["await_notify"] is False
+    assert len(discover_calls) == 1
+    assert discover_calls[0]["thread_start_timeout_seconds"] == 120.0
+    assert codex_native_bridge.read_bridge_startup_timeout(
+        codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+    ) == (None if marker_write_fails else 120.0)
+    assert "configured command 'isaac' gets a 120s thread-start budget" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -3052,7 +3107,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
         async def close(self) -> None:
             closed["app_server"] = True
 
-    async def _raise_no_thread(*_args: object, **_kwargs: object) -> str:
+    async def _raise_no_thread(_client: object) -> str:
         raise TimeoutError("no thread/started observed")
 
     # The helper lazily imports wait_for_thread_started from the forwarder
@@ -3083,11 +3138,13 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exc", "expected_cause"),
+    ("exc", "thread_start_timeout_seconds", "expected_cause"),
     [
-        (TimeoutError("no thread/started observed"), "startup timed out"),
+        (TimeoutError("no thread/started observed"), None, "startup timed out after 30s"),
+        (TimeoutError("no thread/started observed"), 120.0, "startup timed out after 120s"),
         (
             RuntimeError("event stream ended"),
+            None,
             "event stream ended before a thread was created",
         ),
     ],
@@ -3096,6 +3153,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     exc: Exception,
+    thread_start_timeout_seconds: float | None,
     expected_cause: str,
 ) -> None:
     """
@@ -3134,6 +3192,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             workspace=str(tmp_path / "workspace"),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
+            thread_start_timeout_seconds=thread_start_timeout_seconds,
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
@@ -3169,8 +3228,10 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
 
     thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
     workspace = tmp_path / "selected-workspace"
+    wait_calls: list[dict[str, object]] = []
 
-    async def _fake_wait(*_args: object, **_kwargs: object) -> str:
+    async def _fake_wait(*_args: object, **kwargs: object) -> str:
+        wait_calls.append(kwargs)
         return thread_id
 
     async def _fake_supervise(**_kwargs: object) -> None:
@@ -3190,6 +3251,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
 
     session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
+    codex_native_bridge.write_bridge_startup_timeout(tmp_path, 120.0)
     _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
     try:
         await _codex_discover_thread_and_forward(
@@ -3200,6 +3262,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
             workspace=str(workspace),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
+            thread_start_timeout_seconds=120.0,
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
@@ -3208,6 +3271,8 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     assert state is not None
     assert state.thread_id == thread_id
     assert state.cwd == str(workspace)
+    assert wait_calls == [{"timeout": 120.0}]
+    assert codex_native_bridge.read_bridge_startup_timeout(tmp_path) == 120.0
 
 
 @pytest.mark.asyncio

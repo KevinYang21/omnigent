@@ -7,6 +7,7 @@ import base64
 import binascii
 import json
 import logging
+import math
 import os
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -20,11 +21,13 @@ from omnigent.codex_native_app_server import (
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     mcp_startup_waiting_detail,
     read_bridge_startup_error,
+    read_bridge_startup_timeout,
     read_bridge_state,
     read_mcp_startup,
     update_active_turn_id,
@@ -56,6 +59,18 @@ _logger = logging.getLogger(__name__)
 
 _NO_ACTIVE_TURN_ERROR_CODE = -32600
 _NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
+_LEGACY_BRIDGE_STATE_POLL_COUNT = 60
+
+
+def _bridge_state_wait_poll_count(bridge_dir: Path) -> int:
+    """Return 60 legacy polls or the advertised configured-command budget."""
+    configured_timeout = read_bridge_startup_timeout(bridge_dir)
+    if configured_timeout is None:
+        return _LEGACY_BRIDGE_STATE_POLL_COUNT
+    return max(
+        _LEGACY_BRIDGE_STATE_POLL_COUNT,
+        math.ceil(configured_timeout + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS),
+    )
 
 
 def _is_no_active_turn_to_steer(error: CodexAppServerResponseError) -> bool:
@@ -366,20 +381,39 @@ class CodexNativeExecutor(Executor):
         # Wait for the bridge to boot OUTSIDE the injection lock: this is a
         # one-time poll for the state file to appear (first turn, app-server
         # starting), with no shared-state mutation, so holding the lock
-        # across its up-to-60s wait would needlessly block concurrent
+        # across its bounded startup wait would needlessly block concurrent
         # steering (enqueue_session_message). Once the state exists, the
         # decision/RPC/write below runs under the lock — re-reading state so
         # it's atomic with respect to a steer that landed during the wait.
         state = read_bridge_state(self._bridge_dir)
         if state is None:
-            for _ in range(60):
+            poll_count = 0
+            max_poll_count = _bridge_state_wait_poll_count(self._bridge_dir)
+            if max_poll_count > _LEGACY_BRIDGE_STATE_POLL_COUNT:
+                _logger.debug(
+                    "Codex bridge-state wait extended from %d to %d polls by startup marker",
+                    _LEGACY_BRIDGE_STATE_POLL_COUNT,
+                    max_poll_count,
+                )
+            while poll_count < max_poll_count:
                 # Startup already failed; the runner recorded the cause — stop waiting.
                 if read_bridge_startup_error(self._bridge_dir) is not None:
                     break
                 await asyncio.sleep(1.0)
+                poll_count += 1
                 state = read_bridge_state(self._bridge_dir)
                 if state is not None:
                     break
+                # The runner may publish the configured-command marker after
+                # this first-turn wait begins. Its bounded allowance only grows.
+                advertised_poll_count = _bridge_state_wait_poll_count(self._bridge_dir)
+                if advertised_poll_count > max_poll_count:
+                    _logger.debug(
+                        "Codex bridge-state wait extended from %d to %d polls by startup marker",
+                        max_poll_count,
+                        advertised_poll_count,
+                    )
+                    max_poll_count = advertised_poll_count
 
         # No client-side wait for Codex MCP startup: the app-server accepts
         # ``turn/start`` mid-startup and defers execution until the round
