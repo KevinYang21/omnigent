@@ -25,7 +25,8 @@ CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
 
 # Cross-process contract: ``designs/CODEX_NATIVE_STARTUP_TIMEOUT.md``.
-# Direct launches keep the forwarder's established thread-start watchdog.
+# Maximum time for a fresh TUI to emit ``thread/started``. Deliberately
+# generous because a host-spawned TUI cold-starts over the runner.
 CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS = 30.0
 # A configured command (for example ``isaac codex --``) may do bounded setup
 # before it execs Codex. Direct launches retain the ordinary 30-second thread
